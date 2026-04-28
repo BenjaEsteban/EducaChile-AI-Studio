@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "changeme"
     MINIO_BUCKET: str = "educachile"
     MINIO_SECURE: bool = False
+    MINIO_PUBLIC_ENDPOINT: str = "localhost:9000"
 
     @property
     def is_production(self) -> bool:

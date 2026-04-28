@@ -19,6 +19,13 @@ class MinIOStorageProvider(StorageProvider):
             secret_key=settings.MINIO_SECRET_KEY,
             secure=settings.MINIO_SECURE,
         )
+        self._presign_client = Minio(
+            endpoint=settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT,
+            access_key=settings.MINIO_ACCESS_KEY,
+            secret_key=settings.MINIO_SECRET_KEY,
+            secure=settings.MINIO_SECURE,
+            region="us-east-1",
+        )
         self._ensure_bucket()
 
     # ── Bucket setup ──────────────────────────────────────────────────────────
@@ -83,7 +90,7 @@ class MinIOStorageProvider(StorageProvider):
     ) -> PresignedURL:
         from datetime import timedelta
 
-        url = self._client.presigned_put_object(
+        url = self._presign_client.presigned_put_object(
             bucket_name=self._bucket,
             object_name=key,
             expires=timedelta(seconds=expires_in),
@@ -97,7 +104,7 @@ class MinIOStorageProvider(StorageProvider):
     ) -> PresignedURL:
         from datetime import timedelta
 
-        url = self._client.presigned_get_object(
+        url = self._presign_client.presigned_get_object(
             bucket_name=self._bucket,
             object_name=key,
             expires=timedelta(seconds=expires_in),

@@ -36,6 +36,38 @@ export interface CreateProjectInput {
   description?: string | null;
 }
 
+export interface InitPresentationUploadInput {
+  filename: string;
+  content_type: string;
+}
+
+export interface InitPresentationUploadResponse {
+  presentation_id: string;
+  upload_url: string;
+  storage_key: string;
+  expires_in: number;
+  method: "PUT";
+}
+
+export interface ConfirmPresentationUploadResponse {
+  presentation_id: string;
+  status: "upload_pending" | "uploaded" | "processing" | "parsed" | "ready" | "failed";
+  job_id: string;
+}
+
+export interface Slide {
+  id: string;
+  presentation_id: string;
+  position: number;
+  title: string | null;
+  notes: string | null;
+  visible_text: string;
+  dialogue: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 export const api = {
   health: () => apiFetch<HealthResponse>("/health"),
   projects: {
@@ -46,5 +78,22 @@ export const api = {
         body: JSON.stringify(input),
       }),
     get: (projectId: string) => apiFetch<Project>(`/api/v1/projects/${projectId}`),
+  },
+  presentations: {
+    initUpload: (projectId: string, input: InitPresentationUploadInput) =>
+      apiFetch<InitPresentationUploadResponse>(
+        `/api/v1/projects/${projectId}/presentations/init-upload`,
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      ),
+    confirmUpload: (presentationId: string) =>
+      apiFetch<ConfirmPresentationUploadResponse>(
+        `/api/v1/presentations/${presentationId}/confirm-upload`,
+        { method: "POST" },
+      ),
+    listSlides: (presentationId: string) =>
+      apiFetch<Slide[]>(`/api/v1/presentations/${presentationId}/slides`),
   },
 };
