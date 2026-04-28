@@ -5,7 +5,7 @@ from enum import Enum
 from sqlalchemy import DateTime, Float, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.database import GUID, JSONType, Base, TimestampMixin
+from app.database import GUID, Base, JSONType, TimestampMixin
 
 
 class JobStatus(str, Enum):
@@ -41,6 +41,7 @@ class Job(Base, TimestampMixin):
     )
     celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    current_step: Mapped[str | None] = mapped_column(String(255), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     result: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(

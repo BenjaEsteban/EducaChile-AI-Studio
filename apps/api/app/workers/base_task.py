@@ -56,11 +56,19 @@ class JobTask(Task):
         """Implementar en cada task. Debe retornar un dict con el resultado."""
         raise NotImplementedError
 
-    def set_progress(self, job_id: uuid.UUID, progress: float) -> None:
+    def set_progress(
+        self,
+        job_id: uuid.UUID,
+        progress: float,
+        current_step: str | None = None,
+    ) -> None:
         """Llamar desde run_job() para reportar progreso (0-100)."""
         with worker_db_session() as db:
             repo = JobRepository(db)
             job = repo.get_by_id(job_id)
             if job:
-                repo.update_progress(job, progress)
-        self.update_state(state="PROGRESS", meta={"progress": progress})
+                repo.update_progress(job, progress, current_step=current_step)
+        meta = {"progress": progress}
+        if current_step is not None:
+            meta["current_step"] = current_step
+        self.update_state(state="PROGRESS", meta=meta)

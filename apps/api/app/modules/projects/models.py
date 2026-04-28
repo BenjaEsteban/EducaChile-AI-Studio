@@ -4,8 +4,7 @@ from enum import Enum
 from sqlalchemy import BigInteger, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.database import GUID, JSONType, Base, TimestampMixin
-
+from app.database import GUID, Base, JSONType, TimestampMixin
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
@@ -18,6 +17,7 @@ class PresentationStatus(str, Enum):
     upload_pending = "upload_pending"
     uploaded = "uploaded"
     processing = "processing"
+    parsed = "parsed"
     ready = "ready"
     failed = "failed"
 

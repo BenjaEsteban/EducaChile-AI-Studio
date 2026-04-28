@@ -1,13 +1,19 @@
 import uuid
 from contextlib import contextmanager
-from unittest.mock import MagicMock, call, patch
+from io import BytesIO
+from unittest.mock import MagicMock, patch
 
-import pytest
+from pptx import Presentation as PptxPresentation
 
 from app.modules.jobs.models import Job, JobStatus, JobType
+from app.modules.organizations.models import Organization
+from app.modules.projects.models import Presentation, PresentationStatus, Project, Slide
+from app.modules.projects.service import MOCK_ORG_ID, MOCK_USER_ID
+from app.modules.users.models import User
 from app.workers.celery_app import celery_app
 from app.workers.tasks import ParsePresentationTask, enqueue_parse_presentation, ping
-
+from tests.conftest import _TestingSession
+from tests.fakes import InMemoryStorageProvider
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -20,6 +26,7 @@ def _make_job(job_id: uuid.UUID | None = None) -> Job:
         job_type=JobType.parse_presentation,
         status=JobStatus.queued,
         progress=0.0,
+        current_step=None,
         celery_task_id=None,
         error_message=None,
         result=None,
@@ -41,6 +48,84 @@ def _make_repo(job: Job) -> MagicMock:
 @contextmanager
 def _fake_session():
     yield MagicMock()
+
+
+@contextmanager
+def _testing_worker_session():
+    db = _TestingSession()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _make_pptx_bytes() -> bytes:
+    deck = PptxPresentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[1])
+    slide.shapes.title.text = "Clase 1"
+    slide.placeholders[1].text = "Objetivo de aprendizaje\nContenido visible"
+
+    second = deck.slides.add_slide(deck.slide_layouts[1])
+    second.shapes.title.text = "Clase 2"
+    second.placeholders[1].text = "Actividad final"
+
+    buffer = BytesIO()
+    deck.save(buffer)
+    return buffer.getvalue()
+
+
+def _create_parse_fixture(storage: InMemoryStorageProvider, pptx_bytes: bytes | None = None):
+    storage_key = f"{MOCK_ORG_ID}/{uuid.uuid4()}/deck.pptx"
+    storage.upload_file(
+        storage_key,
+        pptx_bytes if pptx_bytes is not None else _make_pptx_bytes(),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+
+    db = _TestingSession()
+    try:
+        user = User(
+            id=MOCK_USER_ID,
+            email=f"{uuid.uuid4()}@test.local",
+            hashed_password="test",
+            full_name="Test User",
+        )
+        org = Organization(id=MOCK_ORG_ID, name="Test Org", slug=f"test-{uuid.uuid4()}")
+        project = Project(
+            organization_id=MOCK_ORG_ID,
+            owner_id=MOCK_USER_ID,
+            name="Project",
+        )
+        db.add_all([user, org, project])
+        db.flush()
+
+        presentation = Presentation(
+            project_id=project.id,
+            organization_id=MOCK_ORG_ID,
+            title="deck.pptx",
+            original_filename="deck.pptx",
+            storage_key=storage_key,
+            status=PresentationStatus.uploaded,
+        )
+        db.add(presentation)
+        db.flush()
+
+        job = Job(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            presentation_id=presentation.id,
+            job_type=JobType.parse_presentation,
+            status=JobStatus.queued,
+        )
+        db.add(job)
+        db.commit()
+        return job.id, presentation.id
+    finally:
+        db.close()
 
 
 # ── ping ──────────────────────────────────────────────────────────────────────
@@ -155,42 +240,74 @@ def test_job_task_set_progress_updates_db():
 
 # ── ParsePresentationTask ─────────────────────────────────────────────────────
 
-@patch("app.workers.tasks.time.sleep", return_value=None)
-def test_parse_presentation_completes_successfully(mock_sleep):
-    job = _make_job()
-    repo = _make_repo(job)
+def test_parse_presentation_completes_successfully():
+    storage = InMemoryStorageProvider()
+    job_id, presentation_id = _create_parse_fixture(storage)
 
-    with patch("app.workers.base_task.worker_db_session", _fake_session), \
-         patch("app.workers.base_task.JobRepository", return_value=repo):
+    with patch("app.workers.base_task.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.get_storage", return_value=storage):
         celery_app.conf.task_always_eager = True
         result = ParsePresentationTask().apply(kwargs={
-            "job_id": str(job.id),
-            "presentation_id": str(job.presentation_id),
+            "job_id": str(job_id),
+            "presentation_id": str(presentation_id),
         })
 
     assert not result.failed()
     body = result.result
     assert body["parsed"] is True
-    assert body["presentation_id"] == str(job.presentation_id)
-    assert "slide_count" in body
+    assert body["presentation_id"] == str(presentation_id)
+    assert body["slide_count"] == 2
+
+    db = _TestingSession()
+    try:
+        presentation = db.get(Presentation, presentation_id)
+        slides = (
+            db.query(Slide)
+            .filter(Slide.presentation_id == presentation_id)
+            .order_by(Slide.position)
+            .all()
+        )
+        job = db.get(Job, job_id)
+        assert presentation.status == PresentationStatus.parsed
+        assert presentation.slide_count == 2
+        assert job.status == JobStatus.completed
+        assert job.progress == 100.0
+        assert job.current_step == "Completed"
+        assert len(slides) == 2
+        assert slides[0].position == 1
+        assert slides[0].title == "Clase 1"
+        assert "Objetivo de aprendizaje" in slides[0].metadata_["visible_text"]
+        assert slides[0].notes is None
+        assert slides[0].metadata_["dialogue"] == ""
+    finally:
+        db.close()
 
 
-@patch("app.workers.tasks.time.sleep", return_value=None)
-def test_parse_presentation_reports_progress(mock_sleep):
-    job = _make_job()
-    repo = _make_repo(job)
+def test_parse_presentation_failure_marks_presentation_failed():
+    storage = InMemoryStorageProvider()
+    job_id, presentation_id = _create_parse_fixture(storage, pptx_bytes=b"not a pptx")
 
-    with patch("app.workers.base_task.worker_db_session", _fake_session), \
-         patch("app.workers.base_task.JobRepository", return_value=repo):
+    with patch("app.workers.base_task.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.get_storage", return_value=storage):
         celery_app.conf.task_always_eager = True
-        ParsePresentationTask().apply(kwargs={
-            "job_id": str(job.id),
-            "presentation_id": str(job.presentation_id),
+        result = ParsePresentationTask().apply(kwargs={
+            "job_id": str(job_id),
+            "presentation_id": str(presentation_id),
         })
 
-    # Debe haber llamado update_progress al menos una vez por cada step
-    assert repo.update_progress.call_count >= 6
-    repo.mark_completed.assert_called_once()
+    assert result.failed()
+    db = _TestingSession()
+    try:
+        presentation = db.get(Presentation, presentation_id)
+        job = db.get(Job, job_id)
+        assert presentation.status == PresentationStatus.failed
+        assert job.status == JobStatus.failed
+        assert job.error_message
+        assert job.current_step == "Failed"
+    finally:
+        db.close()
 
 
 # ── enqueue_parse_presentation ────────────────────────────────────────────────
@@ -209,7 +326,10 @@ def test_enqueue_uses_presentations_queue():
     mock_result = MagicMock()
     mock_result.id = "x"
 
-    with patch("app.workers.tasks.parse_presentation.apply_async", return_value=mock_result) as mock_apply:
+    with patch(
+        "app.workers.tasks.parse_presentation.apply_async",
+        return_value=mock_result,
+    ) as mock_apply:
         enqueue_parse_presentation(uuid.uuid4(), uuid.uuid4())
 
     assert mock_apply.call_args[1]["queue"] == "presentations"
@@ -221,7 +341,10 @@ def test_enqueue_passes_job_and_presentation_ids():
     mock_result = MagicMock()
     mock_result.id = "x"
 
-    with patch("app.workers.tasks.parse_presentation.apply_async", return_value=mock_result) as mock_apply:
+    with patch(
+        "app.workers.tasks.parse_presentation.apply_async",
+        return_value=mock_result,
+    ) as mock_apply:
         enqueue_parse_presentation(job_id, presentation_id)
 
     kwargs = mock_apply.call_args[1]["kwargs"]

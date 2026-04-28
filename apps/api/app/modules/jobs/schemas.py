@@ -17,6 +17,7 @@ class JobRead(BaseModel):
     status: JobStatus
     celery_task_id: str | None
     progress: float
+    current_step: str | None
     error_message: str | None
     result: dict | None
     started_at: datetime | None

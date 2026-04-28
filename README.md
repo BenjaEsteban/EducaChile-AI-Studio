@@ -11,6 +11,7 @@ Plataforma SaaS de inteligencia artificial para la creación, gestión y distrib
 | Base de datos | PostgreSQL 16 |
 | Cola de tareas | Redis + Celery |
 | Almacenamiento | MinIO |
+| Parsing PPTX | python-pptx |
 | Infra local | Docker Compose |
 
 ## Estructura

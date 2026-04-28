@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
@@ -39,23 +39,33 @@ class JobRepository:
     def mark_running(self, job: Job, celery_task_id: str) -> Job:
         job.status = JobStatus.running
         job.celery_task_id = celery_task_id
-        job.started_at = datetime.now(timezone.utc)
+        job.started_at = datetime.now(UTC)
         job.progress = 0.0
+        job.current_step = "Starting"
         return self.save(job)
 
-    def update_progress(self, job: Job, progress: float) -> Job:
+    def update_progress(
+        self,
+        job: Job,
+        progress: float,
+        current_step: str | None = None,
+    ) -> Job:
         job.progress = max(0.0, min(100.0, progress))
+        if current_step is not None:
+            job.current_step = current_step
         return self.save(job)
 
     def mark_completed(self, job: Job, result: dict) -> Job:
         job.status = JobStatus.completed
         job.result = result
         job.progress = 100.0
-        job.finished_at = datetime.now(timezone.utc)
+        job.current_step = "Completed"
+        job.finished_at = datetime.now(UTC)
         return self.save(job)
 
     def mark_failed(self, job: Job, error_message: str) -> Job:
         job.status = JobStatus.failed
         job.error_message = error_message
-        job.finished_at = datetime.now(timezone.utc)
+        job.current_step = "Failed"
+        job.finished_at = datetime.now(UTC)
         return self.save(job)
