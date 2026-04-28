@@ -60,6 +60,12 @@ class Project(Base, TimestampMixin):
     jobs: Mapped[list["Job"]] = relationship(  # noqa: F821
         "Job", back_populates="project", cascade="all, delete-orphan"
     )
+    generation_config: Mapped["ProjectGenerationConfig | None"] = relationship(
+        "ProjectGenerationConfig",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class Presentation(Base, TimestampMixin):
@@ -126,6 +132,29 @@ class GenerationConfig(Base, TimestampMixin):
     presentation: Mapped["Presentation"] = relationship(
         "Presentation", back_populates="generation_config"
     )
+
+
+class ProjectGenerationConfig(Base, TimestampMixin):
+    __tablename__ = "project_generation_configs"
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID, primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        GUID, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        GUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tts_provider: Mapped[str] = mapped_column(String(50), nullable=False, default="gemini")
+    video_provider: Mapped[str] = mapped_column(String(50), nullable=False, default="wavespeed")
+    voice_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    voice_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gemini_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    elevenlabs_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    wavespeed_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution: Mapped[str] = mapped_column(String(20), nullable=False, default="1920x1080")
+    aspect_ratio: Mapped[str] = mapped_column(String(20), nullable=False, default="16:9")
+
+    project: Mapped["Project"] = relationship("Project", back_populates="generation_config")
 
 
 class Asset(Base, TimestampMixin):

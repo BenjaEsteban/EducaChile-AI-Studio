@@ -6,7 +6,6 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.modules.projects.models import AssetType, PresentationStatus, ProjectStatus
 
-
 # ── Project ───────────────────────────────────────────────────────────────────
 
 class ProjectCreate(BaseModel):

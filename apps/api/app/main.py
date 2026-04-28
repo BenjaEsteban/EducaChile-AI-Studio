@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+import app.models  # noqa: F401
 from app.config import settings
 
 
@@ -26,12 +27,13 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000"],
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
+    from app.modules.generation_config.router import router as generation_config_router
     from app.modules.health.router import router as health_router
     from app.modules.jobs.router import router as jobs_router
     from app.modules.presentations.router import router as presentations_router
@@ -41,6 +43,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(projects_router, prefix="/api/v1")
+    app.include_router(generation_config_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
     app.include_router(storage_router, prefix="/api/v1")
     app.include_router(presentations_router, prefix="/api/v1")

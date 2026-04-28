@@ -14,18 +14,7 @@ if config.config_file_name is not None:
 # Importar Base y settings DESPUÉS de configurar logging
 from app.config import settings  # noqa: E402
 from app.database import Base  # noqa: E402
-
-# Modelos — deben importarse para que Alembic los detecte en autogenerate
-from app.modules.users.models import User  # noqa: F401
-from app.modules.organizations.models import Organization, OrganizationMember  # noqa: F401
-from app.modules.projects.models import (  # noqa: F401
-    Asset,
-    GenerationConfig,
-    Presentation,
-    Project,
-    Slide,
-)
-from app.modules.jobs.models import Job  # noqa: F401
+import app.models  # noqa: F401, E402
 
 # Inyectar DATABASE_URL desde pydantic-settings (ignora el valor en alembic.ini)
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)

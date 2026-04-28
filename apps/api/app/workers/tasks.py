@@ -5,6 +5,7 @@ import uuid
 from pptx import Presentation as PptxPresentation
 from sqlalchemy import delete
 
+import app.models  # noqa: F401
 from app.modules.projects.models import Presentation, PresentationStatus, Slide
 from app.providers.storage import get_storage
 from app.workers.base_task import JobTask

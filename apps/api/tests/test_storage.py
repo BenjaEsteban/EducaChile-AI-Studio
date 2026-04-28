@@ -39,7 +39,10 @@ def test_presigned_upload_returns_url(storage_client):
 
 def test_presigned_upload_custom_expiry(storage_client):
     client, _ = storage_client
-    res = client.post(BASE + "/presigned-upload", json={"filename": "video.mp4", "expires_in": 7200})
+    res = client.post(
+        BASE + "/presigned-upload",
+        json={"filename": "video.mp4", "expires_in": 7200},
+    )
     assert res.status_code == 200
     assert res.json()["expires_in"] == 7200
 
@@ -55,12 +58,14 @@ def test_presigned_upload_key_contains_org_and_project(storage_client):
 
 def test_presigned_upload_rejects_path_traversal(storage_client):
     client, _ = storage_client
-    assert client.post(BASE + "/presigned-upload", json={"filename": "../etc/passwd"}).status_code == 422
+    res = client.post(BASE + "/presigned-upload", json={"filename": "../etc/passwd"})
+    assert res.status_code == 422
 
 
 def test_presigned_upload_rejects_absolute_path(storage_client):
     client, _ = storage_client
-    assert client.post(BASE + "/presigned-upload", json={"filename": "/etc/passwd"}).status_code == 422
+    res = client.post(BASE + "/presigned-upload", json={"filename": "/etc/passwd"})
+    assert res.status_code == 422
 
 
 def test_presigned_upload_rejects_empty_filename(storage_client):
@@ -70,12 +75,20 @@ def test_presigned_upload_rejects_empty_filename(storage_client):
 
 def test_presigned_upload_rejects_expiry_too_short(storage_client):
     client, _ = storage_client
-    assert client.post(BASE + "/presigned-upload", json={"filename": "f.pdf", "expires_in": 10}).status_code == 422
+    res = client.post(
+        BASE + "/presigned-upload",
+        json={"filename": "f.pdf", "expires_in": 10},
+    )
+    assert res.status_code == 422
 
 
 def test_presigned_upload_rejects_expiry_too_long(storage_client):
     client, _ = storage_client
-    assert client.post(BASE + "/presigned-upload", json={"filename": "f.pdf", "expires_in": 999999}).status_code == 422
+    res = client.post(
+        BASE + "/presigned-upload",
+        json={"filename": "f.pdf", "expires_in": 999999},
+    )
+    assert res.status_code == 422
 
 
 # ── GET /storage/presigned-download ──────────────────────────────────────────
@@ -94,7 +107,11 @@ def test_presigned_download_returns_url(storage_client):
 
 def test_presigned_download_not_found_returns_404(storage_client):
     client, _ = storage_client
-    assert client.get(BASE + "/presigned-download", params={"key": "nonexistent/file.pdf"}).status_code == 404
+    res = client.get(
+        BASE + "/presigned-download",
+        params={"key": "nonexistent/file.pdf"},
+    )
+    assert res.status_code == 404
 
 
 # ── InMemoryStorageProvider unit tests ────────────────────────────────────────

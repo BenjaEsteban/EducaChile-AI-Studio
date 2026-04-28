@@ -7,7 +7,11 @@ from app.database import get_db
 from app.modules.jobs.repository import JobRepository
 from app.modules.presentations.service import PresentationUploadService
 from app.modules.projects.repository import PresentationRepository, ProjectRepository
-from app.modules.projects.schemas import ConfirmUploadResponse, InitUploadRequest, InitUploadResponse
+from app.modules.projects.schemas import (
+    ConfirmUploadResponse,
+    InitUploadRequest,
+    InitUploadResponse,
+)
 from app.modules.storage.service import StorageService
 from app.providers.storage import StorageProvider, get_storage
 

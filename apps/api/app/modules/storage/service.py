@@ -2,8 +2,8 @@ import uuid
 
 from fastapi import HTTPException, status
 
-from app.providers.storage.base import PresignedURL, StorageProvider, UploadedFile
 from app.modules.storage.schemas import PresignedUploadRequest
+from app.providers.storage.base import PresignedURL, StorageProvider, UploadedFile
 
 
 class StorageService:

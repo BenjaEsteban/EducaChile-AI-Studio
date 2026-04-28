@@ -4,9 +4,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.config import settings
 from app.database import Base, get_db
 from app.main import app
-from app.config import settings
 
 settings.ENABLE_DEV_SEED = False
 
@@ -34,11 +34,7 @@ override_get_db = _override_get_db
 @pytest.fixture(autouse=True)
 def reset_db():
     """Recrea todas las tablas antes de cada test para garantizar aislamiento."""
-    # Importar modelos para que Base los conozca
-    import app.modules.jobs.models  # noqa: F401
-    import app.modules.organizations.models  # noqa: F401
-    import app.modules.projects.models  # noqa: F401
-    import app.modules.users.models  # noqa: F401
+    import app.models  # noqa: F401
 
     Base.metadata.create_all(bind=_engine)
     yield

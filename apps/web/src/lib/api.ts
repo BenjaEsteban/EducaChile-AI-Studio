@@ -68,6 +68,42 @@ export interface Slide {
   updated_at: string;
 }
 
+export interface UpdateSlideInput {
+  title?: string | null;
+  notes?: string | null;
+  dialogue?: string;
+  visible_text?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ProjectGenerationConfig {
+  id: string | null;
+  project_id: string;
+  tts_provider: "gemini" | "elevenlabs";
+  video_provider: "wavespeed";
+  voice_id: string | null;
+  voice_name: string | null;
+  gemini_api_key: string | null;
+  elevenlabs_api_key: string | null;
+  wavespeed_api_key: string | null;
+  resolution: string;
+  aspect_ratio: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface UpdateProjectGenerationConfigInput {
+  tts_provider: "gemini" | "elevenlabs";
+  video_provider: "wavespeed";
+  voice_id?: string | null;
+  voice_name?: string | null;
+  gemini_api_key?: string | null;
+  elevenlabs_api_key?: string | null;
+  wavespeed_api_key?: string | null;
+  resolution: string;
+  aspect_ratio: string;
+}
+
 export const api = {
   health: () => apiFetch<HealthResponse>("/health"),
   projects: {
@@ -78,6 +114,16 @@ export const api = {
         body: JSON.stringify(input),
       }),
     get: (projectId: string) => apiFetch<Project>(`/api/v1/projects/${projectId}`),
+    getGenerationConfig: (projectId: string) =>
+      apiFetch<ProjectGenerationConfig>(`/api/v1/projects/${projectId}/generation-config`),
+    updateGenerationConfig: (
+      projectId: string,
+      input: UpdateProjectGenerationConfigInput,
+    ) =>
+      apiFetch<ProjectGenerationConfig>(`/api/v1/projects/${projectId}/generation-config`, {
+        method: "PUT",
+        body: JSON.stringify(input),
+      }),
   },
   presentations: {
     initUpload: (projectId: string, input: InitPresentationUploadInput) =>
@@ -95,5 +141,12 @@ export const api = {
       ),
     listSlides: (presentationId: string) =>
       apiFetch<Slide[]>(`/api/v1/presentations/${presentationId}/slides`),
+  },
+  slides: {
+    update: (slideId: string, input: UpdateSlideInput) =>
+      apiFetch<Slide>(`/api/v1/slides/${slideId}`, {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      }),
   },
 };

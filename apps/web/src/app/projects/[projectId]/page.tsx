@@ -185,6 +185,15 @@ export default function ProjectDetailPage() {
               </span>
             </div>
 
+            <div className="mt-5">
+              <Link
+                href={`/projects/${project.id}/settings`}
+                className="text-sm font-semibold text-brand-700 hover:text-brand-800"
+              >
+                Configurar generacion
+              </Link>
+            </div>
+
             <dl className="mt-6 grid gap-4 sm:grid-cols-2">
               <div>
                 <dt className="text-xs font-medium uppercase text-gray-500">Creado</dt>

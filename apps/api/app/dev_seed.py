@@ -5,8 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
+import app.models  # noqa: F401
 from app.database import SessionLocal
-from app.modules.jobs.models import Job  # noqa: F401
 from app.modules.organizations.models import MemberRole, Organization, OrganizationMember
 from app.modules.projects.service import MOCK_ORG_ID, MOCK_USER_ID
 from app.modules.users.models import User, UserRole

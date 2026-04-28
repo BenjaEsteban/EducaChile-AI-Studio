@@ -142,6 +142,35 @@ Los servicios `api` y `web` tienen **hot reload** activado:
 
 No es necesario reconstruir la imagen para cambios de código. Solo usa `--build` cuando modifiques `pyproject.toml`, `package.json` o los `Dockerfile`.
 
+## Preview público local
+
+Para mostrar el MVP local con una URL pública temporal, usa ngrok o Cloudflare Tunnel:
+
+```bash
+scripts/expose-local.sh
+```
+
+Luego copia las URLs públicas a `.env`:
+
+```bash
+NEXT_PUBLIC_API_URL=https://<backend-tunnel>
+CORS_ORIGINS=http://localhost:3000,https://<frontend-tunnel>
+```
+
+Reinicia los servicios que leen esas variables:
+
+```bash
+docker compose up -d --force-recreate api web
+```
+
+Si personas fuera de tu máquina deben subir PPT/PPTX, también debes exponer MinIO y ajustar
+`MINIO_PUBLIC_ENDPOINT`. Ver [docs/local-public-preview.md](docs/local-public-preview.md).
+
+## Deploy producción
+
+El deploy de producción usa GitHub Actions, Docker Hub privado y un servidor Linux por SSH.
+Ver [docs/production-deployment.md](docs/production-deployment.md).
+
 ## Servicios y puertos
 
 ```

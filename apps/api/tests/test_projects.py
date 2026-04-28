@@ -1,6 +1,5 @@
 import uuid
 
-import pytest
 from fastapi.testclient import TestClient
 
 BASE = "/api/v1/projects"

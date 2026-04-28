@@ -30,7 +30,10 @@ def client(storage_provider):
     from tests.conftest import override_get_db
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_storage] = lambda: storage_provider
-    with patch("app.modules.presentations.service.enqueue_parse_presentation", return_value="mock-celery-id"):
+    with patch(
+        "app.modules.presentations.service.enqueue_parse_presentation",
+        return_value="mock-celery-id",
+    ):
         with TestClient(app) as c:
             yield c
     app.dependency_overrides.clear()

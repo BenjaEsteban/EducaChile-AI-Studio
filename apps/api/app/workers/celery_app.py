@@ -3,6 +3,7 @@ import logging
 from celery import Celery
 from celery.signals import task_failure, task_postrun, task_prerun, worker_ready
 
+import app.models  # noqa: F401
 from app.config import settings
 
 logger = logging.getLogger(__name__)

@@ -8,9 +8,13 @@ from app.modules.jobs.models import Job, JobStatus, JobType
 from app.modules.jobs.repository import JobRepository
 from app.modules.projects.models import Presentation, PresentationStatus
 from app.modules.projects.repository import PresentationRepository, ProjectRepository
-from app.modules.projects.schemas import ConfirmUploadResponse, InitUploadRequest, InitUploadResponse
-from app.modules.storage.service import StorageService
+from app.modules.projects.schemas import (
+    ConfirmUploadResponse,
+    InitUploadRequest,
+    InitUploadResponse,
+)
 from app.modules.projects.service import MOCK_ORG_ID
+from app.modules.storage.service import StorageService
 from app.workers.tasks import enqueue_parse_presentation
 
 _PRESIGNED_EXPIRES = 3600  # 1 hora para completar el upload

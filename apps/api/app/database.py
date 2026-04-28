@@ -11,7 +11,6 @@ from sqlalchemy.types import TypeDecorator
 
 from app.config import settings
 
-
 # ── Portable types (PostgreSQL ↔ SQLite) ──────────────────────────────────────
 
 class GUID(TypeDecorator):

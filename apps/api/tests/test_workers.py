@@ -4,6 +4,7 @@ from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 from pptx import Presentation as PptxPresentation
+from sqlalchemy.orm import configure_mappers
 
 from app.modules.jobs.models import Job, JobStatus, JobType
 from app.modules.organizations.models import Organization
@@ -129,6 +130,10 @@ def _create_parse_fixture(storage: InMemoryStorageProvider, pptx_bytes: bytes | 
 
 
 # ── ping ──────────────────────────────────────────────────────────────────────
+
+def test_worker_imports_register_all_sqlalchemy_mappers():
+    configure_mappers()
+
 
 def test_ping_returns_message():
     celery_app.conf.task_always_eager = True

@@ -8,7 +8,9 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     DEBUG: bool = True
     SECRET_KEY: str = "changeme-secret-key-min-32-chars"
+    ENCRYPTION_KEY: str = "dev-only-change-me-encryption-key"
     ENABLE_DEV_SEED: bool = True
+    CORS_ORIGINS: str = "http://localhost:3000"
 
     # Database
     DATABASE_URL: str = "postgresql+psycopg://educachile:changeme@localhost:5432/educa_chile"
@@ -27,6 +29,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.APP_ENV == "production"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 
 settings = Settings()
