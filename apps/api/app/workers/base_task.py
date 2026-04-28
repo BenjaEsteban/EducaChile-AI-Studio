@@ -71,4 +71,11 @@ class JobTask(Task):
         meta = {"progress": progress}
         if current_step is not None:
             meta["current_step"] = current_step
-        self.update_state(state="PROGRESS", meta=meta)
+        try:
+            self.update_state(state="PROGRESS", meta=meta)
+        except Exception as exc:
+            logger.warning(
+                "Could not update Celery state for job %s: %s",
+                job_id,
+                exc,
+            )
