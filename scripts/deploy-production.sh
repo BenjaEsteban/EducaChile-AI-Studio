@@ -18,7 +18,7 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 compose() {
-  docker-compose \
+  docker compose \
     -p "$PROJECT_NAME" \
     --env-file "$ENV_FILE" \
     -f "$COMPOSE_FILE" \
