@@ -48,3 +48,13 @@ class SlideRepository:
         self.db.refresh(slide)
         return slide
 
+    def list_by_presentation_id(self, presentation_id: uuid.UUID) -> list[Slide]:
+        return (
+            self.db.query(Slide)
+            .filter(Slide.presentation_id == presentation_id)
+            .order_by(Slide.position.asc())
+            .all()
+        )
+
+    def commit(self) -> None:
+        self.db.commit()

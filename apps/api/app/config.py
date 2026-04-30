@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "changeme-secret-key-min-32-chars"
     ENCRYPTION_KEY: str = "dev-only-change-me-encryption-key"
     ENABLE_DEV_SEED: bool = True
-    CORS_ORIGINS: str = "http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # Database
     DATABASE_URL: str = "postgresql+psycopg://educachile:changeme@localhost:5432/educa_chile"
