@@ -1,10 +1,15 @@
+import io
 import uuid
 
 from fastapi import HTTPException, status
+from pptx import Presentation as PptxPresentation
 
+from app.modules.presentations.rendering import render_slide_previews
+from app.modules.projects.models import Slide
 from app.modules.projects.service import MOCK_ORG_ID
 from app.modules.slides.repository import SlideRepository
 from app.modules.slides.schemas import SlideRead, SlideUpdate
+from app.providers.storage import get_storage
 
 
 class SlideService:
@@ -52,5 +57,81 @@ class SlideService:
             metadata["visible_text"] = update_data["visible_text"] or ""
         slide.metadata_ = metadata
 
+        has_text_update = "title" in update_data or "visible_text" in update_data
+        if has_text_update and _contains_canvas_text_blocks(metadata):
+            self._update_pptx_text_and_previews(slide)
+
         return SlideRead.from_model(self.repo.save(slide))
 
+    def _update_pptx_text_and_previews(self, slide: Slide) -> None:
+        presentation = slide.presentation
+        if not presentation:
+            return
+
+        storage = get_storage()
+        pptx_bytes = storage.download_file(presentation.storage_key)
+        deck = PptxPresentation(io.BytesIO(pptx_bytes))
+        slide_index = slide.position - 1
+        if slide_index < 0 or slide_index >= len(deck.slides):
+            return
+
+        text_blocks = _get_canvas_text_blocks(slide.metadata_ or {})
+        ppt_slide = deck.slides[slide_index]
+        for block in text_blocks:
+            shape_index = _shape_index_from_block_id(str(block.get("id") or ""))
+            text = str(block.get("text") or "")
+            if shape_index is None or shape_index >= len(ppt_slide.shapes):
+                continue
+            shape = ppt_slide.shapes[shape_index]
+            if getattr(shape, "has_text_frame", False):
+                shape.text = text
+
+        buffer = io.BytesIO()
+        deck.save(buffer)
+        updated_pptx = buffer.getvalue()
+        storage.upload_file(
+            key=presentation.storage_key,
+            data=updated_pptx,
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+
+        preview_keys = render_slide_previews(
+            pptx_bytes=updated_pptx,
+            presentation_id=presentation.id,
+            original_filename=presentation.original_filename,
+            storage=storage,
+        )
+        if not preview_keys:
+            return
+
+        slides = self.repo.list_by_presentation_id(presentation.id)
+        for current_slide in slides:
+            preview_key = preview_keys.get(current_slide.position)
+            if not preview_key:
+                continue
+            current_slide.thumbnail_key = preview_key
+            current_metadata = dict(current_slide.metadata_ or {})
+            current_metadata["rendered_image_key"] = preview_key
+            current_slide.metadata_ = current_metadata
+        self.repo.commit()
+
+
+def _contains_canvas_text_blocks(metadata: dict) -> bool:
+    return bool(_get_canvas_text_blocks(metadata))
+
+
+def _get_canvas_text_blocks(metadata: dict) -> list[dict]:
+    canvas = metadata.get("canvas")
+    if not isinstance(canvas, dict):
+        return []
+    text_blocks = canvas.get("text_blocks")
+    if not isinstance(text_blocks, list):
+        return []
+    return [block for block in text_blocks if isinstance(block, dict)]
+
+
+def _shape_index_from_block_id(block_id: str) -> int | None:
+    try:
+        return int(block_id.rsplit("-", 1)[-1])
+    except ValueError:
+        return None

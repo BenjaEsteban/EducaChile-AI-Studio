@@ -6,6 +6,7 @@ from pptx import Presentation as PptxPresentation
 from sqlalchemy import delete
 
 import app.models  # noqa: F401
+from app.modules.presentations.rendering import render_slide_previews
 from app.modules.projects.models import Presentation, PresentationStatus, Slide
 from app.providers.storage import get_storage
 from app.workers.base_task import JobTask
@@ -43,20 +44,35 @@ class ParsePresentationTask(JobTask):
                     raise ValueError(f"Presentation not found: {presentation_id}")
 
                 presentation.status = PresentationStatus.processing
-                db.commit()
                 storage_key = presentation.storage_key
+                original_filename = presentation.original_filename
+                db.commit()
 
             self.set_progress(job_id, 25.0, "Downloading presentation from storage")
-            pptx_bytes = get_storage().download_file(storage_key)
+            storage = get_storage()
+            pptx_bytes = storage.download_file(storage_key)
 
             self.set_progress(job_id, 45.0, "Opening PPTX")
             deck = PptxPresentation(io.BytesIO(pptx_bytes))
 
             self.set_progress(job_id, 65.0, "Extracting slides")
             slide_records = [
-                _extract_slide(slide, index)
+                _extract_slide(
+                    slide=slide,
+                    slide_number=index,
+                    slide_width=int(deck.slide_width),
+                    slide_height=int(deck.slide_height),
+                )
                 for index, slide in enumerate(deck.slides, 1)
             ]
+
+            self.set_progress(job_id, 75.0, "Rendering slide previews")
+            preview_keys = render_slide_previews(
+                pptx_bytes=pptx_bytes,
+                presentation_id=presentation_uuid,
+                original_filename=original_filename,
+                storage=storage,
+            )
 
             self.set_progress(job_id, 85.0, "Saving parsed slides")
             with worker_db_session() as db:
@@ -72,10 +88,26 @@ class ParsePresentationTask(JobTask):
                             position=record["slide_number"],
                             title=record["title"],
                             notes=record["speaker_notes"] or None,
+                            thumbnail_key=preview_keys.get(record["slide_number"]),
                             metadata_={
                                 "slide_number": record["slide_number"],
                                 "visible_text": record["visible_text"],
                                 "dialogue": record["dialogue"],
+                                "rendered_image_key": preview_keys.get(record["slide_number"]),
+                                "canvas": {
+                                    "avatar": {
+                                        "enabled": True,
+                                        "x": 700,
+                                        "y": 290,
+                                        "width": 200,
+                                        "height": 200,
+                                    },
+                                    "text": {
+                                        "title": record["title"] or "",
+                                        "visible_text": record["visible_text"],
+                                    },
+                                    "text_blocks": record["text_blocks"],
+                                },
                             },
                         )
                     )
@@ -101,10 +133,11 @@ class ParsePresentationTask(JobTask):
             raise RuntimeError(error_message) from exc
 
 
-def _extract_slide(slide, slide_number: int) -> dict:
+def _extract_slide(slide, slide_number: int, slide_width: int, slide_height: int) -> dict:
     visible_text = _extract_visible_text(slide)
     speaker_notes = _extract_speaker_notes(slide)
     title = _extract_title(slide, visible_text)
+    text_blocks = _extract_text_blocks(slide, slide_width, slide_height)
 
     return {
         "slide_number": slide_number,
@@ -112,6 +145,7 @@ def _extract_slide(slide, slide_number: int) -> dict:
         "visible_text": visible_text,
         "speaker_notes": speaker_notes,
         "dialogue": speaker_notes,
+        "text_blocks": text_blocks,
     }
 
 
@@ -148,6 +182,44 @@ def _extract_title(slide, visible_text: str) -> str | None:
         if line.strip():
             return line.strip()[:500]
     return None
+
+
+def _extract_text_blocks(slide, slide_width: int, slide_height: int) -> list[dict]:
+    blocks: list[dict] = []
+    title_shape = getattr(slide.shapes, "title", None)
+
+    for index, shape in enumerate(slide.shapes):
+        if not getattr(shape, "has_text_frame", False):
+            continue
+
+        text = _normalize_text(shape.text)
+        if not text:
+            continue
+
+        block_type = "title" if title_shape is not None and shape == title_shape else "body"
+        blocks.append(
+            {
+                "id": f"{block_type}-{index}",
+                "type": block_type,
+                "text": text,
+                "x": _scale_emu(getattr(shape, "left", 0), slide_width, 960),
+                "y": _scale_emu(getattr(shape, "top", 0), slide_height, 540),
+                "width": _scale_emu(getattr(shape, "width", 0), slide_width, 960),
+                "height": _scale_emu(getattr(shape, "height", 0), slide_height, 540),
+                "fontSize": 34 if block_type == "title" else 22,
+                "fontWeight": "700" if block_type == "title" else "400",
+                "color": "#111827" if block_type == "title" else "#1f2937",
+                "textAlign": "left",
+            }
+        )
+
+    return blocks
+
+
+def _scale_emu(value: int, source_size: int, target_size: int) -> int:
+    if source_size <= 0:
+        return 0
+    return round((int(value) / source_size) * target_size)
 
 
 def _normalize_text(text: str | None) -> str:

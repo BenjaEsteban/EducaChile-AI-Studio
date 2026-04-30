@@ -61,6 +61,8 @@ export interface Slide {
   position: number;
   title: string | null;
   notes: string | null;
+  thumbnail_key: string | null;
+  preview_image_url: string | null;
   visible_text: string;
   dialogue: string;
   metadata: Record<string, unknown>;
@@ -74,6 +76,12 @@ export interface UpdateSlideInput {
   dialogue?: string;
   visible_text?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface PresignedDownloadResponse {
+  url: string;
+  key: string;
+  expires_in: number;
 }
 
 export interface ProjectGenerationConfig {
@@ -148,5 +156,11 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify(input),
       }),
+  },
+  storage: {
+    presignedDownload: (key: string) =>
+      apiFetch<PresignedDownloadResponse>(
+        `/api/v1/storage/presigned-download?key=${encodeURIComponent(key)}`,
+      ),
   },
 };

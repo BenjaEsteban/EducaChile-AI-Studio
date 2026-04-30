@@ -283,6 +283,9 @@ def test_parse_presentation_completes_successfully():
         assert slides[0].position == 1
         assert slides[0].title == "Clase 1"
         assert "Objetivo de aprendizaje" in slides[0].metadata_["visible_text"]
+        assert slides[0].metadata_["canvas"]["text"]["title"] == "Clase 1"
+        assert len(slides[0].metadata_["canvas"]["text_blocks"]) >= 2
+        assert slides[0].metadata_["canvas"]["text_blocks"][0]["text"] == "Clase 1"
         assert slides[0].notes is None
         assert slides[0].metadata_["dialogue"] == ""
     finally:
