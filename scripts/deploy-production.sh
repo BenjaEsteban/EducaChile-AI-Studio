@@ -4,6 +4,7 @@ set -euo pipefail
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 ENV_FILE="${ENV_FILE:-.env.production}"
 PROJECT_NAME="${PROJECT_NAME:-educachile}"
+
 export ENV_FILE
 
 if [ ! -f "$COMPOSE_FILE" ]; then
@@ -17,8 +18,8 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 compose() {
-  docker compose \
-    --project-name "$PROJECT_NAME" \
+  docker-compose \
+    -p "$PROJECT_NAME" \
     --env-file "$ENV_FILE" \
     -f "$COMPOSE_FILE" \
     "$@"
