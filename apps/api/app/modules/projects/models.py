@@ -1,7 +1,7 @@
 import uuid
 from enum import Enum
 
-from sqlalchemy import BigInteger, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import GUID, Base, JSONType, TimestampMixin
@@ -28,6 +28,13 @@ class AssetType(str, Enum):
     audio = "audio"
     image = "image"
     thumbnail = "thumbnail"
+    source_pptx = "source_pptx"
+    slide_preview = "slide_preview"
+    slide_render = "slide_render"
+    tts_audio = "tts_audio"
+    avatar_clip = "avatar_clip"
+    slide_video = "slide_video"
+    final_video = "final_video"
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -144,15 +151,22 @@ class ProjectGenerationConfig(Base, TimestampMixin):
     organization_id: Mapped[uuid.UUID] = mapped_column(
         GUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    ai_provider: Mapped[str] = mapped_column(String(50), nullable=False, default="gemini")
     tts_provider: Mapped[str] = mapped_column(String(50), nullable=False, default="gemini")
     video_provider: Mapped[str] = mapped_column(String(50), nullable=False, default="wavespeed")
     voice_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     voice_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    avatar_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gemini_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     elevenlabs_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     wavespeed_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolution: Mapped[str] = mapped_column(String(20), nullable=False, default="1920x1080")
     aspect_ratio: Mapped[str] = mapped_column(String(20), nullable=False, default="16:9")
+    language: Mapped[str] = mapped_column(String(20), nullable=False, default="es")
+    output_format: Mapped[str] = mapped_column(String(20), nullable=False, default="mp4")
+    subtitles_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    background_music_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="draft")
 
     project: Mapped["Project"] = relationship("Project", back_populates="generation_config")
 
@@ -167,10 +181,15 @@ class Asset(Base, TimestampMixin):
     organization_id: Mapped[uuid.UUID] = mapped_column(
         GUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    slide_id: Mapped[uuid.UUID | None] = mapped_column(
+        GUID, ForeignKey("slides.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     asset_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     storage_key: Mapped[str] = mapped_column(String(1000), nullable=False)
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    metadata_json: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
 
     project: Mapped["Project"] = relationship("Project", back_populates="assets")

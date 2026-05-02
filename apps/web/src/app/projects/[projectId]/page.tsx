@@ -132,16 +132,7 @@ export default function ProjectDetailPage() {
       setPresentationId(init.presentation_id);
 
       setUploadStatus("uploading");
-      const uploadRes = await fetch(init.upload_url, {
-        method: init.method,
-        headers: {
-          "Content-Type": selectedFile.type || "application/octet-stream",
-        },
-        body: selectedFile,
-      });
-      if (!uploadRes.ok) {
-        throw new Error(`Upload failed with status ${uploadRes.status}`);
-      }
+      await api.presentations.uploadFile(init.presentation_id, selectedFile);
 
       setUploadStatus("confirming");
       const confirmed = await api.presentations.confirmUpload(init.presentation_id);
@@ -183,15 +174,6 @@ export default function ProjectDetailPage() {
               <span className="w-fit rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">
                 {project.status}
               </span>
-            </div>
-
-            <div className="mt-5">
-              <Link
-                href={`/projects/${project.id}/settings`}
-                className="text-sm font-semibold text-brand-700 hover:text-brand-800"
-              >
-                Configurar generacion
-              </Link>
             </div>
 
             <dl className="mt-6 grid gap-4 sm:grid-cols-2">
@@ -282,6 +264,7 @@ export default function ProjectDetailPage() {
               ) : null}
             </div>
           </section>
+
         </div>
       ) : null}
     </AppShell>

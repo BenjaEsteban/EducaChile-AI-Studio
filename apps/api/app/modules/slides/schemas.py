@@ -18,6 +18,7 @@ class SlideRead(BaseModel):
     notes: str | None
     thumbnail_key: str | None
     preview_image_url: str | None
+    background_image_url: str | None
     visible_text: str
     dialogue: str
     metadata: dict
@@ -28,6 +29,7 @@ class SlideRead(BaseModel):
     def from_model(cls, slide: Slide) -> "SlideRead":
         metadata = dict(slide.metadata_ or {})
         preview_image_url = None
+        background_image_url = None
         if slide.thumbnail_key:
             try:
                 preview_image_url = get_storage().generate_presigned_download_url(
@@ -35,6 +37,16 @@ class SlideRead(BaseModel):
                 ).url
             except Exception as exc:
                 logger.warning("Could not generate slide preview URL for %s: %s", slide.id, exc)
+        background_key = metadata.get("background_image_key")
+        if isinstance(background_key, str) and background_key:
+            try:
+                background_image_url = get_storage().generate_presigned_download_url(
+                    background_key
+                ).url
+            except Exception as exc:
+                logger.warning(
+                    "Could not generate slide background URL for %s: %s", slide.id, exc
+                )
         return cls(
             id=slide.id,
             presentation_id=slide.presentation_id,
@@ -43,6 +55,7 @@ class SlideRead(BaseModel):
             notes=slide.notes,
             thumbnail_key=slide.thumbnail_key,
             preview_image_url=preview_image_url,
+            background_image_url=background_image_url,
             visible_text=metadata.get("visible_text") or "",
             dialogue=metadata.get("dialogue") or "",
             metadata=metadata,

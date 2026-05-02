@@ -33,17 +33,21 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    from app.modules.generation.router import router as generation_router
     from app.modules.generation_config.router import router as generation_config_router
     from app.modules.health.router import router as health_router
     from app.modules.jobs.router import router as jobs_router
     from app.modules.presentations.router import router as presentations_router
     from app.modules.projects.router import router as projects_router
+    from app.modules.provider_credentials.router import router as provider_credentials_router
     from app.modules.slides.router import router as slides_router
     from app.modules.storage.router import router as storage_router
 
     app.include_router(health_router)
     app.include_router(projects_router, prefix="/api/v1")
     app.include_router(generation_config_router, prefix="/api/v1")
+    app.include_router(provider_credentials_router, prefix="/api/v1")
+    app.include_router(generation_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
     app.include_router(storage_router, prefix="/api/v1")
     app.include_router(presentations_router, prefix="/api/v1")

@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -43,6 +43,23 @@ def init_upload(
     """Crea un registro Presentation en estado upload_pending y devuelve
     una presigned PUT URL para que el cliente suba el archivo directamente a MinIO."""
     return service.init_upload(project_id=project_id, request=body)
+
+
+@router.post(
+    "/presentations/{presentation_id}/upload-file",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def upload_file(
+    presentation_id: uuid.UUID,
+    file: UploadFile = File(...),
+    service: PresentationUploadService = Depends(get_service),
+):
+    """Development-friendly upload proxy.
+
+    The app still creates a storage-backed Presentation first, but the browser sends the
+    PPT/PPTX to the API instead of directly to the raw MinIO presigned URL.
+    """
+    service.upload_file(presentation_id=presentation_id, file=file)
 
 
 @router.post(
