@@ -36,12 +36,19 @@ class ProjectGenerationConfigService:
                 organization_id=MOCK_ORG_ID,
             )
 
+        config.ai_provider = data.ai_provider
         config.tts_provider = data.tts_provider
         config.video_provider = data.video_provider
         config.voice_id = data.voice_id
         config.voice_name = data.voice_name
+        config.avatar_id = data.avatar_id
         config.resolution = data.resolution
         config.aspect_ratio = data.aspect_ratio
+        config.language = data.language
+        config.output_format = data.output_format
+        config.subtitles_enabled = data.subtitles_enabled
+        config.background_music_enabled = data.background_music_enabled
+        config.status = "configured" if data.voice_id else "draft"
 
         if data.gemini_api_key is not None:
             config.gemini_api_key_encrypted = encrypt_secret(data.gemini_api_key)

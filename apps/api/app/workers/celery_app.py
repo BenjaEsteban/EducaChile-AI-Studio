@@ -38,9 +38,11 @@ celery_app.conf.update(
     task_queues={
         "default": {"exchange": "default", "routing_key": "default"},
         "presentations": {"exchange": "presentations", "routing_key": "presentations"},
+        "generation": {"exchange": "generation", "routing_key": "generation"},
     },
     task_routes={
         "app.workers.tasks.parse_presentation": {"queue": "presentations"},
+        "app.workers.tasks.generate_video": {"queue": "generation"},
         "app.workers.tasks.ping": {"queue": "default"},
     },
 )

@@ -13,6 +13,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-impress \
     poppler-utils \
+    ffmpeg \
     fonts-dejavu \
     && rm -rf /var/lib/apt/lists/*
 

@@ -78,7 +78,7 @@ services:
       dockerfile: Dockerfile.dev
     restart: unless-stopped
     env_file: .env
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --queues=default,presentations
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --queues=default,presentations,generation
     depends_on:
       db:
         condition: service_healthy

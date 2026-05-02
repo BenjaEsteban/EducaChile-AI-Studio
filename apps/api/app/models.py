@@ -5,6 +5,7 @@ Import this module before mapper configuration in processes that touch the DB
 so string-based relationships can resolve consistently.
 """
 
+from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.jobs.models import Job
 from app.modules.organizations.models import Organization, OrganizationMember
 from app.modules.projects.models import (
@@ -15,17 +16,21 @@ from app.modules.projects.models import (
     ProjectGenerationConfig,
     Slide,
 )
+from app.modules.provider_credentials.models import ProviderCredential
 from app.modules.users.models import User
 
 __all__ = [
     "Asset",
     "GenerationConfig",
+    "GenerationJob",
     "Job",
     "Organization",
     "OrganizationMember",
     "Presentation",
     "Project",
     "ProjectGenerationConfig",
+    "ProviderCredential",
     "Slide",
     "User",
+    "VideoGenerationSettings",
 ]

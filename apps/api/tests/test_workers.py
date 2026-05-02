@@ -4,6 +4,7 @@ from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 from pptx import Presentation as PptxPresentation
+from pptx.dml.color import RGBColor
 from sqlalchemy.orm import configure_mappers
 
 from app.modules.jobs.models import Job, JobStatus, JobType
@@ -68,6 +69,9 @@ def _make_pptx_bytes() -> bytes:
     deck = PptxPresentation()
     slide = deck.slides.add_slide(deck.slide_layouts[1])
     slide.shapes.title.text = "Clase 1"
+    slide.shapes.title.text_frame.paragraphs[0].runs[0].font.color.rgb = RGBColor(
+        255, 255, 255
+    )
     slide.placeholders[1].text = "Objetivo de aprendizaje\nContenido visible"
 
     second = deck.slides.add_slide(deck.slide_layouts[1])
@@ -284,8 +288,22 @@ def test_parse_presentation_completes_successfully():
         assert slides[0].title == "Clase 1"
         assert "Objetivo de aprendizaje" in slides[0].metadata_["visible_text"]
         assert slides[0].metadata_["canvas"]["text"]["title"] == "Clase 1"
+        assert slides[0].metadata_["canvas"]["width"] == 960
+        assert slides[0].metadata_["canvas"]["height"] > 0
+        assert slides[0].metadata_["canvas"]["version"] == 1
         assert len(slides[0].metadata_["canvas"]["text_blocks"]) >= 2
         assert slides[0].metadata_["canvas"]["text_blocks"][0]["text"] == "Clase 1"
+        assert slides[0].metadata_["canvas"]["text_blocks"][0]["shape_index"] == 0
+        elements = slides[0].metadata_["canvas"]["elements"]
+        assert elements[0]["type"] == "background"
+        text_elements = [element for element in elements if element["type"] == "text"]
+        assert text_elements[0]["text"] == "Clase 1"
+        assert text_elements[0]["shape_index"] == 0
+        assert text_elements[0]["style"]["fontFamily"]
+        assert "originalFontFamily" in text_elements[0]["style"]
+        assert text_elements[0]["style"]["fallbackFontFamily"] == "Arial"
+        assert text_elements[0]["style"]["color"] == "#FFFFFF"
+        assert text_elements[0]["style"]["originalColor"] == "#FFFFFF"
         assert slides[0].notes is None
         assert slides[0].metadata_["dialogue"] == ""
     finally:

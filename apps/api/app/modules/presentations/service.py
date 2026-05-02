@@ -1,7 +1,7 @@
 import uuid
 from dataclasses import dataclass
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.modules.jobs.models import Job, JobStatus, JobType
@@ -88,6 +88,38 @@ class PresentationUploadService:
             expires_in=_PRESIGNED_EXPIRES,
         )
 
+    # ── upload_file ───────────────────────────────────────────────────────────
+
+    def upload_file(self, presentation_id: uuid.UUID, file: UploadFile) -> None:
+        presentation = self._presentations.get_by_id_only(presentation_id)
+        if not presentation:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Presentation not found",
+            )
+
+        if presentation.status != PresentationStatus.upload_pending:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot upload file: presentation is in status "
+                    f"'{presentation.status}', expected 'upload_pending'"
+                ),
+            )
+
+        content = file.file.read()
+        if not content:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded presentation is empty",
+            )
+
+        self._storage.upload(
+            key=presentation.storage_key,
+            data=content,
+            content_type=file.content_type or "application/octet-stream",
+        )
+
     # ── confirm_upload ────────────────────────────────────────────────────────
 
     def confirm_upload(self, presentation_id: uuid.UUID) -> ConfirmUploadResponse:
@@ -108,6 +140,16 @@ class PresentationUploadService:
                     f"'{presentation.status}', expected 'upload_pending'"
                 ),
             )
+
+        try:
+            self._storage.download(presentation.storage_key)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Cannot confirm upload: presentation file is not available in storage",
+                ) from exc
+            raise
 
         # 3. Cambiar status a uploaded
         presentation.status = PresentationStatus.uploaded

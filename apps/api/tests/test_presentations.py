@@ -45,6 +45,20 @@ def _create_project(client: TestClient, name: str = "Test Project") -> str:
     return res.json()["id"]
 
 
+def _upload_presentation_file(client: TestClient, presentation_id: str) -> None:
+    res = client.post(
+        f"{PRESENTATIONS_BASE}/{presentation_id}/upload-file",
+        files={
+            "file": (
+                "deck.pptx",
+                b"pptx-bytes",
+                PPTX_CONTENT_TYPE,
+            )
+        },
+    )
+    assert res.status_code == 204
+
+
 # ── POST /projects/{id}/presentations/init-upload ─────────────────────────────
 
 def test_init_upload_returns_201_with_url(client):
@@ -170,6 +184,7 @@ def test_confirm_upload_returns_200_with_job(client):
         json={"filename": "deck.pptx"},
     )
     presentation_id = init_res.json()["presentation_id"]
+    _upload_presentation_file(client, presentation_id)
 
     res = client.post(f"{PRESENTATIONS_BASE}/{presentation_id}/confirm-upload")
     assert res.status_code == 200
@@ -186,6 +201,7 @@ def test_confirm_upload_creates_parse_job(client):
         json={"filename": "deck.pptx"},
     )
     presentation_id = init_res.json()["presentation_id"]
+    _upload_presentation_file(client, presentation_id)
     confirm_res = client.post(f"{PRESENTATIONS_BASE}/{presentation_id}/confirm-upload")
 
     job_id = confirm_res.json()["job_id"]
@@ -211,6 +227,7 @@ def test_confirm_upload_twice_returns_409(client):
         json={"filename": "deck.pptx"},
     )
     presentation_id = init_res.json()["presentation_id"]
+    _upload_presentation_file(client, presentation_id)
 
     client.post(f"{PRESENTATIONS_BASE}/{presentation_id}/confirm-upload")
     res = client.post(f"{PRESENTATIONS_BASE}/{presentation_id}/confirm-upload")
@@ -231,14 +248,49 @@ def test_full_flow_init_then_confirm(client):
     presentation_id = init.json()["presentation_id"]
     assert "biologia_clase1.pptx" in init.json()["storage_key"]
 
-    # 2. Confirm upload
+    # 2. Upload file through API proxy
+    _upload_presentation_file(client, presentation_id)
+
+    # 3. Confirm upload
     confirm = client.post(f"{PRESENTATIONS_BASE}/{presentation_id}/confirm-upload")
     assert confirm.status_code == 200
     assert confirm.json()["status"] == "uploaded"
 
-    # 3. Job encolado
+    # 4. Job encolado
     job_id = confirm.json()["job_id"]
     job = client.get(f"/api/v1/jobs/{job_id}").json()
     assert job["status"] == "queued"
     assert job["job_type"] == "parse_presentation"
     assert job["project_id"] == project_id
+
+
+def test_upload_file_stores_original_in_storage(client, storage_provider):
+    project_id = _create_project(client)
+    init_res = client.post(
+        f"{PROJECTS_BASE}/{project_id}/presentations/init-upload",
+        json={"filename": "deck.pptx"},
+    )
+    presentation_id = init_res.json()["presentation_id"]
+    storage_key = init_res.json()["storage_key"]
+
+    res = client.post(
+        f"{PRESENTATIONS_BASE}/{presentation_id}/upload-file",
+        files={"file": ("deck.pptx", b"real-pptx-bytes", PPTX_CONTENT_TYPE)},
+    )
+
+    assert res.status_code == 204
+    assert storage_provider.download_file(storage_key) == b"real-pptx-bytes"
+
+
+def test_confirm_upload_requires_file_in_storage(client):
+    project_id = _create_project(client)
+    init_res = client.post(
+        f"{PROJECTS_BASE}/{project_id}/presentations/init-upload",
+        json={"filename": "deck.pptx"},
+    )
+    presentation_id = init_res.json()["presentation_id"]
+
+    res = client.post(f"{PRESENTATIONS_BASE}/{presentation_id}/confirm-upload")
+
+    assert res.status_code == 409
+    assert "not available in storage" in res.json()["detail"]

@@ -4,7 +4,7 @@ import uuid
 from fastapi import HTTPException, status
 from pptx import Presentation as PptxPresentation
 
-from app.modules.presentations.rendering import render_slide_previews
+from app.modules.presentations.rendering import render_slide_backgrounds, render_slide_previews
 from app.modules.projects.models import Slide
 from app.modules.projects.service import MOCK_ORG_ID
 from app.modules.slides.repository import SlideRepository
@@ -58,7 +58,7 @@ class SlideService:
         slide.metadata_ = metadata
 
         has_text_update = "title" in update_data or "visible_text" in update_data
-        if has_text_update and _contains_canvas_text_blocks(metadata):
+        if has_text_update and _contains_canvas_text(metadata):
             self._update_pptx_text_and_previews(slide)
 
         return SlideRead.from_model(self.repo.save(slide))
@@ -75,11 +75,11 @@ class SlideService:
         if slide_index < 0 or slide_index >= len(deck.slides):
             return
 
-        text_blocks = _get_canvas_text_blocks(slide.metadata_ or {})
+        text_entries = _get_canvas_text_entries(slide.metadata_ or {})
         ppt_slide = deck.slides[slide_index]
-        for block in text_blocks:
-            shape_index = _shape_index_from_block_id(str(block.get("id") or ""))
-            text = str(block.get("text") or "")
+        for entry in text_entries:
+            shape_index = _shape_index_from_block(entry)
+            text = str(entry.get("text") or "")
             if shape_index is None or shape_index >= len(ppt_slide.shapes):
                 continue
             shape = ppt_slide.shapes[shape_index]
@@ -101,23 +101,57 @@ class SlideService:
             original_filename=presentation.original_filename,
             storage=storage,
         )
-        if not preview_keys:
-            return
+        background_keys = render_slide_backgrounds(
+            pptx_bytes=updated_pptx,
+            presentation_id=presentation.id,
+            original_filename=presentation.original_filename,
+            storage=storage,
+        )
 
         slides = self.repo.list_by_presentation_id(presentation.id)
         for current_slide in slides:
             preview_key = preview_keys.get(current_slide.position)
-            if not preview_key:
+            background_key = background_keys.get(current_slide.position)
+            if not preview_key and not background_key:
                 continue
-            current_slide.thumbnail_key = preview_key
             current_metadata = dict(current_slide.metadata_ or {})
-            current_metadata["rendered_image_key"] = preview_key
+            if preview_key:
+                current_slide.thumbnail_key = preview_key
+                current_metadata["rendered_image_key"] = preview_key
+            if background_key:
+                current_metadata["background_image_key"] = background_key
+                canvas = dict(current_metadata.get("canvas") or {})
+                background = dict(canvas.get("background") or {})
+                background["key"] = background_key
+                canvas["background"] = background
+                elements = canvas.get("elements")
+                if isinstance(elements, list):
+                    for element in elements:
+                        if isinstance(element, dict) and element.get("type") == "background":
+                            element["src"] = background_key
+                current_metadata["canvas"] = canvas
             current_slide.metadata_ = current_metadata
         self.repo.commit()
 
 
-def _contains_canvas_text_blocks(metadata: dict) -> bool:
-    return bool(_get_canvas_text_blocks(metadata))
+def _contains_canvas_text(metadata: dict) -> bool:
+    return bool(_get_canvas_text_entries(metadata))
+
+
+def _get_canvas_text_entries(metadata: dict) -> list[dict]:
+    canvas = metadata.get("canvas")
+    if not isinstance(canvas, dict):
+        return []
+    elements = canvas.get("elements")
+    if isinstance(elements, list):
+        text_elements = [
+            element
+            for element in elements
+            if isinstance(element, dict) and element.get("type") == "text"
+        ]
+        if text_elements:
+            return text_elements
+    return _get_canvas_text_blocks(metadata)
 
 
 def _get_canvas_text_blocks(metadata: dict) -> list[dict]:
@@ -128,6 +162,13 @@ def _get_canvas_text_blocks(metadata: dict) -> list[dict]:
     if not isinstance(text_blocks, list):
         return []
     return [block for block in text_blocks if isinstance(block, dict)]
+
+
+def _shape_index_from_block(block: dict) -> int | None:
+    shape_index = block.get("shape_index")
+    if isinstance(shape_index, int):
+        return shape_index
+    return _shape_index_from_block_id(str(block.get("id") or ""))
 
 
 def _shape_index_from_block_id(block_id: str) -> int | None:
