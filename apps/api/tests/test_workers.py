@@ -287,12 +287,43 @@ def test_parse_presentation_completes_successfully():
         assert slides[0].position == 1
         assert slides[0].title == "Clase 1"
         assert "Objetivo de aprendizaje" in slides[0].metadata_["visible_text"]
-        assert slides[0].thumbnail_key is not None
-        assert slides[0].thumbnail_key == slides[0].metadata_["rendered_image_key"]
-        assert slides[0].metadata_["slide_preview"]["asset_type"] == "slide_preview"
-        assert slides[0].metadata_["slide_preview"]["includes_text"] is True
         assert slides[0].notes is None
         assert slides[0].metadata_["dialogue"] == ""
+    finally:
+        db.close()
+
+
+def test_parse_presentation_saves_thumbnails_when_preview_rendering_succeeds():
+    storage = InMemoryStorageProvider()
+    job_id, presentation_id = _create_parse_fixture(storage)
+
+    with patch("app.workers.base_task.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.get_storage", return_value=storage), \
+         patch(
+             "app.workers.tasks.render_slide_previews",
+             return_value={1: "presentations/test/previews/slide-1.png", 2: "presentations/test/previews/slide-2.png"},
+         ):
+        celery_app.conf.task_always_eager = True
+        result = ParsePresentationTask().apply(kwargs={
+            "job_id": str(job_id),
+            "presentation_id": str(presentation_id),
+        })
+
+    assert not result.failed()
+
+    db = _TestingSession()
+    try:
+        slides = (
+            db.query(Slide)
+            .filter(Slide.presentation_id == presentation_id)
+            .order_by(Slide.position)
+            .all()
+        )
+        assert slides[0].thumbnail_key == "presentations/test/previews/slide-1.png"
+        assert slides[0].metadata_["rendered_image_key"] == "presentations/test/previews/slide-1.png"
+        assert slides[0].metadata_["slide_preview"]["asset_type"] == "slide_preview"
+        assert slides[0].metadata_["slide_preview"]["includes_text"] is True
     finally:
         db.close()
 
