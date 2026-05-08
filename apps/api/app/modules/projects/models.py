@@ -32,8 +32,11 @@ class AssetType(str, Enum):
     slide_preview = "slide_preview"
     slide_render = "slide_render"
     tts_audio = "tts_audio"
+    slide_audio = "slide_audio"
     avatar_clip = "avatar_clip"
+    generated_avatar_clip = "generated_avatar_clip"
     slide_video = "slide_video"
+    slide_segment_video = "slide_segment_video"
     final_video = "final_video"
 
 

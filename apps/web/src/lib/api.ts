@@ -1,11 +1,37 @@
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  errorCode?: string;
+
+  constructor(status: number, path: string, detail: unknown) {
+    const parsed = parseErrorDetail(detail);
+    super(parsed.message || `API error ${status}: ${path}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.errorCode = parsed.errorCode;
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (!res.ok) throw new Error(`API error ${res.status}: ${path}`);
+  if (!res.ok) throw await buildApiError(res, path);
+  if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
+async function apiFetchOptional<T>(path: string, init?: RequestInit): Promise<T | null> {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw await buildApiError(res, path);
   return res.json() as Promise<T>;
 }
 
@@ -16,7 +42,48 @@ async function apiUpload(path: string, file: File): Promise<void> {
     method: "POST",
     body: form,
   });
-  if (!res.ok) throw new Error(`API upload error ${res.status}: ${path}`);
+  if (!res.ok) throw await buildApiError(res, path);
+}
+
+async function apiUploadJson<T>(path: string, file: File): Promise<T> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) throw await buildApiError(res, path);
+  return res.json() as Promise<T>;
+}
+
+async function buildApiError(res: Response, path: string): Promise<ApiError> {
+  let detail: unknown = null;
+  try {
+    detail = await res.json();
+  } catch {
+    detail = await res.text().catch(() => null);
+  }
+  return new ApiError(res.status, path, detail);
+}
+
+function parseErrorDetail(detail: unknown): { message?: string; errorCode?: string } {
+  const payload = isRecord(detail) && "detail" in detail ? detail.detail : detail;
+  if (isRecord(payload)) {
+    const message = typeof payload.message === "string" ? payload.message : undefined;
+    const errorCode =
+      typeof payload.error_code === "string"
+        ? payload.error_code
+        : typeof payload.code === "string"
+          ? payload.code
+          : undefined;
+    return { message, errorCode };
+  }
+  if (typeof payload === "string") return { message: payload };
+  return {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 export interface HealthResponse {
@@ -39,6 +106,29 @@ export interface ProjectList {
   total: number;
   skip: number;
   limit: number;
+}
+
+export interface ProjectAvatar {
+  object_key: string;
+  filename: string;
+  content_type: string | null;
+  url: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  updated_at: string | null;
+  avatar_asset_id: string;
+  avatar_preview_url: string;
+  mime_type: string | null;
+  size_bytes: number | null;
+}
+
+export interface ProjectAvatarLayoutUpdate {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface CreateProjectInput {
@@ -168,6 +258,7 @@ export interface GenerationJob {
     | "generating_audio"
     | "generating_avatar"
     | "rendering_slides"
+    | "composing_slide"
     | "composing_video"
     | "completed"
     | "failed"
@@ -204,6 +295,9 @@ export interface VideoSettings {
   elevenlabs_api_key_masked: string | null;
   elevenlabs_voice_id: string | null;
   wavespeed_api_key_masked: string | null;
+  avatar_source_url: string | null;
+  avatar_source_asset_id: string | null;
+  using_debug_avatar_source: boolean;
   elevenlabs_valid: boolean;
   wavespeed_valid: boolean;
   validation_status: "not_configured" | "saved" | "valid" | "invalid";
@@ -215,6 +309,8 @@ export interface UpdateVideoSettingsInput {
   elevenlabs_api_key?: string | null;
   elevenlabs_voice_id?: string | null;
   wavespeed_api_key?: string | null;
+  avatar_source_url?: string | null;
+  avatar_source_asset_id?: string | null;
 }
 
 export interface VideoSettingsValidation extends VideoSettings {
@@ -230,6 +326,7 @@ export interface GenerationStatus {
     | "generating_audio"
     | "generating_avatar"
     | "rendering_slides"
+    | "composing_slide"
     | "composing_video"
     | "completed"
     | "failed"
@@ -241,6 +338,25 @@ export interface GenerationStatus {
   error_code: string | null;
   error_message: string | null;
   final_video_url: string | null;
+}
+
+export interface DebugGenerationAsset {
+  id: string;
+  slide_id: string | null;
+  asset_type: string;
+  storage_key: string;
+  filename: string;
+  mime_type: string | null;
+  size_bytes: number;
+  duration_seconds: number | null;
+  download_url: string;
+}
+
+export interface DebugGenerationAssetsResponse {
+  ok: boolean;
+  has_video_settings: boolean;
+  latest_generation_job_id: string | null;
+  assets: DebugGenerationAsset[];
 }
 
 export const api = {
@@ -262,6 +378,19 @@ export const api = {
       apiFetch<ProjectGenerationConfig>(`/api/v1/projects/${projectId}/generation-config`, {
         method: "PUT",
         body: JSON.stringify(input),
+      }),
+    getAvatar: (projectId: string) =>
+      apiFetchOptional<ProjectAvatar>(`/api/v1/projects/${projectId}/avatar`),
+    uploadAvatar: (projectId: string, file: File) =>
+      apiUploadJson<ProjectAvatar>(`/api/v1/projects/${projectId}/avatar`, file),
+    updateAvatarLayout: (projectId: string, payload: ProjectAvatarLayoutUpdate) =>
+      apiFetch<ProjectAvatar>(`/api/v1/projects/${projectId}/avatar/layout`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      }),
+    deleteAvatar: (projectId: string) =>
+      apiFetch<void>(`/api/v1/projects/${projectId}/avatar`, {
+        method: "DELETE",
       }),
   },
   presentations: {
@@ -315,6 +444,10 @@ export const api = {
       apiFetch<GenerationStatus>(`/api/v1/projects/${projectId}/generation-status`),
     finalVideo: (projectId: string) =>
       apiFetch<FinalVideoResponse>(`/api/v1/projects/${projectId}/final-video`),
+    debugAssets: (projectId: string) =>
+      apiFetch<DebugGenerationAssetsResponse>(
+        `/api/v1/projects/${projectId}/debug/generation-assets`,
+      ),
   },
   videoSettings: {
     get: (projectId: string) =>

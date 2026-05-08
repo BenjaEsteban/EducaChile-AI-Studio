@@ -1,4 +1,6 @@
 import uuid
+import types
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -143,3 +145,128 @@ def test_provider_delete_missing_raises():
 def test_provider_presigned_download_missing_raises():
     with pytest.raises(FileNotFoundError):
         InMemoryStorageProvider().generate_presigned_download_url("missing")
+
+
+def test_storage_factory_returns_minio_by_default(monkeypatch):
+    import app.providers.storage as storage_module
+
+    sentinel = object()
+    storage_module._get_provider.cache_clear()
+    monkeypatch.setattr("app.providers.storage.settings.STORAGE_BACKEND", "minio")
+    monkeypatch.setattr(storage_module, "MinIOStorageProvider", lambda: sentinel)
+
+    assert storage_module.get_storage() is sentinel
+    storage_module._get_provider.cache_clear()
+
+
+def test_storage_factory_returns_azure(monkeypatch):
+    import app.providers.storage as storage_module
+
+    class FakeAzureProvider:
+        def __init__(self, connection_string, container_name, public_base_url):
+            self.connection_string = connection_string
+            self.container_name = container_name
+            self.public_base_url = public_base_url
+
+    fake_module = types.ModuleType("app.providers.storage.azure_blob_provider")
+    fake_module.AzureBlobStorageProvider = FakeAzureProvider
+    storage_module._get_provider.cache_clear()
+    monkeypatch.setitem(sys.modules, "app.providers.storage.azure_blob_provider", fake_module)
+    monkeypatch.setattr("app.providers.storage.settings.STORAGE_BACKEND", "azure")
+    monkeypatch.setattr(
+        "app.providers.storage.settings.AZURE_STORAGE_CONNECTION_STRING",
+        "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=secret;EndpointSuffix=core.windows.net",
+    )
+    monkeypatch.setattr("app.providers.storage.settings.AZURE_STORAGE_CONTAINER", "assets")
+    monkeypatch.setattr(
+        "app.providers.storage.settings.AZURE_STORAGE_PUBLIC_BASE_URL",
+        "https://test.blob.core.windows.net",
+    )
+
+    provider = storage_module.get_storage()
+
+    assert isinstance(provider, FakeAzureProvider)
+    assert provider.container_name == "assets"
+    storage_module._get_provider.cache_clear()
+
+
+def test_azure_storage_service_upload_download_and_sas(monkeypatch):
+    from app.providers.storage.azure_blob_provider import AzureBlobStorageProvider
+
+    uploaded = {}
+
+    class FakeDownloader:
+        def readall(self):
+            return b"downloaded"
+
+    class FakeBlobClient:
+        def upload_blob(self, data, overwrite, content_settings):
+            uploaded["data"] = data
+            uploaded["overwrite"] = overwrite
+            uploaded["content_type"] = content_settings.content_type
+
+        def download_blob(self):
+            return FakeDownloader()
+
+        def exists(self):
+            return True
+
+    class FakeContainerClient:
+        def create_container(self):
+            return None
+
+        def get_blob_client(self, key):
+            uploaded["key"] = key
+            return FakeBlobClient()
+
+        def delete_blob(self, key):
+            uploaded["deleted"] = key
+
+    class FakeBlobServiceClient:
+        @classmethod
+        def from_connection_string(cls, connection_string):
+            uploaded["connection_string"] = connection_string
+            return cls()
+
+        def get_container_client(self, container_name):
+            uploaded["container_name"] = container_name
+            return FakeContainerClient()
+
+    class FakeContentSettings:
+        def __init__(self, content_type):
+            self.content_type = content_type
+
+    class FakeBlobSasPermissions:
+        def __init__(self, read=False, write=False, create=False):
+            self.read = read
+            self.write = write
+            self.create = create
+
+    fake_blob_module = types.ModuleType("azure.storage.blob")
+    fake_blob_module.BlobServiceClient = FakeBlobServiceClient
+    fake_blob_module.ContentSettings = FakeContentSettings
+    fake_blob_module.BlobSasPermissions = FakeBlobSasPermissions
+    fake_blob_module.generate_blob_sas = lambda **kwargs: "sig=fake"
+    fake_azure_module = types.ModuleType("azure")
+    fake_storage_module = types.ModuleType("azure.storage")
+    fake_storage_module.blob = fake_blob_module
+    fake_azure_module.storage = fake_storage_module
+    monkeypatch.setitem(sys.modules, "azure", fake_azure_module)
+    monkeypatch.setitem(sys.modules, "azure.storage", fake_storage_module)
+    monkeypatch.setitem(sys.modules, "azure.storage.blob", fake_blob_module)
+
+    service = AzureBlobStorageProvider(
+        connection_string=(
+            "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=secret;"
+            "EndpointSuffix=core.windows.net"
+        ),
+        container_name="assets",
+        public_base_url="https://test.blob.core.windows.net",
+    )
+
+    service.upload_bytes("file.txt", b"hello", "text/plain")
+
+    assert uploaded["data"] == b"hello"
+    assert uploaded["content_type"] == "text/plain"
+    assert service.download_bytes("file.txt") == b"downloaded"
+    assert "sig=fake" in service.generate_read_url("file.txt")

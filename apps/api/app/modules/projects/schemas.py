@@ -166,3 +166,26 @@ class AssetRead(BaseModel):
     mime_type: str | None
     size_bytes: int | None
     created_at: datetime
+
+
+class ProjectAvatarRead(BaseModel):
+    object_key: str
+    filename: str
+    content_type: str | None
+    url: str
+    x: float
+    y: float
+    width: float
+    height: float
+    updated_at: datetime | None
+    avatar_asset_id: uuid.UUID
+    avatar_preview_url: str
+    mime_type: str | None
+    size_bytes: int | None
+
+
+class ProjectAvatarLayoutUpdate(BaseModel):
+    x: float = Field(..., ge=0)
+    y: float = Field(..., ge=0)
+    width: float = Field(..., gt=0)
+    height: float = Field(..., gt=0)

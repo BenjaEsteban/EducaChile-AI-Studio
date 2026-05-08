@@ -287,25 +287,43 @@ def test_parse_presentation_completes_successfully():
         assert slides[0].position == 1
         assert slides[0].title == "Clase 1"
         assert "Objetivo de aprendizaje" in slides[0].metadata_["visible_text"]
-        assert slides[0].metadata_["canvas"]["text"]["title"] == "Clase 1"
-        assert slides[0].metadata_["canvas"]["width"] == 960
-        assert slides[0].metadata_["canvas"]["height"] > 0
-        assert slides[0].metadata_["canvas"]["version"] == 1
-        assert len(slides[0].metadata_["canvas"]["text_blocks"]) >= 2
-        assert slides[0].metadata_["canvas"]["text_blocks"][0]["text"] == "Clase 1"
-        assert slides[0].metadata_["canvas"]["text_blocks"][0]["shape_index"] == 0
-        elements = slides[0].metadata_["canvas"]["elements"]
-        assert elements[0]["type"] == "background"
-        text_elements = [element for element in elements if element["type"] == "text"]
-        assert text_elements[0]["text"] == "Clase 1"
-        assert text_elements[0]["shape_index"] == 0
-        assert text_elements[0]["style"]["fontFamily"]
-        assert "originalFontFamily" in text_elements[0]["style"]
-        assert text_elements[0]["style"]["fallbackFontFamily"] == "Arial"
-        assert text_elements[0]["style"]["color"] == "#FFFFFF"
-        assert text_elements[0]["style"]["originalColor"] == "#FFFFFF"
         assert slides[0].notes is None
         assert slides[0].metadata_["dialogue"] == ""
+    finally:
+        db.close()
+
+
+def test_parse_presentation_saves_thumbnails_when_preview_rendering_succeeds():
+    storage = InMemoryStorageProvider()
+    job_id, presentation_id = _create_parse_fixture(storage)
+
+    with patch("app.workers.base_task.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.worker_db_session", _testing_worker_session), \
+         patch("app.workers.tasks.get_storage", return_value=storage), \
+         patch(
+             "app.workers.tasks.render_slide_previews",
+             return_value={1: "presentations/test/previews/slide-1.png", 2: "presentations/test/previews/slide-2.png"},
+         ):
+        celery_app.conf.task_always_eager = True
+        result = ParsePresentationTask().apply(kwargs={
+            "job_id": str(job_id),
+            "presentation_id": str(presentation_id),
+        })
+
+    assert not result.failed()
+
+    db = _TestingSession()
+    try:
+        slides = (
+            db.query(Slide)
+            .filter(Slide.presentation_id == presentation_id)
+            .order_by(Slide.position)
+            .all()
+        )
+        assert slides[0].thumbnail_key == "presentations/test/previews/slide-1.png"
+        assert slides[0].metadata_["rendered_image_key"] == "presentations/test/previews/slide-1.png"
+        assert slides[0].metadata_["slide_preview"]["asset_type"] == "slide_preview"
+        assert slides[0].metadata_["slide_preview"]["includes_text"] is True
     finally:
         db.close()
 

@@ -70,6 +70,8 @@ class VideoGenerationSettings(Base, TimestampMixin):
     elevenlabs_voice_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     wavespeed_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     wavespeed_api_key_last_four: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    avatar_source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    avatar_source_asset_id: Mapped[uuid.UUID | None] = mapped_column(GUID, nullable=True)
     validation_status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="not_configured"
     )

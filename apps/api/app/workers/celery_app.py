@@ -29,8 +29,15 @@ celery_app.conf.update(
     # Reintentos y timeouts
     task_acks_late=True,          # ack solo después de completar (evita pérdida si el worker muere)
     task_reject_on_worker_lost=True,
-    task_soft_time_limit=300,     # 5 min → SoftTimeLimitExceeded (puede limpiar)
-    task_time_limit=360,          # 6 min → SIGKILL
+    task_soft_time_limit=300,     # default for small tasks
+    task_time_limit=360,
+    task_annotations={
+        "app.workers.tasks.generate_video": {
+            "soft_time_limit": 1800,
+            "time_limit": 2100,
+            "max_retries": 1,
+        },
+    },
     # Concurrencia
     worker_prefetch_multiplier=1, # un task a la vez por worker (fair dispatch)
     # Queues

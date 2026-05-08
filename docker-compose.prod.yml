@@ -44,6 +44,14 @@ services:
     image: ${DOCKERHUB_API_IMAGE}:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file: ${ENV_FILE:-.env.production}
+    environment:
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-minio}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
+      AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-educachile-assets}
+      AZURE_STORAGE_PUBLIC_BASE_URL: ${AZURE_STORAGE_PUBLIC_BASE_URL:-}
+      DEFAULT_LIPSYNC_MODEL: ${DEFAULT_LIPSYNC_MODEL:-wavespeed-ai/ltx-2-19b/lipsync}
+      FALLBACK_LIPSYNC_MODEL: ${FALLBACK_LIPSYNC_MODEL:-}
+      LIPSYNC_PROMPT: ${LIPSYNC_PROMPT:-A front-facing presenter speaking naturally, visible mouth movement, subtle natural head motion, realistic lip sync, stable face, well-lit portrait.}
     ports:
       - "8000:8000"
     depends_on:
@@ -58,7 +66,15 @@ services:
     image: ${DOCKERHUB_API_IMAGE}:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file: ${ENV_FILE:-.env.production}
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --queues=default,presentations
+    environment:
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-minio}
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
+      AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-educachile-assets}
+      AZURE_STORAGE_PUBLIC_BASE_URL: ${AZURE_STORAGE_PUBLIC_BASE_URL:-}
+      DEFAULT_LIPSYNC_MODEL: ${DEFAULT_LIPSYNC_MODEL:-wavespeed-ai/ltx-2-19b/lipsync}
+      FALLBACK_LIPSYNC_MODEL: ${FALLBACK_LIPSYNC_MODEL:-}
+      LIPSYNC_PROMPT: ${LIPSYNC_PROMPT:-A front-facing presenter speaking naturally, visible mouth movement, subtle natural head motion, realistic lip sync, stable face, well-lit portrait.}
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --queues=default,presentations,generation
     depends_on:
       postgres:
         condition: service_healthy

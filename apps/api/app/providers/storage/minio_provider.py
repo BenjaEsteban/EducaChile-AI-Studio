@@ -1,5 +1,6 @@
 import io
 import logging
+from urllib.parse import urlparse
 
 from minio import Minio
 from minio.error import S3Error
@@ -13,19 +14,40 @@ logger = logging.getLogger(__name__)
 class MinIOStorageProvider(StorageProvider):
     def __init__(self) -> None:
         self._bucket = settings.MINIO_BUCKET
+        internal_endpoint, internal_secure = _normalize_minio_endpoint(
+            settings.MINIO_INTERNAL_ENDPOINT or settings.MINIO_ENDPOINT,
+            settings.MINIO_SECURE,
+        )
+        public_endpoint, public_secure = _normalize_minio_endpoint(
+            settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT,
+            settings.MINIO_SECURE,
+        )
         self._client = Minio(
-            endpoint=settings.MINIO_ENDPOINT,
+            endpoint=internal_endpoint,
             access_key=settings.MINIO_ACCESS_KEY,
             secret_key=settings.MINIO_SECRET_KEY,
-            secure=settings.MINIO_SECURE,
+            secure=internal_secure,
         )
         self._presign_client = Minio(
-            endpoint=settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT,
+            endpoint=public_endpoint,
             access_key=settings.MINIO_ACCESS_KEY,
             secret_key=settings.MINIO_SECRET_KEY,
-            secure=settings.MINIO_SECURE,
+            secure=public_secure,
             region="us-east-1",
         )
+        self._external_presign_client: Minio | None = None
+        if settings.EXTERNAL_PROVIDER_ASSET_BASE_URL:
+            external_endpoint, external_secure = _normalize_minio_endpoint(
+                settings.EXTERNAL_PROVIDER_ASSET_BASE_URL,
+                settings.MINIO_SECURE,
+            )
+            self._external_presign_client = Minio(
+                endpoint=external_endpoint,
+                access_key=settings.MINIO_ACCESS_KEY,
+                secret_key=settings.MINIO_SECRET_KEY,
+                secure=external_secure,
+                region="us-east-1",
+            )
         self._ensure_bucket()
 
     # ── Bucket setup ──────────────────────────────────────────────────────────
@@ -111,6 +133,21 @@ class MinIOStorageProvider(StorageProvider):
         )
         return PresignedURL(url=url, key=key, expires_in=expires_in)
 
+    def generate_external_download_url(
+        self,
+        key: str,
+        expires_in: int = 3600,
+    ) -> PresignedURL:
+        from datetime import timedelta
+
+        client = self._external_presign_client or self._presign_client
+        url = client.presigned_get_object(
+            bucket_name=self._bucket,
+            object_name=key,
+            expires=timedelta(seconds=expires_in),
+        )
+        return PresignedURL(url=url, key=key, expires_in=expires_in)
+
     def delete_file(self, key: str) -> None:
         try:
             self._client.remove_object(self._bucket, key)
@@ -119,3 +156,25 @@ class MinIOStorageProvider(StorageProvider):
             if exc.code == "NoSuchKey":
                 raise FileNotFoundError(f"Object not found: {key}") from exc
             raise
+
+    def exists(self, object_key: str) -> bool:
+        try:
+            self._client.stat_object(self._bucket, object_key)
+            return True
+        except S3Error as exc:
+            if exc.code == "NoSuchKey":
+                return False
+            raise
+
+
+def _normalize_minio_endpoint(endpoint: str, default_secure: bool) -> tuple[str, bool]:
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"http", "https"}:
+        host = parsed.netloc
+        if parsed.path and parsed.path != "/":
+            logger.warning(
+                "Ignoring path component in MinIO endpoint '%s'; use only scheme://host:port",
+                endpoint,
+            )
+        return host, parsed.scheme == "https"
+    return endpoint, default_secure

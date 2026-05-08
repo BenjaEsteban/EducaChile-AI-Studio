@@ -1,0 +1,3 @@
+from app.providers.storage.azure_blob_provider import AzureBlobStorageProvider
+
+AzureBlobStorageService = AzureBlobStorageProvider

@@ -73,6 +73,22 @@ class GenerationRepository:
             .first()
         )
 
+    def get_asset(
+        self,
+        asset_id: uuid.UUID,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> Asset | None:
+        return (
+            self.db.query(Asset)
+            .filter(
+                Asset.id == asset_id,
+                Asset.project_id == project_id,
+                Asset.organization_id == org_id,
+            )
+            .first()
+        )
+
     def get_video_settings(
         self,
         project_id: uuid.UUID,
@@ -110,3 +126,61 @@ class GenerationRepository:
             .order_by(GenerationJob.created_at.desc())
             .first()
         )
+
+    def get_running_generation_job(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> GenerationJob | None:
+        return (
+            self.db.query(GenerationJob)
+            .filter(
+                GenerationJob.project_id == project_id,
+                GenerationJob.organization_id == org_id,
+                GenerationJob.status.in_(
+                    [
+                        "queued",
+                        "validating",
+                        "generating_audio",
+                        "generating_avatar",
+                        "rendering_slides",
+                        "composing_slide",
+                        "composing_video",
+                    ]
+                ),
+            )
+            .order_by(GenerationJob.created_at.desc())
+            .first()
+        )
+
+    def list_running_generation_jobs(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> list[GenerationJob]:
+        return (
+            self.db.query(GenerationJob)
+            .filter(
+                GenerationJob.project_id == project_id,
+                GenerationJob.organization_id == org_id,
+                GenerationJob.status.in_(
+                    [
+                        "queued",
+                        "validating",
+                        "generating_audio",
+                        "generating_avatar",
+                        "rendering_slides",
+                        "composing_slide",
+                        "composing_video",
+                    ]
+                ),
+            )
+            .order_by(GenerationJob.created_at.desc())
+            .all()
+        )
+
+    def save_generation_job(self, generation_job: GenerationJob) -> GenerationJob:
+        self.db.add(generation_job)
+        self.db.commit()
+        self.db.refresh(generation_job)
+        return generation_job

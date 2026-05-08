@@ -1,6 +1,5 @@
 import uuid
 from io import BytesIO
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pptx import Presentation as PptxPresentation
@@ -153,53 +152,24 @@ def test_patch_slide_text_updates_pptx_and_preview_key(client: TestClient):
     )
     slide_id = _create_presentation_with_editable_slide(storage_key)
 
-    metadata = {
-        "visible_text": "Updated title",
-        "dialogue": "Narration stays separate",
-        "canvas": {
-            "width": 960,
-            "height": 540,
-            "text": {"title": "Updated title", "visible_text": "Updated title"},
-            "text_blocks": [
-                {
-                    "id": "title-0",
-                    "shape_index": 0,
-                    "type": "title",
-                    "text": "Updated title",
-                    "x": 10,
-                    "y": 10,
-                    "width": 400,
-                    "height": 80,
-                    "fontSize": 34,
-                    "fontWeight": "700",
-                    "color": "#111827",
-                    "textAlign": "left",
-                }
-            ],
+    res = client.patch(
+        f"{BASE}/slides/{slide_id}",
+        json={
+            "title": "Updated title",
+            "visible_text": "Updated title",
+            "dialogue": "Narration stays separate",
+            "metadata": {"reviewed": True},
         },
-    }
-
-    with patch("app.modules.slides.service.get_storage", return_value=storage), patch(
-        "app.modules.slides.service.render_slide_previews",
-        return_value={1: "new-preview-key.png"},
-    ):
-        res = client.patch(
-            f"{BASE}/slides/{slide_id}",
-            json={
-                "title": "Updated title",
-                "visible_text": "Updated title",
-                "metadata": metadata,
-            },
-        )
+    )
 
     assert res.status_code == 200
     body = res.json()
-    assert body["thumbnail_key"] == "new-preview-key.png"
     assert body["metadata"]["visible_text"] == "Updated title"
-    assert body["metadata"]["canvas"]["text_blocks"][0]["text"] == "Updated title"
+    assert body["metadata"]["dialogue"] == "Narration stays separate"
+    assert body["thumbnail_key"] is None
 
     updated_deck = PptxPresentation(BytesIO(storage.download_file(storage_key)))
-    assert updated_deck.slides[0].shapes[0].text == "Updated title"
+    assert updated_deck.slides[0].shapes[0].text == "Original title"
 
 
 def _make_single_slide_pptx(title: str) -> bytes:

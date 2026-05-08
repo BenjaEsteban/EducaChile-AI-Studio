@@ -1,8 +1,12 @@
+import ipaddress
+import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
 
+from app.config import settings as app_settings
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.repository import GenerationRepository
 from app.modules.generation.schemas import (
@@ -17,10 +21,26 @@ from app.modules.generation.schemas import (
 from app.modules.jobs.models import Job, JobStatus, JobType
 from app.modules.jobs.repository import JobRepository
 from app.modules.projects.models import PresentationStatus
+from app.modules.presentations.rendering import render_slide_previews
 from app.modules.projects.service import MOCK_ORG_ID
 from app.providers.storage import get_storage
 from app.utils.crypto import decrypt_secret, encrypt_secret
 from app.workers.tasks import enqueue_generate_video
+
+logger = logging.getLogger(__name__)
+
+RUNNING_GENERATION_STATUSES = {
+    "queued",
+    "validating",
+    "generating_audio",
+    "generating_avatar",
+    "rendering_slides",
+    "composing_slide",
+    "composing_video",
+}
+STALLED_ERROR_MESSAGE = (
+    "Previous generation job stopped updating. Please try again."
+)
 
 
 class GenerationReadinessError(HTTPException):
@@ -28,6 +48,25 @@ class GenerationReadinessError(HTTPException):
         super().__init__(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": code, "message": message},
+        )
+
+
+class GenerationAlreadyRunningError(HTTPException):
+    def __init__(self, generation_job: GenerationJob) -> None:
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "GENERATION_ALREADY_RUNNING",
+                "code": "GENERATION_ALREADY_RUNNING",
+                "message": "A video generation job is already running.",
+                "job_id": str(generation_job.id),
+                "status": generation_job.status,
+                "updated_at": (
+                    generation_job.updated_at.isoformat()
+                    if generation_job.updated_at is not None
+                    else None
+                ),
+            },
         )
 
 
@@ -41,10 +80,34 @@ class GenerationService:
         self.job_repo = job_repo
 
     def start(self, project_id: uuid.UUID) -> StartGenerationResponse:
-        self._validate_readiness(project_id)
+        logger.info("generate-video request received: project_id=%s", project_id)
         project = self.repo.get_project(project_id, MOCK_ORG_ID)
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
+
+        existing_job = self.repo.get_running_generation_job(project_id, MOCK_ORG_ID)
+        logger.info(
+            "generate-video existing running job before stale check: project_id=%s "
+            "existing_job_id=%s existing_job_status=%s existing_job_updated_at=%s",
+            project_id,
+            existing_job.id if existing_job else None,
+            existing_job.status if existing_job else None,
+            existing_job.updated_at if existing_job else None,
+        )
+        self._fail_stale_running_jobs(project_id)
+        running_job = self.repo.get_running_generation_job(project_id, MOCK_ORG_ID)
+        if running_job is not None:
+            logger.info(
+                "generate-video blocked by active job: project_id=%s existing_job_id=%s "
+                "existing_job_status=%s existing_job_updated_at=%s",
+                project_id,
+                running_job.id,
+                running_job.status,
+                running_job.updated_at,
+            )
+            raise GenerationAlreadyRunningError(running_job)
+
+        self._validate_readiness(project_id)
 
         job = self.job_repo.create(
             Job(
@@ -66,12 +129,29 @@ class GenerationService:
                 current_step="Queued",
             )
         )
+        logger.info(
+            "Enqueueing generate_video: project_id=%s generation_job_id=%s "
+            "queue=%s status_before_enqueue=%s",
+            project_id,
+            generation_job.id,
+            "generation",
+            generation_job.status,
+        )
         job.celery_task_id = enqueue_generate_video(
             job_id=job.id,
             generation_job_id=generation_job.id,
             project_id=project_id,
         )
         self.job_repo.save(job)
+        logger.info(
+            "Enqueued generate_video: project_id=%s generation_job_id=%s "
+            "celery_task_id=%s queue=%s status_after_enqueue=%s",
+            project_id,
+            generation_job.id,
+            job.celery_task_id,
+            "generation",
+            generation_job.status,
+        )
         return StartGenerationResponse(
             generation_job=GenerationJobRead.model_validate(generation_job),
             job_id=job.id,
@@ -88,6 +168,7 @@ class GenerationService:
         return GenerationJobRead.model_validate(generation_job)
 
     def get_status(self, project_id: uuid.UUID) -> GenerationStatusRead:
+        self._fail_stale_running_jobs(project_id)
         generation_job = self.repo.get_latest_generation_job(project_id, MOCK_ORG_ID)
         if generation_job is None:
             return GenerationStatusRead(
@@ -103,7 +184,11 @@ class GenerationService:
 
         final_video_url = None
         if generation_job.status == "completed":
-            asset = self.repo.get_latest_final_video(project_id, MOCK_ORG_ID)
+            asset = (
+                self.repo.get_asset(generation_job.final_asset_id, project_id, MOCK_ORG_ID)
+                if generation_job.final_asset_id is not None
+                else self.repo.get_latest_final_video(project_id, MOCK_ORG_ID)
+            )
             if asset is not None:
                 final_video_url = get_storage().generate_presigned_download_url(
                     asset.storage_key
@@ -179,6 +264,10 @@ class GenerationService:
         if data.elevenlabs_voice_id is not None:
             settings.elevenlabs_voice_id = data.elevenlabs_voice_id.strip() or None
             settings.elevenlabs_valid = False
+        if data.avatar_source_url is not None:
+            settings.avatar_source_url = data.avatar_source_url.strip() or None
+        if data.avatar_source_asset_id is not None:
+            settings.avatar_source_asset_id = data.avatar_source_asset_id
 
         settings.validation_status = (
             "saved"
@@ -239,15 +328,14 @@ class GenerationService:
                 "MISSING_DIALOGUE",
                 f"Slides missing dialogue: {missing_dialogue}",
             )
-        missing_canvas = [
-            slide.position
-            for slide in presentation.slides
-            if not (slide.metadata_ or {}).get("canvas")
-        ]
-        if missing_canvas:
+        missing_previews = self._missing_slide_previews(presentation.slides)
+        if missing_previews:
+            self._regenerate_missing_slide_previews(presentation)
+            missing_previews = self._missing_slide_previews(presentation.slides)
+        if missing_previews:
             raise GenerationReadinessError(
-                "MISSING_CANVAS_STATE",
-                f"Slides missing editable canvas state: {missing_canvas}",
+                "MISSING_RENDERED_PREVIEW",
+                f"Slides missing rendered preview image: {missing_previews}",
             )
 
         settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
@@ -271,6 +359,16 @@ class GenerationService:
                 "MISSING_WAVESPEED_API_KEY",
                 "WaveSpeed API key is required",
             )
+        if not _has_avatar_source(settings):
+            raise GenerationReadinessError(
+                "MISSING_AVATAR_ASSET",
+                "Please upload an avatar image before generating the video.",
+            )
+        if not _has_public_provider_asset_endpoint():
+            raise GenerationReadinessError(
+                "EXTERNAL_ASSET_URL_NOT_PUBLIC",
+                "WaveSpeed requires a public URL for audio/avatar assets. Configure a public tunnel or external storage.",
+            )
         if not settings.elevenlabs_valid:
             raise GenerationReadinessError(
                 "INVALID_ELEVENLABS_CREDENTIALS",
@@ -280,6 +378,65 @@ class GenerationService:
             raise GenerationReadinessError(
                 "INVALID_WAVESPEED_CREDENTIALS",
                 "WaveSpeed credentials must be validated before generation",
+            )
+
+    def _missing_slide_previews(self, slides) -> list[int]:
+        storage = get_storage()
+        missing: list[int] = []
+        for slide in slides:
+            preview_key = _slide_preview_storage_key(slide)
+            if not preview_key:
+                missing.append(slide.position)
+                continue
+            try:
+                if storage.exists(preview_key):
+                    continue
+            except Exception:
+                # Fall back to a best-effort check; missing storage access should not
+                # reintroduce editable-canvas requirements.
+                try:
+                    storage.download_bytes(preview_key)
+                    continue
+                except Exception:
+                    pass
+            missing.append(slide.position)
+        return missing
+
+    def _regenerate_missing_slide_previews(self, presentation) -> None:
+        storage = get_storage()
+        try:
+            pptx_bytes = storage.download_file(presentation.storage_key)
+        except Exception:
+            return
+        try:
+            preview_keys = render_slide_previews(
+                pptx_bytes=pptx_bytes,
+                presentation_id=presentation.id,
+                original_filename=presentation.original_filename,
+                storage=storage,
+            )
+            if not preview_keys:
+                return
+            for slide in presentation.slides:
+                preview_key = preview_keys.get(slide.position)
+                if not preview_key:
+                    continue
+                metadata = dict(slide.metadata_ or {})
+                slide.thumbnail_key = preview_key
+                metadata["rendered_image_key"] = preview_key
+                metadata["slide_preview"] = {
+                    "asset_type": "slide_preview",
+                    "storage_key": preview_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                }
+                slide.metadata_ = metadata
+            self.repo.db.commit()
+        except Exception as exc:
+            logger.info(
+                "Could not regenerate slide previews for presentation %s: %s",
+                presentation.id,
+                exc,
             )
 
     def _settings_read(
@@ -293,6 +450,11 @@ class GenerationService:
                 wavespeed_api_key_masked=None,
                 elevenlabs_valid=False,
                 wavespeed_valid=False,
+                avatar_source_url=None,
+                avatar_source_asset_id=None,
+                using_debug_avatar_source=bool(
+                    app_settings.DEBUG_AVATAR_SOURCE_URL and not app_settings.is_production
+                ),
                 validation_status="not_configured",
                 last_validated_at=None,
                 updated_at=None,
@@ -301,12 +463,41 @@ class GenerationService:
             elevenlabs_api_key_masked=_mask(settings.elevenlabs_api_key_last_four),
             elevenlabs_voice_id=settings.elevenlabs_voice_id,
             wavespeed_api_key_masked=_mask(settings.wavespeed_api_key_last_four),
+            avatar_source_url=settings.avatar_source_url,
+            avatar_source_asset_id=settings.avatar_source_asset_id,
+            using_debug_avatar_source=(
+                not bool(settings.avatar_source_url or settings.avatar_source_asset_id)
+                and bool(app_settings.DEBUG_AVATAR_SOURCE_URL)
+                and not app_settings.is_production
+            ),
             elevenlabs_valid=settings.elevenlabs_valid,
             wavespeed_valid=settings.wavespeed_valid,
             validation_status=settings.validation_status,  # type: ignore[arg-type]
             last_validated_at=settings.last_validated_at,
             updated_at=settings.updated_at,
         )
+
+    def _fail_stale_running_jobs(self, project_id: uuid.UUID) -> None:
+        if app_settings.is_production:
+            return
+        now = datetime.now(UTC)
+        for generation_job in self.repo.list_running_generation_jobs(project_id, MOCK_ORG_ID):
+            if not _is_stale_generation_job(generation_job, now):
+                continue
+            logger.warning(
+                "Marking stale generation job failed: project_id=%s generation_job_id=%s "
+                "status=%s updated_at=%s",
+                project_id,
+                generation_job.id,
+                generation_job.status,
+                generation_job.updated_at,
+            )
+            generation_job.status = "failed"
+            generation_job.error_code = "GENERATION_JOB_STALLED"
+            generation_job.error_message = STALLED_ERROR_MESSAGE
+            generation_job.completed_at = now
+            generation_job.current_step = "Generation stalled"
+            self.repo.save_generation_job(generation_job)
 
 
 def _mask(last_four: str | None) -> str | None:
@@ -320,3 +511,69 @@ def _is_valid_key(value: str | None) -> bool:
     return len(value.strip()) >= 8 and not any(
         marker in lowered for marker in ("invalid", "expired", "revoked")
     )
+
+
+def _has_avatar_source(settings: VideoGenerationSettings) -> bool:
+    if settings.avatar_source_url or settings.avatar_source_asset_id:
+        return True
+    return bool(app_settings.DEBUG_AVATAR_SOURCE_URL and not app_settings.is_production)
+
+
+def _has_public_provider_asset_endpoint() -> bool:
+    if app_settings.STORAGE_BACKEND.lower() == "azure":
+        endpoint = app_settings.AZURE_STORAGE_PUBLIC_BASE_URL
+    else:
+        endpoint = app_settings.EXTERNAL_PROVIDER_ASSET_BASE_URL or app_settings.MINIO_PUBLIC_ENDPOINT
+    return _is_public_http_endpoint(endpoint)
+
+
+def _is_public_http_endpoint(endpoint: str | None) -> bool:
+    if not endpoint:
+        return False
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"http", "https"}:
+        hostname = parsed.hostname
+    else:
+        hostname = endpoint.split("/", 1)[0].split(":", 1)[0]
+    if not hostname:
+        return False
+    lowered_host = hostname.lower()
+    if lowered_host in {"localhost", "127.0.0.1", "0.0.0.0", "minio"}:
+        return False
+    if lowered_host.endswith(".local"):
+        return False
+    try:
+        ip_address = ipaddress.ip_address(lowered_host)
+        return not (
+            ip_address.is_private
+            or ip_address.is_loopback
+            or ip_address.is_link_local
+        )
+    except ValueError:
+        return True
+
+
+def _slide_preview_storage_key(slide) -> str | None:
+    metadata = slide.metadata_ or {}
+    slide_preview = metadata.get("slide_preview")
+    if isinstance(slide_preview, dict):
+        preview_key = slide_preview.get("storage_key")
+        if isinstance(preview_key, str) and preview_key:
+            return preview_key
+    rendered_key = metadata.get("rendered_image_key")
+    if isinstance(rendered_key, str) and rendered_key:
+        return rendered_key
+    if isinstance(slide.thumbnail_key, str) and slide.thumbnail_key:
+        return slide.thumbnail_key
+    return None
+
+
+def _is_stale_generation_job(generation_job: GenerationJob, now: datetime) -> bool:
+    if generation_job.status not in RUNNING_GENERATION_STATUSES:
+        return False
+    updated_at = generation_job.updated_at
+    if updated_at is None:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    return now - updated_at > timedelta(minutes=5)
