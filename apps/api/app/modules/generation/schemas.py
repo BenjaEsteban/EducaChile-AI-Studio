@@ -12,6 +12,7 @@ GenerationStatus = Literal[
     "generating_audio",
     "generating_avatar",
     "rendering_slides",
+    "composing_slide",
     "composing_video",
     "completed",
     "failed",
@@ -61,6 +62,9 @@ class VideoSettingsRead(BaseModel):
     elevenlabs_api_key_masked: str | None
     elevenlabs_voice_id: str | None
     wavespeed_api_key_masked: str | None
+    avatar_source_url: str | None
+    avatar_source_asset_id: uuid.UUID | None
+    using_debug_avatar_source: bool = False
     elevenlabs_valid: bool
     wavespeed_valid: bool
     validation_status: ValidationStatus
@@ -72,6 +76,8 @@ class VideoSettingsUpdate(BaseModel):
     elevenlabs_api_key: str | None = None
     elevenlabs_voice_id: str | None = None
     wavespeed_api_key: str | None = None
+    avatar_source_url: str | None = None
+    avatar_source_asset_id: uuid.UUID | None = None
 
 
 class VideoSettingsValidationRead(VideoSettingsRead):

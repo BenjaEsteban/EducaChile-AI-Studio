@@ -57,10 +57,9 @@ class SlideService:
             metadata["visible_text"] = update_data["visible_text"] or ""
         slide.metadata_ = metadata
 
-        has_text_update = "title" in update_data or "visible_text" in update_data
-        if has_text_update and _contains_canvas_text(metadata):
-            self._update_pptx_text_and_previews(slide)
-
+        # Visual PPT editing is disabled in the simplified flow. Slide updates may
+        # change narration metadata, but they must not rewrite PPT text or
+        # regenerate canvas/background layers.
         return SlideRead.from_model(self.repo.save(slide))
 
     def _update_pptx_text_and_previews(self, slide: Slide) -> None:

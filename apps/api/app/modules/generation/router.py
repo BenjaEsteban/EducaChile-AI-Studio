@@ -4,6 +4,12 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.modules.generation.debug import (
+    list_generation_debug_assets,
+    run_elevenlabs_debug,
+    run_ffmpeg_debug,
+    run_wavespeed_debug,
+)
 from app.modules.generation.repository import GenerationRepository
 from app.modules.generation.schemas import (
     FinalVideoRead,
@@ -86,3 +92,33 @@ def get_final_video(
     service: GenerationService = Depends(get_service),
 ):
     return service.final_video(project_id)
+
+
+@router.post("/{project_id}/debug/elevenlabs-test")
+def debug_elevenlabs_test(
+    project_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    return run_elevenlabs_debug(project_id, db)
+
+
+@router.post("/{project_id}/debug/wavespeed-test")
+def debug_wavespeed_test(
+    project_id: uuid.UUID,
+    avatar_source_url: str | None = None,
+    db: Session = Depends(get_db),
+):
+    return run_wavespeed_debug(project_id, db, avatar_source_url=avatar_source_url)
+
+
+@router.post("/{project_id}/debug/ffmpeg-compose-test")
+def debug_ffmpeg_compose_test(project_id: uuid.UUID):
+    return run_ffmpeg_debug(project_id)
+
+
+@router.get("/{project_id}/debug/generation-assets")
+def debug_generation_assets(
+    project_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    return list_generation_debug_assets(project_id, db)

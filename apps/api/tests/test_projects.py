@@ -2,6 +2,8 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+from tests.fakes import InMemoryStorageProvider
+
 BASE = "/api/v1/projects"
 
 
@@ -155,3 +157,108 @@ def test_delete_project_twice_returns_404(client):
     client.delete(f"{BASE}/{project_id}")
     res = client.delete(f"{BASE}/{project_id}")
     assert res.status_code == 404
+
+
+def test_get_avatar_missing_returns_404(client):
+    project_id = _create(client).json()["id"]
+
+    res = client.get(f"{BASE}/{project_id}/avatar")
+
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Avatar not configured for this project."
+
+
+def test_upload_avatar_success(client, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.projects.router.get_storage", lambda: storage)
+    project_id = _create(client).json()["id"]
+
+    res = client.post(
+        f"{BASE}/{project_id}/avatar",
+        files={"file": ("avatar.png", b"png-bytes", "image/png")},
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["object_key"].startswith(f"projects/{project_id}/avatar/")
+    assert body["filename"] == "avatar.png"
+    assert body["content_type"] == "image/png"
+    assert body["url"].startswith("http://minio-test/download/")
+    assert body["width"] == 160.0
+    assert storage.download_file(body["object_key"]) == b"png-bytes"
+
+
+def test_upload_avatar_rejects_invalid_content_type(client):
+    project_id = _create(client).json()["id"]
+
+    res = client.post(
+        f"{BASE}/{project_id}/avatar",
+        files={"file": ("avatar.txt", b"text", "text/plain")},
+    )
+
+    assert res.status_code == 400
+    assert res.json()["detail"]["code"] == "INVALID_AVATAR_MIME_TYPE"
+
+
+def test_get_avatar_returns_metadata_and_url(client, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.projects.router.get_storage", lambda: storage)
+    project_id = _create(client).json()["id"]
+    upload = client.post(
+        f"{BASE}/{project_id}/avatar",
+        files={"file": ("avatar.webp", b"webp-bytes", "image/webp")},
+    ).json()
+
+    res = client.get(f"{BASE}/{project_id}/avatar")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["object_key"] == upload["object_key"]
+    assert body["url"].startswith("http://minio-test/download/")
+
+
+def test_patch_avatar_layout_saves_values(client, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.projects.router.get_storage", lambda: storage)
+    project_id = _create(client).json()["id"]
+    client.post(
+        f"{BASE}/{project_id}/avatar",
+        files={"file": ("avatar.jpg", b"jpg-bytes", "image/jpeg")},
+    )
+
+    res = client.patch(
+        f"{BASE}/{project_id}/avatar/layout",
+        json={"x": 12, "y": 34, "width": 200, "height": 180},
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["x"] == 12
+    assert body["y"] == 34
+    assert body["width"] == 200
+    assert body["height"] == 180
+
+
+def test_delete_avatar_clears_metadata(client, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.projects.router.get_storage", lambda: storage)
+    project_id = _create(client).json()["id"]
+    uploaded = client.post(
+        f"{BASE}/{project_id}/avatar",
+        files={"file": ("avatar.png", b"png-bytes", "image/png")},
+    ).json()
+
+    res = client.delete(f"{BASE}/{project_id}/avatar")
+
+    assert res.status_code == 204
+    assert client.get(f"{BASE}/{project_id}/avatar").status_code == 404
+    try:
+        storage.download_file(uploaded["object_key"])
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("avatar object was not deleted")

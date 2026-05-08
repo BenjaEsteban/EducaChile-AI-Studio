@@ -1,18 +1,36 @@
 import io
+import ipaddress
+import json
 import logging
+import subprocess
+import tempfile
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import urlparse
 
+from celery.exceptions import SoftTimeLimitExceeded
 from pptx import Presentation as PptxPresentation
 from sqlalchemy import delete
 
 import app.models  # noqa: F401
+from app.config import settings
 from app.modules.composer.service import ComposerService
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
-from app.modules.presentations.rendering import render_slide_backgrounds, render_slide_previews
+from app.modules.generation.pipeline import (
+    PipelineError,
+    compose_final_video,
+    compose_segment_for_slide,
+    generate_audio_for_slide,
+    generate_avatar_clip_for_slide,
+    mark_generation_failed,
+    validate_generation_job,
+)
+from app.modules.presentations.rendering import render_slide_previews
 from app.modules.projects.models import Asset, Presentation, PresentationStatus, Slide
-from app.modules.tts.adapters import get_tts_provider
-from app.modules.video.adapters import get_avatar_video_provider
+from app.modules.tts.adapters import TTSProviderError, get_tts_provider
+from app.modules.video.adapters import AvatarVideoProviderError, get_avatar_video_provider
 from app.providers.storage import get_storage
 from app.utils.crypto import decrypt_secret
 from app.workers.base_task import JobTask
@@ -101,12 +119,6 @@ class ParsePresentationTask(JobTask):
                 original_filename=original_filename,
                 storage=storage,
             )
-            background_keys = render_slide_backgrounds(
-                pptx_bytes=pptx_bytes,
-                presentation_id=presentation_uuid,
-                original_filename=original_filename,
-                storage=storage,
-            )
 
             self.set_progress(job_id, 85.0, "Saving parsed slides")
             with worker_db_session() as db:
@@ -128,61 +140,11 @@ class ParsePresentationTask(JobTask):
                                 "visible_text": record["visible_text"],
                                 "dialogue": record["dialogue"],
                                 "rendered_image_key": preview_keys.get(record["slide_number"]),
-                                "background_image_key": background_keys.get(
-                                    record["slide_number"]
-                                ),
-                                "canvas": {
-                                    "version": 1,
-                                    "width": 960,
-                                    "height": _scale_emu(
-                                        int(deck.slide_height),
-                                        int(deck.slide_width),
-                                        960,
-                                    )
-                                    or 540,
-                                    "avatar": {
-                                        "enabled": True,
-                                        "x": 700,
-                                        "y": 290,
-                                        "width": 200,
-                                        "height": 200,
-                                    },
-                                    "text": {
-                                        "title": record["title"] or "",
-                                        "visible_text": record["visible_text"],
-                                    },
-                                    "background": {
-                                        "type": "background",
-                                        "key": background_keys.get(record["slide_number"]),
-                                    },
-                                    "text_blocks": record["text_blocks"],
-                                    "elements": [
-                                        {
-                                            "id": "background",
-                                            "type": "background",
-                                            "x": 0,
-                                            "y": 0,
-                                            "width": 960,
-                                            "height": _scale_emu(
-                                                int(deck.slide_height),
-                                                int(deck.slide_width),
-                                                960,
-                                            )
-                                            or 540,
-                                            "zIndex": 0,
-                                            "src": background_keys.get(record["slide_number"]),
-                                        },
-                                        *record["elements"],
-                                        {
-                                            "id": "avatar",
-                                            "type": "avatar",
-                                            "x": 700,
-                                            "y": 290,
-                                            "width": 200,
-                                            "height": 200,
-                                            "zIndex": 1000,
-                                        },
-                                    ],
+                                "slide_preview": {
+                                    "asset_type": "slide_preview",
+                                    "storage_key": preview_keys.get(record["slide_number"]),
+                                    "render_source": "ppt_render",
+                                    "includes_text": True,
                                 },
                             },
                         )
@@ -680,6 +642,8 @@ parse_presentation = celery_app.register_task(ParsePresentationTask())
 
 class GenerateVideoTask(JobTask):
     name = "app.workers.tasks.generate_video"
+    soft_time_limit = 1800
+    time_limit = 2100
 
     def run_job(
         self,
@@ -690,240 +654,556 @@ class GenerateVideoTask(JobTask):
     ) -> dict:
         generation_uuid = uuid.UUID(generation_job_id)
         project_uuid = uuid.UUID(project_id)
+        logger.info(
+            "generate_video task started: project_id=%s generation_job_id=%s celery_request_id=%s",
+            project_uuid,
+            generation_uuid,
+            self.request.id,
+        )
         storage = get_storage()
-        composer = ComposerService()
+        _log_storage_config_for_generation()
 
         try:
-            self.set_progress(job_id, 5.0, "Validating configuration")
-            _update_generation_job(generation_uuid, "validating", 5.0, "Validating configuration")
-
             with worker_db_session() as db:
                 generation_job = db.get(GenerationJob, generation_uuid)
                 if not generation_job:
                     raise RuntimeError("Generation job not found")
-                project = generation_job.project_id
-                presentation = (
-                    db.query(Presentation)
-                    .filter(Presentation.project_id == project_uuid)
-                    .order_by(Presentation.created_at.desc())
-                    .first()
-                )
-                if presentation is None:
-                    raise RuntimeError("PRESENTATION_NOT_FOUND")
-                settings = (
-                    db.query(VideoGenerationSettings)
-                    .filter(VideoGenerationSettings.project_id == project_uuid)
-                    .first()
-                )
-                if settings is None:
-                    raise RuntimeError("VIDEO_SETTINGS_NOT_CONFIGURED")
-                elevenlabs_api_key = decrypt_secret(settings.elevenlabs_api_key_encrypted)
-                wavespeed_api_key = decrypt_secret(settings.wavespeed_api_key_encrypted)
-                if not elevenlabs_api_key or not settings.elevenlabs_voice_id:
-                    raise RuntimeError("INVALID_ELEVENLABS_CREDENTIALS")
-                if not wavespeed_api_key:
-                    raise RuntimeError("INVALID_WAVESPEED_CREDENTIALS")
-                slides = list(presentation.slides)
-                organization_id = presentation.organization_id
-
-            tts_provider = get_tts_provider("elevenlabs")
-            avatar_provider = get_avatar_video_provider("wavespeed")
-            audio_assets: list[tuple[uuid.UUID, bytes, float]] = []
-            slide_videos: list[bytes] = []
-            total_slides = len(slides)
-
-            self.set_progress(job_id, 20.0, "Generating audio")
-            _update_generation_job(
-                generation_uuid,
-                "generating_audio",
-                20.0,
-                "Generating ElevenLabs audio",
-                total_slides=total_slides,
-            )
-            for index, slide in enumerate(slides, 1):
-                _update_generation_job(
-                    generation_uuid,
-                    "generating_audio",
-                    20.0 + (15.0 * ((index - 1) / max(total_slides, 1))),
-                    f"Generating audio for slide {index}",
-                    current_slide=index,
-                    total_slides=total_slides,
-                )
-                metadata = slide.metadata_ or {}
-                dialogue = str(metadata.get("dialogue") or slide.notes or "")
-                audio_bytes, duration = tts_provider.generate_audio(
-                    text=dialogue,
-                    voice_id=settings.elevenlabs_voice_id,
-                    language="es",
-                )
-                key = (
-                    f"orgs/{organization_id}/projects/{project}/generation/"
-                    f"{generation_uuid}/audio/slide-{index}.wav"
-                )
-                storage.upload_file(key, audio_bytes, "audio/wav")
-                _create_asset(
-                    organization_id=organization_id,
-                    project_id=project,
-                    slide_id=slide.id,
-                    asset_type="tts_audio",
-                    storage_key=key,
-                    filename=f"slide-{index}.wav",
-                    mime_type="audio/wav",
-                    size_bytes=len(audio_bytes),
-                    duration_seconds=duration,
-                    metadata_json={"dialogue": dialogue, "provider": "elevenlabs"},
-                )
-                audio_assets.append((slide.id, audio_bytes, duration))
-
-            self.set_progress(job_id, 45.0, "Generating avatar clips")
-            _update_generation_job(
-                generation_uuid,
-                "generating_avatar",
-                45.0,
-                "Generating WaveSpeed avatar clips",
-                total_slides=total_slides,
-            )
-            for index, (slide_id, audio_bytes, duration) in enumerate(audio_assets, 1):
-                _update_generation_job(
-                    generation_uuid,
-                    "generating_avatar",
-                    35.0 + (25.0 * ((index - 1) / max(total_slides, 1))),
-                    f"Generating avatar clip for slide {index}",
-                    current_slide=index,
-                    total_slides=total_slides,
-                )
-                clip = avatar_provider.generate_avatar_clip(
-                    audio_bytes=audio_bytes,
-                    duration_seconds=duration,
-                    avatar_id=None,
-                )
-                key = (
-                    f"orgs/{organization_id}/projects/{project}/generation/"
-                    f"{generation_uuid}/avatar/slide-{index}.mp4"
-                )
-                storage.upload_file(key, clip, "video/mp4")
-                _create_asset(
-                    organization_id=organization_id,
-                    project_id=project,
-                    slide_id=slide_id,
-                    asset_type="avatar_clip",
-                    storage_key=key,
-                    filename=f"avatar-slide-{index}.mp4",
-                    mime_type="video/mp4",
-                    size_bytes=len(clip),
-                    duration_seconds=duration,
-                    metadata_json={"provider": "wavespeed"},
+                context = validate_generation_job(
+                    db=db,
+                    job=generation_job,
+                    project_id=project_uuid,
+                    organization_id=generation_job.organization_id,
+                    storage=storage,
                 )
 
-            self.set_progress(job_id, 65.0, "Composing slide videos")
-            _update_generation_job(
-                generation_uuid,
-                "rendering_slides",
-                60.0,
-                "Rendering edited slides",
-                total_slides=total_slides,
-            )
-            for index, slide in enumerate(slides, 1):
-                _update_generation_job(
-                    generation_uuid,
-                    "rendering_slides",
-                    60.0 + (20.0 * ((index - 1) / max(total_slides, 1))),
-                    f"Rendering slide {index}",
-                    current_slide=index,
-                    total_slides=total_slides,
-                )
-                metadata = slide.metadata_ or {}
-                background_key = metadata.get("background_image_key")
-                background_bytes = (
-                    storage.download_file(background_key)
-                    if isinstance(background_key, str) and background_key
-                    else None
-                )
-                slide_image = composer.render_slide_image(
-                    background_bytes=background_bytes,
-                    slide_metadata=metadata,
-                    resolution="1080p",
-                )
-                render_key = (
-                    f"orgs/{organization_id}/projects/{project}/generation/"
-                    f"{generation_uuid}/renders/slide-{index}.png"
-                )
-                storage.upload_file(render_key, slide_image, "image/png")
-                _create_asset(
-                    organization_id=organization_id,
-                    project_id=project,
-                    slide_id=slide.id,
-                    asset_type="slide_render",
-                    storage_key=render_key,
-                    filename=f"slide-{index}.png",
-                    mime_type="image/png",
-                    size_bytes=len(slide_image),
-                    metadata_json={"canvas": metadata.get("canvas")},
-                )
+                total_slides = len(context.slides)
+                audio_assets = [
+                    generate_audio_for_slide(
+                        db,
+                        storage,
+                        generation_job,
+                        context,
+                        slide,
+                        slide_index,
+                        total_slides,
+                    )
+                    for slide_index, slide in enumerate(context.slides, 1)
+                ]
 
-                _slide_id, audio_bytes, duration = audio_assets[index - 1]
-                _update_generation_job(
-                    generation_uuid,
-                    "composing_video",
-                    80.0 + (15.0 * ((index - 1) / max(total_slides, 1))),
-                    f"Composing video for slide {index}",
-                    current_slide=index,
-                    total_slides=total_slides,
-                )
-                slide_video = composer.compose_slide_video(slide_image, audio_bytes, duration)
-                slide_video_key = (
-                    f"orgs/{organization_id}/projects/{project}/generation/"
-                    f"{generation_uuid}/slides/slide-{index}.mp4"
-                )
-                storage.upload_file(slide_video_key, slide_video, "video/mp4")
-                _create_asset(
-                    organization_id=organization_id,
-                    project_id=project,
-                    slide_id=slide.id,
-                    asset_type="slide_video",
-                    storage_key=slide_video_key,
-                    filename=f"slide-{index}.mp4",
-                    mime_type="video/mp4",
-                    size_bytes=len(slide_video),
-                    duration_seconds=duration,
-                )
-                slide_videos.append(slide_video)
+                avatar_clip_assets = [
+                    generate_avatar_clip_for_slide(
+                        db,
+                        storage,
+                        generation_job,
+                        context,
+                        slide,
+                        slide_index,
+                        total_slides,
+                        audio_assets[slide_index - 1],
+                    )
+                    for slide_index, slide in enumerate(context.slides, 1)
+                ]
 
-            self.set_progress(job_id, 90.0, "Creating final MP4")
-            _update_generation_job(
-                generation_uuid,
-                "composing_video",
-                90.0,
-                "Creating final MP4",
-                total_slides=total_slides,
-            )
-            final_video = composer.concatenate_slide_videos(slide_videos)
-            final_key = (
-                f"orgs/{organization_id}/projects/{project}/output/final-{generation_uuid}.mp4"
-            )
-            storage.upload_file(final_key, final_video, "video/mp4")
-            final_asset = _create_asset(
-                organization_id=organization_id,
-                project_id=project,
-                slide_id=None,
-                asset_type="final_video",
-                storage_key=final_key,
-                filename="final.mp4",
-                mime_type="video/mp4",
-                size_bytes=len(final_video),
-            )
+                segment_assets = [
+                    compose_segment_for_slide(
+                        db,
+                        storage,
+                        generation_job,
+                        context,
+                        slide,
+                        slide_index,
+                        total_slides,
+                        audio_assets[slide_index - 1],
+                        avatar_clip_assets[slide_index - 1],
+                    )
+                    for slide_index, slide in enumerate(context.slides, 1)
+                ]
 
-            result = {"final_video_key": final_key, "final_asset_id": str(final_asset.id)}
-            _complete_generation_job(generation_uuid, final_asset.id, result)
+                final_asset = compose_final_video(
+                    db,
+                    storage,
+                    generation_job,
+                    context,
+                    segment_assets,
+                )
+                result = {
+                    "final_video_key": final_asset.storage_key,
+                    "final_asset_id": str(final_asset.id),
+                }
             self.set_progress(job_id, 100.0, "Completed")
             return result
+        except SoftTimeLimitExceeded as exc:
+            with worker_db_session() as db:
+                generation_job = db.get(GenerationJob, generation_uuid)
+                if generation_job:
+                    mark_generation_failed(
+                        db,
+                        generation_job,
+                        "soft_time_limit_exceeded",
+                        "Video generation exceeded the worker time limit. "
+                        "Please retry or reduce the number of slides.",
+                    )
+            logger.exception("Video generation job %s exceeded soft time limit", generation_job_id)
+            raise
+        except PipelineError as exc:
+            with worker_db_session() as db:
+                generation_job = db.get(GenerationJob, generation_uuid)
+                if generation_job:
+                    mark_generation_failed(
+                        db,
+                        generation_job,
+                        exc.code,
+                        exc.message,
+                        current_step=exc.stage,
+                        current_slide=exc.slide_index,
+                    )
+            logger.exception(
+                "Generation job %s: failed at slide %s during stage %s: %s",
+                generation_job_id,
+                exc.slide_index,
+                exc.stage,
+                exc.message,
+            )
+            raise
         except Exception as exc:
-            _fail_generation_job(generation_uuid, "VIDEO_GENERATION_FAILED", str(exc))
+            with worker_db_session() as db:
+                generation_job = db.get(GenerationJob, generation_uuid)
+                if generation_job:
+                    mark_generation_failed(
+                        db,
+                        generation_job,
+                        "unexpected_generation_error",
+                        str(exc),
+                    )
             logger.exception("Video generation job %s failed: %s", generation_job_id, exc)
             raise
 
 
 generate_video = celery_app.register_task(GenerateVideoTask())
+
+
+class GenerationAssetError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _validate_slide_assets(
+    index: int,
+    slide_image: bytes,
+    audio_bytes: bytes,
+    audio_duration: float,
+    avatar_clip: bytes,
+    avatar_duration: float,
+) -> None:
+    if not slide_image:
+        raise GenerationAssetError(
+            "MISSING_SLIDE_RENDER",
+            f"Slide render for slide {index} is missing",
+        )
+    if not audio_bytes or audio_duration <= 0:
+        raise GenerationAssetError(
+            "MISSING_AUDIO_ASSET",
+            f"Audio asset for slide {index} is missing or empty",
+        )
+    if not avatar_clip or avatar_duration <= 0:
+        raise GenerationAssetError(
+            "MISSING_AVATAR_CLIP",
+            f"Avatar clip for slide {index} is missing or empty",
+        )
+
+
+def _probe_media_duration(media_bytes: bytes, suffix: str) -> float:
+    if not media_bytes:
+        return 0.0
+    with tempfile.TemporaryDirectory() as tmp:
+        media_path = Path(tmp) / f"asset{suffix}"
+        media_path.write_bytes(media_bytes)
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(media_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _probe_media_streams(media_bytes: bytes, suffix: str) -> dict[str, bool]:
+    streams = {"video": False, "audio": False}
+    if not media_bytes:
+        return streams
+    with tempfile.TemporaryDirectory() as tmp:
+        media_path = Path(tmp) / f"asset{suffix}"
+        media_path.write_bytes(media_bytes)
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_type",
+                    "-of",
+                    "csv=p=0",
+                    str(media_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return streams
+    for line in result.stdout.splitlines():
+        codec_type = line.strip()
+        if codec_type in streams:
+            streams[codec_type] = True
+    return streams
+
+
+def _probe_media_info(media_bytes: bytes, suffix: str) -> dict:
+    info = {
+        "duration_seconds": 0.0,
+        "has_video": False,
+        "has_audio": False,
+        "video_codec": None,
+        "audio_codec": None,
+        "width": None,
+        "height": None,
+    }
+    if not media_bytes:
+        return info
+    with tempfile.TemporaryDirectory() as tmp:
+        media_path = Path(tmp) / f"asset{suffix}"
+        media_path.write_bytes(media_bytes)
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration:stream=codec_type,codec_name,width,height",
+                    "-of",
+                    "json",
+                    str(media_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return info
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return info
+    try:
+        info["duration_seconds"] = float((payload.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        info["duration_seconds"] = 0.0
+    for stream in payload.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        if stream.get("codec_type") == "video" and not info["has_video"]:
+            info["has_video"] = True
+            info["video_codec"] = stream.get("codec_name")
+            info["width"] = stream.get("width")
+            info["height"] = stream.get("height")
+        if stream.get("codec_type") == "audio" and not info["has_audio"]:
+            info["has_audio"] = True
+            info["audio_codec"] = stream.get("codec_name")
+    return info
+
+
+def _generate_avatar_with_motion_fallback(
+    avatar_provider,
+    audio_bytes: bytes,
+    duration: float,
+    avatar_source_url: str,
+    wavespeed_api_key: str,
+    audio_url: str,
+    slide_index: int,
+    generation_uuid: uuid.UUID,
+) -> tuple[bytes, dict]:
+    primary_model = settings.DEFAULT_LIPSYNC_MODEL
+    clip = avatar_provider.generate_avatar_clip(
+        audio_bytes=audio_bytes,
+        duration_seconds=duration,
+        avatar_id=avatar_source_url,
+        api_key=wavespeed_api_key,
+        audio_url=audio_url,
+        avatar_source_url=avatar_source_url,
+        model_name=primary_model,
+        prompt=settings.LIPSYNC_PROMPT,
+    )
+    motion = _analyze_video_motion(clip)
+    metadata = {
+        "model": primary_model,
+        "fallback_used": False,
+        "motion_analysis": motion,
+        "prompt": settings.LIPSYNC_PROMPT,
+    }
+    fallback_model = (settings.FALLBACK_LIPSYNC_MODEL or "").strip()
+    if motion.get("almost_static") and fallback_model:
+        logger.warning(
+            "Primary WaveSpeed lipsync result appears almost static; retrying fallback model: "
+            "generation_job=%s slide=%s primary_model=%s fallback_model=%s score=%s",
+            generation_uuid,
+            slide_index,
+            primary_model,
+            fallback_model,
+            motion.get("motion_score"),
+        )
+        fallback_clip = avatar_provider.generate_avatar_clip(
+            audio_bytes=audio_bytes,
+            duration_seconds=duration,
+            avatar_id=avatar_source_url,
+            api_key=wavespeed_api_key,
+            audio_url=audio_url,
+            avatar_source_url=avatar_source_url,
+            model_name=fallback_model,
+            prompt=settings.LIPSYNC_PROMPT,
+        )
+        fallback_motion = _analyze_video_motion(fallback_clip)
+        if float(fallback_motion.get("motion_score") or 0) > float(
+            motion.get("motion_score") or 0
+        ):
+            return fallback_clip, {
+                "model": fallback_model,
+                "primary_model": primary_model,
+                "fallback_used": True,
+                "primary_motion_analysis": motion,
+                "motion_analysis": fallback_motion,
+                "prompt": settings.LIPSYNC_PROMPT,
+            }
+        metadata["fallback_attempted"] = True
+        metadata["fallback_model"] = fallback_model
+        metadata["fallback_motion_analysis"] = fallback_motion
+    return clip, metadata
+
+
+def _analyze_video_motion(media_bytes: bytes) -> dict:
+    info = _probe_media_info(media_bytes, ".mp4")
+    duration = float(info.get("duration_seconds") or 0)
+    if not media_bytes or duration <= 0 or not info.get("has_video"):
+        return {"motion_score": 0.0, "almost_static": True, "sample_count": 0}
+    sample_times = [0.15, max(0.15, duration / 2), max(0.15, duration - 0.15)]
+    frames: list[bytes] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        media_path = Path(tmp) / "avatar.mp4"
+        media_path.write_bytes(media_bytes)
+        for sample_time in sample_times:
+            try:
+                result = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-v",
+                        "error",
+                        "-ss",
+                        f"{sample_time:.3f}",
+                        "-i",
+                        str(media_path),
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "scale=64:64,format=gray",
+                        "-f",
+                        "rawvideo",
+                        "-",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                continue
+            if result.stdout:
+                frames.append(result.stdout)
+    if len(frames) < 2:
+        return {"motion_score": 0.0, "almost_static": True, "sample_count": len(frames)}
+    scores = [_mean_abs_frame_diff(frames[index], frames[index + 1]) for index in range(len(frames) - 1)]
+    motion_score = max(scores) if scores else 0.0
+    return {
+        "motion_score": round(motion_score, 4),
+        "almost_static": motion_score < 1.5,
+        "sample_count": len(frames),
+        "threshold": 1.5,
+    }
+
+
+def _mean_abs_frame_diff(left: bytes, right: bytes) -> float:
+    length = min(len(left), len(right))
+    if length <= 0:
+        return 0.0
+    return sum(abs(left[index] - right[index]) for index in range(length)) / length
+
+
+def _ffmpeg_error_message(exc: subprocess.CalledProcessError) -> str:
+    stderr = exc.stderr
+    if isinstance(stderr, bytes):
+        return stderr.decode("utf-8", errors="ignore")[-1000:] or "FFmpeg failed"
+    return str(stderr or "FFmpeg failed")[-1000:]
+
+
+def _avatar_source_url(settings_row: VideoGenerationSettings, storage) -> str | None:
+    if settings_row.avatar_source_url:
+        _validate_external_provider_url(settings_row.avatar_source_url)
+        return settings_row.avatar_source_url
+    if settings_row.avatar_source_asset_id:
+        with worker_db_session() as db:
+            asset = db.get(Asset, settings_row.avatar_source_asset_id)
+            if asset:
+                try:
+                    if not storage.download_bytes(asset.storage_key):
+                        raise GenerationAssetError(
+                            "MISSING_AVATAR_ASSET",
+                            "Please upload an avatar image before generating the video.",
+                        )
+                    return _external_asset_url(storage, asset.storage_key)
+                except Exception as exc:
+                    if isinstance(exc, GenerationAssetError):
+                        raise
+                    raise GenerationAssetError(
+                        "AVATAR_SIGNED_URL_FAILED",
+                        "Could not create a signed URL for the avatar asset.",
+                    ) from exc
+    if settings.DEBUG_AVATAR_SOURCE_URL and not settings.is_production:
+        _validate_external_provider_url(settings.DEBUG_AVATAR_SOURCE_URL)
+        return settings.DEBUG_AVATAR_SOURCE_URL
+    return None
+
+
+def _external_asset_url(storage, storage_key: str) -> str:
+    url = storage.generate_external_download_url(storage_key).url
+    _validate_external_provider_url(url)
+    return url
+
+
+def _validate_external_provider_url(url: str) -> None:
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise GenerationAssetError(
+            "EXTERNAL_ASSET_URL_NOT_PUBLIC",
+            "WaveSpeed requires a public URL for audio/avatar assets. Configure a public tunnel or external storage.",
+        )
+    lowered_host = hostname.lower()
+    blocked_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "minio"}
+    is_blocked = lowered_host in blocked_hosts or lowered_host.endswith(".local")
+    try:
+        ip_address = ipaddress.ip_address(lowered_host)
+        is_blocked = (
+            is_blocked
+            or ip_address.is_private
+            or ip_address.is_loopback
+            or ip_address.is_link_local
+        )
+    except ValueError:
+        pass
+    if is_blocked:
+        raise GenerationAssetError(
+            "EXTERNAL_ASSET_URL_NOT_PUBLIC",
+            "WaveSpeed requires a public URL for audio/avatar assets. Configure a public tunnel or external storage.",
+        )
+
+
+def _log_storage_config_for_generation() -> None:
+    internal = settings.MINIO_INTERNAL_ENDPOINT or settings.MINIO_ENDPOINT
+    public = settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT
+    logger.info(
+        "Storage config for generation: backend=%s internal_host=%s public_host=%s "
+        "azure_public_host=%s external_provider_asset_base_url_configured=%s",
+        settings.STORAGE_BACKEND,
+        _endpoint_host(internal),
+        _endpoint_host(public),
+        _endpoint_host(settings.AZURE_STORAGE_PUBLIC_BASE_URL),
+        bool(settings.EXTERNAL_PROVIDER_ASSET_BASE_URL),
+    )
+
+
+def _endpoint_host(endpoint: str | None) -> str | None:
+    if not endpoint:
+        return None
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"http", "https"}:
+        return parsed.netloc
+    return endpoint.split("/", 1)[0]
+
+
+def _avatar_overlay_from_metadata(metadata: dict, resolution: str) -> dict[str, int]:
+    output_width, output_height = _resolution_size_for_generation(resolution)
+    canvas = metadata.get("canvas") if isinstance(metadata, dict) else None
+    canvas_width = 960.0
+    canvas_height = 540.0
+    avatar: dict | None = None
+    if isinstance(canvas, dict):
+        canvas_width = float(canvas.get("width") or canvas_width)
+        canvas_height = float(canvas.get("height") or canvas_height)
+        if isinstance(canvas.get("avatar"), dict):
+            avatar = canvas["avatar"]
+        else:
+            elements = canvas.get("elements") or []
+            avatar = next(
+                (
+                    element
+                    for element in elements
+                    if isinstance(element, dict) and element.get("type") == "avatar"
+                ),
+                None,
+            )
+
+    default_width = 400
+    default_height = 400
+    if not avatar:
+        return {
+            "x": output_width - default_width - 80,
+            "y": output_height - default_height - 60,
+            "width": default_width,
+            "height": default_height,
+        }
+
+    scale_x = output_width / max(canvas_width, 1.0)
+    scale_y = output_height / max(canvas_height, 1.0)
+    width = max(1, int(float(avatar.get("width") or default_width) * scale_x))
+    height = max(1, int(float(avatar.get("height") or default_height) * scale_y))
+    x = int(float(avatar.get("x") or 0) * scale_x)
+    y = int(float(avatar.get("y") or 0) * scale_y)
+    return {
+        "x": max(0, min(x, output_width - width)),
+        "y": max(0, min(y, output_height - height)),
+        "width": min(width, output_width),
+        "height": min(height, output_height),
+    }
+
+
+def _resolution_size_for_generation(resolution: str) -> tuple[int, int]:
+    if resolution == "720p":
+        return 1280, 720
+    if resolution == "1080p":
+        return 1920, 1080
+    if "x" in resolution:
+        left, right = resolution.lower().split("x", 1)
+        return int(left), int(right)
+    return 1920, 1080
 
 
 # ── Función helper para encolar jobs ─────────────────────────────────────────
@@ -990,6 +1270,7 @@ def _complete_generation_job(
             generation_job.current_step = "Completed"
             generation_job.final_asset_id = final_asset_id
             generation_job.result = result
+            generation_job.completed_at = datetime.now(UTC)
             db.commit()
 
 
@@ -1004,6 +1285,7 @@ def _fail_generation_job(
             generation_job.status = "failed"
             generation_job.error_code = error_code
             generation_job.error_message = error_message[:2000]
+            generation_job.completed_at = datetime.now(UTC)
             db.commit()
 
 

@@ -30,6 +30,13 @@ class InMemoryStorageProvider(StorageProvider):
             raise FileNotFoundError(key)
         return PresignedURL(url=f"http://minio-test/download/{key}", key=key, expires_in=expires_in)
 
+    def generate_external_download_url(
+        self, key: str, expires_in: int = 3600
+    ) -> PresignedURL:
+        if key not in self._store:
+            raise FileNotFoundError(key)
+        return PresignedURL(url=f"https://storage.example.test/download/{key}", key=key, expires_in=expires_in)
+
     def delete_file(self, key: str) -> None:
         if key not in self._store:
             raise FileNotFoundError(key)

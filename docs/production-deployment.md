@@ -123,6 +123,14 @@ POSTGRES_DB=educa_chile
 POSTGRES_USER=educachile
 POSTGRES_PASSWORD=replace-with-db-password
 
+STORAGE_BACKEND=azure
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=YOUR_ACCOUNT;AccountKey=YOUR_KEY;EndpointSuffix=core.windows.net
+AZURE_STORAGE_CONTAINER=educachile-assets
+AZURE_STORAGE_PUBLIC_BASE_URL=https://YOUR_ACCOUNT.blob.core.windows.net
+DEFAULT_LIPSYNC_MODEL=wavespeed-ai/ltx-2-19b/lipsync
+FALLBACK_LIPSYNC_MODEL=
+LIPSYNC_PROMPT=A front-facing presenter speaking naturally, visible mouth movement, subtle natural head motion, realistic lip sync, stable face, well-lit portrait.
+
 MINIO_ROOT_USER=replace-with-minio-root-user
 MINIO_ROOT_PASSWORD=replace-with-minio-root-password
 MINIO_ENDPOINT=minio:9000
