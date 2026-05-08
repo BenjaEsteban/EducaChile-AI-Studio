@@ -1,5 +1,6 @@
 import logging
 import ipaddress
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -147,6 +148,11 @@ def run_wavespeed_debug(
 
 def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
     _ensure_debug_enabled()
+    if not _ffmpeg_available():
+        raise _debug_error(
+            "FFMPEG_UNAVAILABLE",
+            "FFmpeg is not available in this environment.",
+        )
     _ensure_test_slide()
     if not TEST_AUDIO_PATH.exists() or TEST_AUDIO_PATH.stat().st_size <= 0:
         raise _debug_error("MISSING_AUDIO_ASSET", f"Missing test audio at {TEST_AUDIO_PATH}")
@@ -570,6 +576,10 @@ def _ensure_test_slide() -> None:
         capture_output=True,
         timeout=30,
     )
+
+
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
 
 
 def _upload_debug_file(project_id: uuid.UUID, path: Path, content_type: str) -> tuple[str, str]:

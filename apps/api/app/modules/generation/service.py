@@ -409,12 +409,29 @@ class GenerationService:
         except Exception:
             return
         try:
-            render_slide_previews(
+            preview_keys = render_slide_previews(
                 pptx_bytes=pptx_bytes,
                 presentation_id=presentation.id,
                 original_filename=presentation.original_filename,
                 storage=storage,
             )
+            if not preview_keys:
+                return
+            for slide in presentation.slides:
+                preview_key = preview_keys.get(slide.position)
+                if not preview_key:
+                    continue
+                metadata = dict(slide.metadata_ or {})
+                slide.thumbnail_key = preview_key
+                metadata["rendered_image_key"] = preview_key
+                metadata["slide_preview"] = {
+                    "asset_type": "slide_preview",
+                    "storage_key": preview_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                }
+                slide.metadata_ = metadata
+            self.repo.db.commit()
         except Exception as exc:
             logger.info(
                 "Could not regenerate slide previews for presentation %s: %s",

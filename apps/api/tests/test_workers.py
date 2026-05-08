@@ -287,23 +287,10 @@ def test_parse_presentation_completes_successfully():
         assert slides[0].position == 1
         assert slides[0].title == "Clase 1"
         assert "Objetivo de aprendizaje" in slides[0].metadata_["visible_text"]
-        assert slides[0].metadata_["canvas"]["text"]["title"] == "Clase 1"
-        assert slides[0].metadata_["canvas"]["width"] == 960
-        assert slides[0].metadata_["canvas"]["height"] > 0
-        assert slides[0].metadata_["canvas"]["version"] == 1
-        assert len(slides[0].metadata_["canvas"]["text_blocks"]) >= 2
-        assert slides[0].metadata_["canvas"]["text_blocks"][0]["text"] == "Clase 1"
-        assert slides[0].metadata_["canvas"]["text_blocks"][0]["shape_index"] == 0
-        elements = slides[0].metadata_["canvas"]["elements"]
-        assert elements[0]["type"] == "background"
-        text_elements = [element for element in elements if element["type"] == "text"]
-        assert text_elements[0]["text"] == "Clase 1"
-        assert text_elements[0]["shape_index"] == 0
-        assert text_elements[0]["style"]["fontFamily"]
-        assert "originalFontFamily" in text_elements[0]["style"]
-        assert text_elements[0]["style"]["fallbackFontFamily"] == "Arial"
-        assert text_elements[0]["style"]["color"] == "#FFFFFF"
-        assert text_elements[0]["style"]["originalColor"] == "#FFFFFF"
+        assert slides[0].thumbnail_key is not None
+        assert slides[0].thumbnail_key == slides[0].metadata_["rendered_image_key"]
+        assert slides[0].metadata_["slide_preview"]["asset_type"] == "slide_preview"
+        assert slides[0].metadata_["slide_preview"]["includes_text"] is True
         assert slides[0].notes is None
         assert slides[0].metadata_["dialogue"] == ""
     finally:

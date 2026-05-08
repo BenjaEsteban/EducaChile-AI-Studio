@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 from typing import TypedDict
 
@@ -21,6 +22,7 @@ class ComposerService:
         avatar_overlay: AvatarOverlay,
         resolution: str = "1080p",
     ) -> bytes:
+        _ensure_ffmpeg_available()
         width, height = _resolution_size(resolution)
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
@@ -73,6 +75,7 @@ class ComposerService:
             return output.read_bytes()
 
     def concatenate_slide_videos(self, slide_videos: list[bytes]) -> bytes:
+        _ensure_ffmpeg_available()
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             list_file = tmpdir / "videos.txt"
@@ -120,3 +123,8 @@ def _resolution_size(resolution: str) -> tuple[int, int]:
         left, right = resolution.lower().split("x", 1)
         return int(left), int(right)
     return 1920, 1080
+
+
+def _ensure_ffmpeg_available() -> None:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("FFmpeg is not available in this environment")

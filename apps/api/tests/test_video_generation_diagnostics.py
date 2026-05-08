@@ -1,8 +1,10 @@
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from celery.exceptions import SoftTimeLimitExceeded
 from app.modules.video.adapters import WavespeedAvatarVideoProvider
 from app.modules.generation.pipeline import (
@@ -63,6 +65,8 @@ def test_wavespeed_payload_includes_audio_image_prompt_and_model(monkeypatch):
 
 
 def test_almost_static_clip_detection_flags_static_video(tmp_path: Path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not available in this test environment")
     output = tmp_path / "static.mp4"
     subprocess.run(
         [
