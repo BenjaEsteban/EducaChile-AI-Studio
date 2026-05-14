@@ -14,8 +14,8 @@ The user uploads a PPT/PPTX, edits the slides in a canvas-like editor, configure
 - Storage: MinIO / S3-compatible storage
 - Async jobs: Redis / Celery workers
 - Video composition: FFmpeg
-- TTS provider: ElevenLabs
-- Avatar/lipsync provider: WaveSpeed
+- Default avatar provider: WaveSpeed AI Talking Photos
+- Optional advanced TTS provider: ElevenLabs
 
 ## Current user flow
 
@@ -38,22 +38,21 @@ The user uploads a PPT/PPTX, edits the slides in a canvas-like editor, configure
 - Raw API keys must not be stored in localStorage or sessionStorage.
 - Saved keys should be shown only masked.
 - For the MVP, only these video settings are required:
-  - ElevenLabs API Key
-  - ElevenLabs Voice ID
   - WaveSpeed API Key
+  - ElevenLabs API Key and Voice ID are optional advanced settings
 
 ## Video generation pipeline
 
 When the user clicks Generate Video inside the editor, the async pipeline should:
 
 1. Load edited slides and dialogue/notes.
-2. Generate audio per slide with ElevenLabs.
-3. Generate avatar/lipsync clip per slide with WaveSpeed.
+2. Generate avatar/talking-photo clip per slide with WaveSpeed using the narration text.
+3. Generate audio per slide only if an advanced voice mode is enabled.
 4. Render the edited slide canvas.
 5. Use FFmpeg to compose:
    - slide render as background
    - avatar clip as overlay
-   - ElevenLabs audio as audio track
+   - avatar clip audio as the audio track by default
 6. Generate one MP4 per slide.
 7. Concatenate all slide videos into final.mp4.
 8. Show progress and final preview/download in the editor.
@@ -81,5 +80,5 @@ When the user clicks Generate Video inside the editor, the async pipeline should
 - Do not remove existing working editor functionality.
 - Keep backend logic modular.
 - Do not put provider-specific logic directly inside route handlers.
-- Use services/adapters for ElevenLabs, WaveSpeed and FFmpeg composition.
+- Use services/adapters for Wavespeed, optional ElevenLabs and FFmpeg composition.
 - Heavy processing must run in workers, not inside HTTP requests.

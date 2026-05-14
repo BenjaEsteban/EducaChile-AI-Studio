@@ -677,19 +677,6 @@ class GenerateVideoTask(JobTask):
                 )
 
                 total_slides = len(context.slides)
-                audio_assets = [
-                    generate_audio_for_slide(
-                        db,
-                        storage,
-                        generation_job,
-                        context,
-                        slide,
-                        slide_index,
-                        total_slides,
-                    )
-                    for slide_index, slide in enumerate(context.slides, 1)
-                ]
-
                 avatar_clip_assets = [
                     generate_avatar_clip_for_slide(
                         db,
@@ -699,7 +686,7 @@ class GenerateVideoTask(JobTask):
                         slide,
                         slide_index,
                         total_slides,
-                        audio_assets[slide_index - 1],
+                        None,
                     )
                     for slide_index, slide in enumerate(context.slides, 1)
                 ]
@@ -713,7 +700,7 @@ class GenerateVideoTask(JobTask):
                         slide,
                         slide_index,
                         total_slides,
-                        audio_assets[slide_index - 1],
+                        None,
                         avatar_clip_assets[slide_index - 1],
                     )
                     for slide_index, slide in enumerate(context.slides, 1)

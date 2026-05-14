@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from celery.exceptions import SoftTimeLimitExceeded
+from app.services.wavespeed_client import WavespeedClient
 from app.modules.video.adapters import WavespeedAvatarVideoProvider
 from app.modules.generation.pipeline import (
     PipelineError,
@@ -15,53 +16,75 @@ from app.modules.generation.pipeline import (
 from app.workers.tasks import GenerateVideoTask
 
 
-def test_wavespeed_payload_includes_audio_image_prompt_and_model(monkeypatch):
+def test_wavespeed_talking_photo_flow_uses_image_text_duration_and_seed(monkeypatch):
     requests = []
 
     class FakeResponse:
-        status_code = 200
-        content = b"not-used"
-
-        def __init__(self, payload=None):
+        def __init__(self, payload=None, status_code=200, content=b"not-used", headers=None):
+            self.status_code = status_code
+            self.content = content
             self._payload = payload or {}
+            self.headers = headers or {}
 
         def json(self):
             return self._payload
 
-    def fake_post(url, headers, json, timeout):
-        requests.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
-        return FakeResponse({"data": {"urls": {"get": "https://wavespeed.test/result"}}})
+    def fake_post(url, headers=None, json=None, content=None, files=None, timeout=None):
+        requests.append(
+            {
+                "url": url,
+                "headers": headers or {},
+                "json": json,
+                "content": content,
+                "files": files,
+                "timeout": timeout,
+            }
+        )
+        if url.endswith("/media/upload/binary"):
+            return FakeResponse({"data": {"download_url": "https://wavespeed.test/uploaded.png"}})
+        if url.endswith("/wavespeed-ai/ai-talking-photos"):
+            return FakeResponse({"data": {"id": "request-123"}})
+        return FakeResponse(status_code=404)
 
     def fake_get(url, headers=None, timeout=None):
-        if url == "https://wavespeed.test/result":
+        if url.endswith("/predictions/request-123/result"):
             return FakeResponse(
                 {"data": {"status": "completed", "outputs": ["https://cdn.test/out.mp4"]}}
             )
+        if url == "https://cdn.test/out.mp4":
+            return FakeResponse(content=b"video-bytes")
         return FakeResponse()
 
-    monkeypatch.setattr("app.modules.video.adapters.httpx.post", fake_post)
+    monkeypatch.setattr("app.services.wavespeed_client.httpx.post", fake_post)
+    monkeypatch.setattr("app.services.wavespeed_client.httpx.get", fake_get)
     monkeypatch.setattr("app.modules.video.adapters.httpx.get", fake_get)
     monkeypatch.setattr("app.modules.video.adapters._probe_duration", lambda *_args: 1.0)
     monkeypatch.setattr("app.modules.video.adapters._has_video_stream", lambda *_args: True)
+    monkeypatch.setattr("app.modules.video.adapters._has_audio_stream", lambda *_args: True)
 
+    client = WavespeedClient(api_key="secret")
+    upload_url = client.upload_image(
+        b"image-bytes",
+        filename="avatar.png",
+        content_type="image/png",
+    )
     provider = WavespeedAvatarVideoProvider()
-    provider.generate_avatar_clip(
-        audio_bytes=b"audio",
-        duration_seconds=1.0,
-        avatar_id=None,
+    video_url = provider.generate_avatar_video(
+        image_url=upload_url,
+        text="talking head prompt",
+        duration=5,
         api_key="secret",
-        audio_url="https://storage.test/audio.mp3",
-        avatar_source_url="https://storage.test/avatar.png",
-        model_name="wavespeed-ai/ltx-2-19b/lipsync",
-        prompt="talking head prompt",
     )
 
-    assert requests[0]["url"].endswith("/wavespeed-ai/ltx-2-19b/lipsync")
-    assert requests[0]["json"]["audio"] == "https://storage.test/audio.mp3"
-    assert requests[0]["json"]["image"] == "https://storage.test/avatar.png"
-    assert requests[0]["json"]["resolution"] == "720p"
-    assert requests[0]["json"]["seed"] == -1
-    assert requests[0]["json"]["prompt"] == "talking head prompt"
+    assert upload_url == "https://wavespeed.test/uploaded.png"
+    assert video_url == "https://cdn.test/out.mp4"
+    assert requests[0]["url"].endswith("/media/upload/binary")
+    assert requests[0]["content"] == b"image-bytes"
+    assert requests[1]["url"].endswith("/wavespeed-ai/ai-talking-photos")
+    assert requests[1]["json"]["image"] == "https://wavespeed.test/uploaded.png"
+    assert requests[1]["json"]["text"] == "talking head prompt"
+    assert requests[1]["json"]["duration"] == 5
+    assert requests[1]["json"]["seed"] == -1
 
 
 def test_almost_static_clip_detection_flags_static_video(tmp_path: Path):

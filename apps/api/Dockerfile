@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     ffmpeg \
     fonts-dejavu \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-liberation2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages

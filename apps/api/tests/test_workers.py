@@ -7,9 +7,11 @@ from pptx import Presentation as PptxPresentation
 from pptx.dml.color import RGBColor
 from sqlalchemy.orm import configure_mappers
 
+from app.modules.generation.models import GenerationJob, VideoGenerationSettings
+from app.modules.generation.pipeline import GenerationContext, generate_avatar_clip_for_slide
 from app.modules.jobs.models import Job, JobStatus, JobType
 from app.modules.organizations.models import Organization
-from app.modules.projects.models import Presentation, PresentationStatus, Project, Slide
+from app.modules.projects.models import Asset, Presentation, PresentationStatus, Project, Slide
 from app.modules.projects.service import MOCK_ORG_ID, MOCK_USER_ID
 from app.modules.users.models import User
 from app.workers.celery_app import celery_app
@@ -394,3 +396,154 @@ def test_enqueue_passes_job_and_presentation_ids():
     kwargs = mock_apply.call_args[1]["kwargs"]
     assert kwargs["job_id"] == str(job_id)
     assert kwargs["presentation_id"] == str(presentation_id)
+
+
+def test_generate_avatar_clip_uses_talking_photo_flow(monkeypatch, db_session):
+    storage = InMemoryStorageProvider()
+    avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
+    storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
+    slide_preview_key = f"presentations/{uuid.uuid4()}/previews/slide-1.png"
+    storage.upload_file(slide_preview_key, b"slide-preview", "image/png")
+
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Talking Photo Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    slide = Slide(
+        presentation_id=presentation.id,
+        position=1,
+        title="Slide 1",
+        notes="Narration text",
+        thumbnail_key=slide_preview_key,
+        metadata_={
+            "dialogue": "Narration text for talking photo",
+            "rendered_image_key": slide_preview_key,
+            "slide_preview": {
+                "asset_type": "slide_preview",
+                "storage_key": slide_preview_key,
+                "render_source": "ppt_render",
+                "includes_text": True,
+            },
+        },
+    )
+    db_session.add(slide)
+    db_session.flush()
+    db_session.add(
+        Asset(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            slide_id=None,
+            asset_type="avatar_source",
+            storage_key=avatar_key,
+            filename="avatar.png",
+            mime_type="image/png",
+            size_bytes=len(b"avatar-bytes"),
+        )
+    )
+    db_session.commit()
+
+    class FakeResponse:
+        def __init__(self, content=b"video-bytes", status_code=200):
+            self.content = content
+            self.status_code = status_code
+
+    class FakeProvider:
+        def generate_avatar_video(self, image_url, text, duration=5, seed=-1, api_key=None):
+            assert image_url == "https://wavespeed.test/uploaded.png"
+            assert text == "Narration text for talking photo"
+            assert duration == 5
+            self.last_request_id = "request-123"
+            return "https://cdn.test/out.mp4"
+
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.WavespeedClient.upload_image",
+        lambda self, file_bytes, filename, content_type: "https://wavespeed.test/uploaded.png",
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.get_avatar_video_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.httpx.get",
+        lambda url, timeout=None: FakeResponse(),
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline._probe_media_info",
+        lambda *_args, **_kwargs: {
+            "duration_seconds": 5.0,
+            "has_video": True,
+            "has_audio": True,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 1280,
+            "height": 720,
+        },
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline._analyze_video_motion",
+        lambda *_args, **_kwargs: {
+            "motion_score": 5.0,
+            "almost_static": False,
+            "sample_count": 3,
+        },
+    )
+    monkeypatch.setattr("app.modules.generation.pipeline.storage_object_exists", lambda *_: True)
+
+    job = GenerationJob(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        status="queued",
+        progress_percentage=0.0,
+    )
+    db_session.add(job)
+    db_session.flush()
+    context = GenerationContext(
+        generation_job_id=job.id,
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=presentation,
+        slides=[slide],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key=None,
+        elevenlabs_voice_id=None,
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url=None,
+        avatar_source_storage_key=avatar_key,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{job.id}",
+    )
+
+    asset = generate_avatar_clip_for_slide(
+        db_session,
+        storage,
+        job,
+        context,
+        slide,
+        1,
+        1,
+        None,
+    )
+
+    assert asset.asset_type == "generated_avatar_clip"
+    assert asset.metadata_json["mode"] == "ai-talking-photos"
+    assert asset.metadata_json["provider"] == "wavespeed"
+    assert asset.metadata_json["wavespeed_request_id"] == "request-123"
+    assert asset.metadata_json["ffprobe"]["has_video"] is True
+    assert asset.metadata_json["ffprobe"]["has_audio"] is True

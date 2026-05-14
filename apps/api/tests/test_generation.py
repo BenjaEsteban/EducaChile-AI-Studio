@@ -45,8 +45,6 @@ def test_start_generation_accepts_slides_with_rendered_previews(
     client.put(
         f"/api/v1/projects/{project['id']}/video-settings",
         json={
-            "elevenlabs_api_key": "elevenlabs-secret-1234",
-            "elevenlabs_voice_id": "voice_abc",
             "wavespeed_api_key": "wavespeed-secret-9876",
         },
     )
@@ -135,8 +133,6 @@ def test_video_settings_validate_updates_status(client: TestClient):
     client.put(
         f"/api/v1/projects/{project['id']}/video-settings",
         json={
-            "elevenlabs_api_key": "elevenlabs-secret-1234",
-            "elevenlabs_voice_id": "voice_abc",
             "wavespeed_api_key": "wavespeed-secret-9876",
         },
     )
@@ -146,7 +142,6 @@ def test_video_settings_validate_updates_status(client: TestClient):
     assert res.status_code == 200
     body = res.json()
     assert body["validation_status"] == "valid"
-    assert body["elevenlabs_valid"] is True
     assert body["wavespeed_valid"] is True
 
 
@@ -342,8 +337,6 @@ def test_start_generation_rejects_only_when_preview_images_are_missing(
     client.put(
         f"/api/v1/projects/{project['id']}/video-settings",
         json={
-            "elevenlabs_api_key": "elevenlabs-secret-1234",
-            "elevenlabs_voice_id": "voice_abc",
             "wavespeed_api_key": "wavespeed-secret-9876",
         },
     )
@@ -423,8 +416,6 @@ def test_start_generation_can_regenerate_missing_previews_from_pptx(
     client.put(
         f"/api/v1/projects/{project['id']}/video-settings",
         json={
-            "elevenlabs_api_key": "elevenlabs-secret-1234",
-            "elevenlabs_voice_id": "voice_abc",
             "wavespeed_api_key": "wavespeed-secret-9876",
         },
     )

@@ -85,7 +85,7 @@ or:
 cloudflared tunnel --url http://localhost:9000
 ```
 
-Then keep browser URLs separate from provider URLs. `MINIO_PUBLIC_ENDPOINT` can stay local for a browser running on the same machine. `EXTERNAL_PROVIDER_ASSET_BASE_URL` must be public for WaveSpeed:
+Then keep browser URLs separate from any optional legacy provider URLs. `MINIO_PUBLIC_ENDPOINT` can stay local for a browser running on the same machine. The default Wavespeed talking-photo flow uploads the avatar image to Wavespeed directly, so it does not require a public provider asset URL:
 
 ```bash
 MINIO_INTERNAL_ENDPOINT=http://minio:9000
@@ -104,7 +104,7 @@ docker compose up -d --force-recreate api worker
 - CORS error in the browser: add the public frontend URL to `CORS_ORIGINS`, then restart `api`.
 - Frontend still calls `localhost:8000`: update `NEXT_PUBLIC_API_URL`, then restart `web`.
 - Upload initializes but file upload fails from another computer: expose MinIO and update `MINIO_PUBLIC_ENDPOINT`.
-- WaveSpeed returns `EXTERNAL_ASSET_URL_NOT_PUBLIC`: expose MinIO or use external storage, then set `EXTERNAL_PROVIDER_ASSET_BASE_URL` to that public URL.
+- Legacy WaveSpeed lip-sync returns `EXTERNAL_ASSET_URL_NOT_PUBLIC`: expose MinIO or use external storage, then set `EXTERNAL_PROVIDER_ASSET_BASE_URL` to that public URL. The default talking-photo path does not use this setting.
 - ngrok asks for authentication: run `ngrok config add-authtoken <token>` from your ngrok account.
 - Tunnel URL changed: update `.env` and restart the affected containers again.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import math
 import subprocess
 import tempfile
 import uuid
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
 from sqlalchemy.orm import Session
 
 from app.config import settings as app_settings
@@ -19,6 +21,7 @@ from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.projects.models import Asset, Presentation, Slide
 from app.modules.tts.adapters import TTSProviderError, get_tts_provider
 from app.modules.video.adapters import AvatarVideoProviderError, get_avatar_video_provider
+from app.services.wavespeed_client import WavespeedClient, WavespeedClientError
 from app.utils.crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -32,10 +35,10 @@ class GenerationContext:
     presentation: Presentation
     slides: list[Slide]
     settings: VideoGenerationSettings
-    elevenlabs_api_key: str
-    elevenlabs_voice_id: str
+    elevenlabs_api_key: str | None
+    elevenlabs_voice_id: str | None
     wavespeed_api_key: str
-    avatar_source_url: str
+    avatar_source_url: str | None
     avatar_source_storage_key: str | None
     output_prefix: str
 
@@ -85,33 +88,32 @@ def validate_generation_job(
         .first()
     )
     if settings_row is None:
-        raise PipelineError(
-            "validation_failed",
-            "Video settings are not configured",
-            stage="validating",
+        if not app_settings.WAVESPEED_API_KEY:
+            raise PipelineError(
+                "validation_failed",
+                "Video settings are not configured",
+                stage="validating",
+            )
+        settings_row = VideoGenerationSettings(
+            organization_id=organization_id,
+            project_id=project_id,
+            validation_status="valid",
+            wavespeed_valid=True,
+            elevenlabs_valid=False,
         )
-    elevenlabs_api_key = decrypt_secret(settings_row.elevenlabs_api_key_encrypted)
-    wavespeed_api_key = decrypt_secret(settings_row.wavespeed_api_key_encrypted)
-    if not elevenlabs_api_key:
-        raise PipelineError(
-            "validation_failed",
-            "ElevenLabs API key is missing",
-            stage="validating",
-        )
-    if not settings_row.elevenlabs_voice_id:
-        raise PipelineError(
-            "validation_failed",
-            "ElevenLabs voice ID is missing",
-            stage="validating",
-        )
+    wavespeed_api_key = decrypt_secret(settings_row.wavespeed_api_key_encrypted) or app_settings.WAVESPEED_API_KEY
     if not wavespeed_api_key:
         raise PipelineError(
             "validation_failed",
             "WaveSpeed API key is missing",
             stage="validating",
         )
-    avatar_source_url, avatar_source_storage_key = _avatar_source_url(db, settings_row, storage)
-    if not avatar_source_url:
+    avatar_source_url, avatar_source_storage_key = _avatar_source_reference(
+        db,
+        settings_row,
+        storage,
+    )
+    if not avatar_source_url and not avatar_source_storage_key:
         raise PipelineError(
             "validation_failed",
             "Please upload an avatar image before generating the video.",
@@ -127,7 +129,7 @@ def validate_generation_job(
         presentation=presentation,
         slides=slides,
         settings=settings_row,
-        elevenlabs_api_key=elevenlabs_api_key,
+        elevenlabs_api_key=decrypt_secret(settings_row.elevenlabs_api_key_encrypted),
         elevenlabs_voice_id=settings_row.elevenlabs_voice_id,
         wavespeed_api_key=wavespeed_api_key,
         avatar_source_url=avatar_source_url,
@@ -226,7 +228,7 @@ def generate_avatar_clip_for_slide(
     slide: Slide,
     slide_index: int,
     total_slides: int,
-    audio_asset: Asset,
+    audio_asset: Asset | None = None,
 ) -> Asset:
     existing = _find_valid_asset(
         db,
@@ -245,8 +247,18 @@ def generate_avatar_clip_for_slide(
         _stage_progress(db, job, "generating_avatar", slide_index, total_slides, 25, 35)
         return existing
 
+    metadata = slide.metadata_ or {}
+    dialogue = str(metadata.get("dialogue") or slide.notes or "").strip()
+    if not dialogue:
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"Slide {slide_index} is missing dialogue text",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+
     logger.info(
-        "Generation job %s: generating avatar clip for slide %s/%s",
+        "Generation job %s: generating talking photo avatar for slide %s/%s",
         job.id,
         slide_index,
         total_slides,
@@ -261,19 +273,43 @@ def generate_avatar_clip_for_slide(
         35,
         slide_index,
     )
-    audio_bytes = storage.download_bytes(audio_asset.storage_key)
-    audio_url = _external_asset_url(storage, audio_asset.storage_key)
     try:
-        clip, avatar_metadata = _generate_avatar_with_motion_fallback(
-            audio_bytes=audio_bytes,
-            duration=float(audio_asset.duration_seconds or 0),
-            avatar_source_url=context.avatar_source_url,
-            wavespeed_api_key=context.wavespeed_api_key,
-            audio_url=audio_url,
-            slide_index=slide_index,
-            generation_uuid=job.id,
+        avatar_image_bytes, avatar_source_metadata = _load_avatar_source_bytes(
+            db=db,
+            storage=storage,
+            context=context,
         )
-    except AvatarVideoProviderError as exc:
+        client = WavespeedClient(api_key=context.wavespeed_api_key)
+        uploaded_image_url = client.upload_image(
+            avatar_image_bytes,
+            filename=avatar_source_metadata.get("filename") or f"avatar-{slide_index}.png",
+            content_type=avatar_source_metadata.get("mime_type") or "image/png",
+        )
+        provider = get_avatar_video_provider("wavespeed")
+        video_url = provider.generate_avatar_video(
+            image_url=uploaded_image_url,
+            text=dialogue,
+            duration=_talking_photo_duration(dialogue),
+            seed=-1,
+            api_key=context.wavespeed_api_key,
+        )
+        request_id = getattr(provider, "last_request_id", None)
+        clip_response = httpx.get(video_url, timeout=180)
+        if clip_response.status_code >= 400:
+            raise AvatarVideoProviderError(
+                f"WaveSpeed output download returned HTTP {clip_response.status_code}",
+                "WAVESPEED_AVATAR_FAILED",
+            )
+        clip = clip_response.content
+        avatar_metadata = {
+            "provider": "wavespeed",
+            "mode": "ai-talking-photos",
+            "source_image_upload_url": uploaded_image_url,
+            "wavespeed_request_id": request_id,
+            "request_text_length": len(dialogue),
+            "request_duration": _talking_photo_duration(dialogue),
+        }
+    except (AvatarVideoProviderError, WavespeedClientError) as exc:
         raise PipelineError(
             "avatar_generation_failed",
             str(exc),
@@ -289,7 +325,14 @@ def generate_avatar_clip_for_slide(
             stage="generating_avatar",
             slide_index=slide_index,
         )
-    motion = avatar_metadata.get("motion_analysis") or _analyze_video_motion(clip)
+    if not avatar_info.get("has_audio"):
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"Avatar clip for slide {slide_index} is missing audio",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+    motion = _analyze_video_motion(clip)
     if motion.get("almost_static"):
         logger.warning(
             "Generated avatar clip appears almost static: generation_job=%s slide=%s score=%s",
@@ -314,7 +357,7 @@ def generate_avatar_clip_for_slide(
             "slide_position": slide_index,
             "generation_job_id": str(job.id),
             "provider": "wavespeed",
-            "model_used": avatar_metadata.get("model"),
+            "model_used": "wavespeed-ai-talking-photos",
             "ffprobe": avatar_info,
             "motion_analysis": motion,
         },
@@ -331,7 +374,7 @@ def compose_segment_for_slide(
     slide: Slide,
     slide_index: int,
     total_slides: int,
-    audio_asset: Asset,
+    audio_asset: Asset | None,
     avatar_clip_asset: Asset,
 ) -> Asset:
     existing = _find_valid_asset(
@@ -382,19 +425,28 @@ def compose_segment_for_slide(
     avatar_source_storage_key = avatar_clip_asset.storage_key
     avatar_clip_info: dict = {}
     try:
-        audio_bytes = storage.download_bytes(audio_asset.storage_key)
-        audio_info = _probe_media_info(audio_bytes, ".mp3")
         avatar_clip, fallback_reason, avatar_clip_info = _load_avatar_clip_or_static_fallback(
             storage=storage,
             context=context,
             avatar_clip_asset=avatar_clip_asset,
-            duration_seconds=float(audio_asset.duration_seconds or 0),
+            duration_seconds=float(
+                (audio_asset.duration_seconds if audio_asset is not None else avatar_clip_asset.duration_seconds)
+                or avatar_clip_asset.duration_seconds
+                or 0
+            ),
         )
         if fallback_reason:
             composition_used_generated_avatar_clip = False
             composition_fallback_reason = fallback_reason
             avatar_source_asset_id = None
             avatar_source_storage_key = None
+            if audio_asset is None:
+                raise PipelineError(
+                    "slide_composition_failed",
+                    "Generated avatar clip is missing or invalid, and static fallback cannot be used without a separate audio track.",
+                    stage="composing_slide",
+                    slide_index=slide_index,
+                )
             logger.warning(
                 "Composing slide %s using avatar STATIC IMAGE fallback: %s",
                 slide_index,
@@ -406,13 +458,23 @@ def compose_segment_for_slide(
                 slide_index,
                 avatar_clip_asset.storage_key,
             )
+        if audio_asset is not None:
+            audio_bytes = storage.download_bytes(audio_asset.storage_key)
+            audio_info = _probe_media_info(audio_bytes, ".mp3")
+            audio_storage_key = audio_asset.storage_key
+            audio_asset_id = str(audio_asset.id)
+        else:
+            audio_bytes = None
+            audio_info = avatar_clip_info
+            audio_storage_key = avatar_clip_asset.storage_key
+            audio_asset_id = None
         logger.info(
             "Generation job %s: composing slide %s with slide preview source=%s audio=%s "
             "audio_duration=%s avatar_duration=%s",
             job.id,
             slide_index,
             slide_preview_source.get("storage_key"),
-            audio_asset.storage_key,
+            audio_storage_key,
             audio_info.get("duration_seconds"),
             avatar_clip_info.get("duration_seconds"),
         )
@@ -420,7 +482,9 @@ def compose_segment_for_slide(
             slide_image_bytes=slide_image,
             avatar_clip_bytes=avatar_clip,
             audio_bytes=audio_bytes,
-            duration_seconds=float(audio_asset.duration_seconds or 0),
+            duration_seconds=float(
+                audio_asset.duration_seconds if audio_asset is not None else avatar_clip_info.get("duration_seconds") or 0
+            ),
             avatar_overlay=_avatar_overlay_from_metadata(metadata, "1080p"),
             resolution="1080p",
         )
@@ -495,8 +559,9 @@ def compose_segment_for_slide(
             "avatar_clip_storage_key": avatar_source_storage_key,
             "avatar_clip_ffprobe": avatar_clip_info,
             "avatar_clip_duration_seconds": avatar_clip_info.get("duration_seconds"),
-            "audio_asset_id": str(audio_asset.id),
+            "audio_asset_id": audio_asset_id,
             "audio_duration_seconds": audio_info.get("duration_seconds"),
+            "audio_storage_key": audio_storage_key,
             "ffprobe": segment_info,
             "segment_motion_analysis": segment_motion,
             "segment_appears_static": segment_motion.get("almost_static"),
@@ -949,53 +1014,68 @@ def _image_to_video_clip(image_bytes: bytes, duration_seconds: float) -> bytes:
         return output_path.read_bytes()
 
 
-def _avatar_source_url(
+def _avatar_source_reference(
     db: Session,
     settings_row: VideoGenerationSettings,
     storage,
 ) -> tuple[str | None, str | None]:
     if settings_row.avatar_source_url:
-        _validate_external_provider_url(settings_row.avatar_source_url)
         return settings_row.avatar_source_url, None
     if settings_row.avatar_source_asset_id:
         asset = db.get(Asset, settings_row.avatar_source_asset_id)
         if asset and storage_object_exists(storage, asset.storage_key):
-            return _external_asset_url(storage, asset.storage_key), asset.storage_key
+            return None, asset.storage_key
     if app_settings.DEBUG_AVATAR_SOURCE_URL and not app_settings.is_production:
-        _validate_external_provider_url(app_settings.DEBUG_AVATAR_SOURCE_URL)
         return app_settings.DEBUG_AVATAR_SOURCE_URL, None
     return None, None
 
 
-def _external_asset_url(storage, storage_key: str) -> str:
-    url = storage.generate_external_download_url(storage_key).url
-    _validate_external_provider_url(url)
-    return url
+def _load_avatar_source_bytes(
+    db: Session,
+    storage,
+    context: GenerationContext,
+) -> tuple[bytes, dict]:
+    if context.avatar_source_storage_key:
+        asset = (
+            db.query(Asset)
+            .filter(
+                Asset.project_id == context.project_id,
+                Asset.organization_id == context.organization_id,
+                Asset.storage_key == context.avatar_source_storage_key,
+            )
+            .first()
+        )
+        image_bytes = storage.download_bytes(context.avatar_source_storage_key)
+        return image_bytes, {
+            "filename": asset.filename if asset else None,
+            "mime_type": asset.mime_type if asset else "image/png",
+            "storage_key": context.avatar_source_storage_key,
+            "source": "storage",
+        }
+    if context.avatar_source_url:
+        response = httpx.get(context.avatar_source_url, timeout=120)
+        if response.status_code >= 400:
+            raise PipelineError(
+                "validation_failed",
+                "Avatar source URL could not be downloaded",
+                stage="validating",
+            )
+        return response.content, {
+            "filename": Path(urlparse(context.avatar_source_url).path).name or "avatar.png",
+            "mime_type": response.headers.get("content-type") or "image/png",
+            "storage_key": None,
+            "source": "url",
+        }
+    raise PipelineError(
+        "validation_failed",
+        "Please upload an avatar image before generating the video.",
+        stage="validating",
+    )
 
 
-def _validate_external_provider_url(url: str) -> None:
-    parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-    if parsed.scheme not in {"http", "https"} or not hostname:
-        raise PipelineError(
-            "validation_failed",
-            "WaveSpeed requires a public URL for audio/avatar assets.",
-            stage="validating",
-        )
-    lowered_host = hostname.lower()
-    blocked = lowered_host in {"localhost", "127.0.0.1", "0.0.0.0", "minio"}
-    try:
-        ip_address = ipaddress.ip_address(lowered_host)
-        blocked = blocked or ip_address.is_private or ip_address.is_loopback
-    except ValueError:
-        pass
-    if blocked:
-        raise PipelineError(
-            "validation_failed",
-            "WaveSpeed requires a public URL for audio/avatar assets. "
-            "Configure a public tunnel or external storage.",
-            stage="validating",
-        )
+def _talking_photo_duration(text: str) -> int:
+    word_count = max(1, len(text.split()))
+    return max(5, min(15, math.ceil(word_count / 2.5)))
 
 
 def _generate_avatar_with_motion_fallback(
