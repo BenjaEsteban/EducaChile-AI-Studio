@@ -273,8 +273,10 @@ class GenerationService:
             "saved"
             if (
                 settings.elevenlabs_api_key_encrypted
-                and settings.elevenlabs_voice_id
-                and settings.wavespeed_api_key_encrypted
+                or settings.elevenlabs_voice_id
+                or settings.wavespeed_api_key_encrypted
+                or settings.avatar_source_url
+                or settings.avatar_source_asset_id
             )
             else "not_configured"
         )
@@ -283,21 +285,30 @@ class GenerationService:
     def validate_video_settings(self, project_id: uuid.UUID) -> VideoSettingsValidationRead:
         settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
         if settings is None:
-            raise GenerationReadinessError(
-                "VIDEO_SETTINGS_NOT_CONFIGURED",
-                "Video settings must be saved before validation",
+            if not app_settings.WAVESPEED_API_KEY:
+                raise GenerationReadinessError(
+                    "VIDEO_SETTINGS_NOT_CONFIGURED",
+                    "Video settings must be saved before validation",
+                )
+            settings = VideoGenerationSettings(
+                organization_id=MOCK_ORG_ID,
+                project_id=project_id,
+                validation_status="valid",
+                wavespeed_valid=True,
+                elevenlabs_valid=True,
             )
 
         elevenlabs_key = decrypt_secret(settings.elevenlabs_api_key_encrypted)
-        wavespeed_key = decrypt_secret(settings.wavespeed_api_key_encrypted)
-        settings.elevenlabs_valid = _is_valid_key(elevenlabs_key) and bool(
-            settings.elevenlabs_voice_id
+        wavespeed_key = decrypt_secret(settings.wavespeed_api_key_encrypted) or app_settings.WAVESPEED_API_KEY
+        elevenlabs_configured = bool(settings.elevenlabs_api_key_encrypted or settings.elevenlabs_voice_id)
+        settings.elevenlabs_valid = (
+            _is_valid_key(elevenlabs_key) and bool(settings.elevenlabs_voice_id)
+            if elevenlabs_configured
+            else True
         )
         settings.wavespeed_valid = _is_valid_key(wavespeed_key)
         settings.last_validated_at = datetime.now(UTC)
-        settings.validation_status = (
-            "valid" if settings.elevenlabs_valid and settings.wavespeed_valid else "invalid"
-        )
+        settings.validation_status = "valid" if settings.wavespeed_valid and settings.elevenlabs_valid else "invalid"
         saved = self.repo.save_video_settings(settings)
         message = (
             "Credentials are valid"
@@ -340,21 +351,19 @@ class GenerationService:
 
         settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
         if settings is None:
-            raise GenerationReadinessError(
-                "VIDEO_SETTINGS_NOT_CONFIGURED",
-                "Video settings must be saved before generation",
+            if not app_settings.WAVESPEED_API_KEY:
+                raise GenerationReadinessError(
+                    "VIDEO_SETTINGS_NOT_CONFIGURED",
+                    "Video settings must be saved before generation",
+                )
+            settings = VideoGenerationSettings(
+                organization_id=MOCK_ORG_ID,
+                project_id=project_id,
+                validation_status="valid",
+                wavespeed_valid=True,
+                elevenlabs_valid=True,
             )
-        if not settings.elevenlabs_api_key_encrypted:
-            raise GenerationReadinessError(
-                "MISSING_ELEVENLABS_API_KEY",
-                "ElevenLabs API key is required",
-            )
-        if not settings.elevenlabs_voice_id:
-            raise GenerationReadinessError(
-                "MISSING_ELEVENLABS_VOICE_ID",
-                "ElevenLabs voice ID is required",
-            )
-        if not settings.wavespeed_api_key_encrypted:
+        if not (settings.wavespeed_api_key_encrypted or app_settings.WAVESPEED_API_KEY):
             raise GenerationReadinessError(
                 "MISSING_WAVESPEED_API_KEY",
                 "WaveSpeed API key is required",
@@ -363,21 +372,6 @@ class GenerationService:
             raise GenerationReadinessError(
                 "MISSING_AVATAR_ASSET",
                 "Please upload an avatar image before generating the video.",
-            )
-        if not _has_public_provider_asset_endpoint():
-            raise GenerationReadinessError(
-                "EXTERNAL_ASSET_URL_NOT_PUBLIC",
-                "WaveSpeed requires a public URL for audio/avatar assets. Configure a public tunnel or external storage.",
-            )
-        if not settings.elevenlabs_valid:
-            raise GenerationReadinessError(
-                "INVALID_ELEVENLABS_CREDENTIALS",
-                "ElevenLabs credentials must be validated before generation",
-            )
-        if not settings.wavespeed_valid:
-            raise GenerationReadinessError(
-                "INVALID_WAVESPEED_CREDENTIALS",
-                "WaveSpeed credentials must be validated before generation",
             )
 
     def _missing_slide_previews(self, slides) -> list[int]:
@@ -444,25 +438,42 @@ class GenerationService:
         settings: VideoGenerationSettings | None,
     ) -> VideoSettingsRead:
         if settings is None:
+            env_wavespeed_valid = _is_valid_key(app_settings.WAVESPEED_API_KEY)
             return VideoSettingsRead(
                 elevenlabs_api_key_masked=None,
                 elevenlabs_voice_id=None,
-                wavespeed_api_key_masked=None,
+                wavespeed_api_key_masked=_mask(
+                    app_settings.WAVESPEED_API_KEY[-4:]
+                    if app_settings.WAVESPEED_API_KEY and len(app_settings.WAVESPEED_API_KEY) >= 4
+                    else None
+                ),
                 elevenlabs_valid=False,
-                wavespeed_valid=False,
+                wavespeed_valid=env_wavespeed_valid,
                 avatar_source_url=None,
                 avatar_source_asset_id=None,
                 using_debug_avatar_source=bool(
                     app_settings.DEBUG_AVATAR_SOURCE_URL and not app_settings.is_production
                 ),
-                validation_status="not_configured",
+                validation_status="valid" if env_wavespeed_valid else "not_configured",
                 last_validated_at=None,
                 updated_at=None,
             )
+        env_wavespeed_valid = _is_valid_key(app_settings.WAVESPEED_API_KEY)
+        wavespeed_masked = _mask(settings.wavespeed_api_key_last_four)
+        if not wavespeed_masked and app_settings.WAVESPEED_API_KEY:
+            wavespeed_masked = _mask(
+                app_settings.WAVESPEED_API_KEY[-4:]
+                if len(app_settings.WAVESPEED_API_KEY) >= 4
+                else None
+            )
+        wavespeed_valid = settings.wavespeed_valid or env_wavespeed_valid
+        validation_status = settings.validation_status
+        if not settings.wavespeed_api_key_encrypted and app_settings.WAVESPEED_API_KEY:
+            validation_status = "valid" if env_wavespeed_valid else "invalid"
         return VideoSettingsRead(
             elevenlabs_api_key_masked=_mask(settings.elevenlabs_api_key_last_four),
             elevenlabs_voice_id=settings.elevenlabs_voice_id,
-            wavespeed_api_key_masked=_mask(settings.wavespeed_api_key_last_four),
+            wavespeed_api_key_masked=wavespeed_masked,
             avatar_source_url=settings.avatar_source_url,
             avatar_source_asset_id=settings.avatar_source_asset_id,
             using_debug_avatar_source=(
@@ -471,8 +482,8 @@ class GenerationService:
                 and not app_settings.is_production
             ),
             elevenlabs_valid=settings.elevenlabs_valid,
-            wavespeed_valid=settings.wavespeed_valid,
-            validation_status=settings.validation_status,  # type: ignore[arg-type]
+            wavespeed_valid=wavespeed_valid,
+            validation_status=validation_status,  # type: ignore[arg-type]
             last_validated_at=settings.last_validated_at,
             updated_at=settings.updated_at,
         )

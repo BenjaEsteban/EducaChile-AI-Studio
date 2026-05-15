@@ -4,6 +4,8 @@ These diagnostics are development-only. They are disabled when `APP_ENV=producti
 
 ## ElevenLabs test
 
+This is optional advanced voice-mode diagnostics. The default generation flow no longer requires ElevenLabs.
+
 Run:
 
 ```bash
@@ -14,29 +16,41 @@ The endpoint loads the saved ElevenLabs API key and voice ID from backend settin
 
 It logs only safe values: voice ID, output path, size, and duration. It never logs the API key.
 
-The endpoint uses the same `ElevenLabsTTSProvider` adapter used by the generation worker. A successful response confirms the adapter can produce a real MP3, not a local silent placeholder.
+The endpoint uses the same `ElevenLabsTTSProvider` adapter used by the optional advanced voice path. A successful response confirms the adapter can produce a real MP3, not a local silent placeholder.
 
-## WaveSpeed test
+## WaveSpeed talking-photo test
 
 Run:
 
 ```bash
-curl -X POST "http://localhost:8000/api/v1/projects/{project_id}/debug/wavespeed-test?avatar_source_url=https://example.com/avatar.png"
+curl -X POST "http://localhost:8000/api/v1/projects/{project_id}/debug/wavespeed-test"
 ```
 
-The endpoint uses `/tmp/educa_test_audio.mp3`, uploads it to storage, creates a provider-accessible signed URL, calls the WaveSpeed LTX-2 lipsync API, writes `/tmp/educa_test_avatar.mp4`, verifies it with `ffprobe`, uploads a debug copy to storage, and returns a browser download URL.
+The endpoint loads the configured avatar image from the project settings, uploads that image to WaveSpeed with `POST /api/v3/media/upload/binary`, then calls `POST /api/v3/wavespeed-ai/ai-talking-photos` with:
 
-WaveSpeed must be able to fetch the audio and avatar URLs from outside Docker. Use these settings for local Docker:
+```json
+{
+  "image": "<download_url>",
+  "text": "Hello, this is a test talking photo from Educa Chile.",
+  "duration": 5,
+  "seed": -1
+}
+```
+
+It polls `GET /api/v3/predictions/{request_id}/result`, writes `/tmp/educa_test_avatar.mp4`, verifies it with `ffprobe`, uploads a debug copy to storage, and returns a browser download URL.
+
+No ElevenLabs audio is required for this default talking-photo diagnostic. The output should contain both video and audio streams.
+
+Use these settings for local Docker:
 
 ```env
 MINIO_INTERNAL_ENDPOINT=http://minio:9000
 MINIO_PUBLIC_ENDPOINT=http://localhost:9000
-EXTERNAL_PROVIDER_ASSET_BASE_URL=https://your-public-minio-tunnel.example
+WAVESPEED_API_KEY=...
+WAVESPEED_BASE_URL=https://api.wavespeed.ai/api/v3
 ```
 
-`MINIO_INTERNAL_ENDPOINT` is for API/worker storage reads and writes. `MINIO_PUBLIC_ENDPOINT` is for browser preview/download URLs. `EXTERNAL_PROVIDER_ASSET_BASE_URL` is for WaveSpeed and must be a public URL, for example an ngrok/cloudflared tunnel or external object storage endpoint.
-
-If `EXTERNAL_PROVIDER_ASSET_BASE_URL` is empty and the only available URL is `localhost`, `127.0.0.1`, `minio`, or a private IP, WaveSpeed diagnostics and real generation fail with `EXTERNAL_ASSET_URL_NOT_PUBLIC`.
+`MINIO_INTERNAL_ENDPOINT` is for API/worker storage reads and writes. `MINIO_PUBLIC_ENDPOINT` is for browser preview/download URLs.
 
 Avatar source resolution order:
 
@@ -49,7 +63,7 @@ In the normal editor flow, users should upload the avatar image in the Avatar se
 
 If no avatar source is available, the debug endpoint returns `MISSING_AVATAR_SOURCE`; the real generation start path returns `MISSING_AVATAR_ASSET`.
 
-The endpoint uses the same `WavespeedAvatarVideoProvider` adapter used by the generation worker. A successful response confirms the adapter can produce a real lipsync MP4, not a local placeholder clip.
+The endpoint uses the same `WavespeedAvatarVideoProvider` adapter used by the generation worker. A successful response confirms the adapter can produce a real talking-photo MP4, not a local placeholder clip.
 
 ## FFmpeg composition test
 
@@ -63,9 +77,8 @@ The endpoint uses:
 
 - `/tmp/test_slide.png`
 - `/tmp/educa_test_avatar.mp4`
-- `/tmp/educa_test_audio.mp3`
 
-It writes `/tmp/educa_test_composed.mp4`, verifies video and audio streams with `ffprobe`, uploads a debug copy to storage, and returns a signed download URL.
+It maps the talking-photo clip audio stream directly, writes `/tmp/educa_test_composed.mp4`, verifies video and audio streams with `ffprobe`, uploads a debug copy to storage, and returns a signed download URL.
 
 ## Pipeline asset links
 
@@ -75,18 +88,17 @@ Run:
 curl http://localhost:8000/api/v1/projects/{project_id}/debug/generation-assets
 ```
 
-The endpoint returns signed download URLs for the latest generation job assets, including `tts_audio`, `avatar_clip`, `slide_render`, `slide_video`, and `final_video` when present.
+The endpoint returns signed download URLs for the latest generation job assets, including `avatar_clip`, `slide_render`, `slide_video`, `final_video`, and `slide_audio` when an advanced voice mode is used.
 
 In the editor, development builds also show a `Debug assets` section after a completed or failed generation.
 
 ## Confirming the real pipeline uses real providers
 
 1. Run the ElevenLabs debug test and confirm the returned MP3 is playable.
-2. Run the WaveSpeed debug test and confirm the returned MP4 is playable and shows the configured avatar source.
+2. Run the WaveSpeed talking-photo debug test and confirm the returned MP4 is playable.
 3. Generate a video from the editor.
 4. Open `GET /api/v1/projects/{project_id}/debug/generation-assets`.
 5. Confirm the latest generation contains:
-   - `tts_audio` assets with `.mp3` filenames and `audio/mpeg` MIME type.
    - `avatar_clip` assets with `.mp4` filenames.
    - `slide_render` assets.
    - `slide_video` assets.
@@ -101,13 +113,11 @@ The output must include both `video` and `audio`.
 
 The generation worker now calls the same real provider adapters:
 
-- `ElevenLabsTTSProvider` calls `https://api.elevenlabs.io/v1/text-to-speech/{voice_id}` and returns MP3 bytes.
-- `WavespeedAvatarVideoProvider` calls `https://api.wavespeed.ai/api/v3/wavespeed-ai/ltx-2-19b/lipsync` and returns MP4 bytes.
+- `WavespeedClient.upload_image()` calls `https://api.wavespeed.ai/api/v3/media/upload/binary` and returns a temporary image URL.
+- `WavespeedTalkingPhotoProvider.generate_avatar_video()` calls `https://api.wavespeed.ai/api/v3/wavespeed-ai/ai-talking-photos` and polls `/predictions/{request_id}/result` until a video URL is ready.
 
-The real pipeline should no longer create local silent WAV files or generated placeholder avatar clips for ElevenLabs/WaveSpeed jobs.
+The real pipeline should no longer create placeholder avatar clips for the default Wavespeed talking-photo flow.
 
-If ElevenLabs fails, the job should fail with `ELEVENLABS_TTS_FAILED`, `INVALID_ELEVENLABS_CREDENTIALS`, or `MISSING_ELEVENLABS_VOICE_ID`.
-
-If WaveSpeed fails, the job should fail with `WAVESPEED_AVATAR_FAILED`, `INVALID_WAVESPEED_CREDENTIALS`, `MISSING_AVATAR_ASSET`, or `AVATAR_SIGNED_URL_FAILED`.
+If WaveSpeed fails, the job should fail with `WAVESPEED_TALKING_PHOTO_FAILED`, `INVALID_WAVESPEED_CREDENTIALS`, `MISSING_AVATAR_SOURCE`, or `INVALID_AVATAR_DURATION`.
 
 If FFmpeg fails, the job should fail with `VIDEO_COMPOSITION_FAILED`.

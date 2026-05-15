@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     AZURE_STORAGE_CONNECTION_STRING: str | None = None
     AZURE_STORAGE_CONTAINER: str = "educachile-assets"
     AZURE_STORAGE_PUBLIC_BASE_URL: str | None = None
+    WAVESPEED_API_KEY: str | None = None
+    WAVESPEED_BASE_URL: str = "https://api.wavespeed.ai/api/v3"
     DEFAULT_LIPSYNC_MODEL: str = "wavespeed-ai/ltx-2-19b/lipsync"
     FALLBACK_LIPSYNC_MODEL: str | None = None
     LIPSYNC_PROMPT: str = (

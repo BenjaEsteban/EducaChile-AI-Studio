@@ -17,7 +17,7 @@ class ComposerService:
         self,
         slide_image_bytes: bytes,
         avatar_clip_bytes: bytes,
-        audio_bytes: bytes,
+        audio_bytes: bytes | None,
         duration_seconds: float,
         avatar_overlay: AvatarOverlay,
         resolution: str = "1080p",
@@ -32,31 +32,39 @@ class ComposerService:
             output = tmpdir / "slide.mp4"
             slide_image.write_bytes(slide_image_bytes)
             avatar_clip.write_bytes(avatar_clip_bytes)
-            audio.write_bytes(audio_bytes)
             overlay_filter = (
                 f"[0:v]scale={width}:{height},setsar=1[bg];"
                 f"[1:v]scale={avatar_overlay['width']}:{avatar_overlay['height']},setsar=1[avatar];"
                 f"[bg][avatar]overlay={avatar_overlay['x']}:{avatar_overlay['y']}:"
                 "shortest=0:eof_action=repeat[outv]"
             )
-            subprocess.run(
+            command = [
+                "ffmpeg",
+                "-y",
+                "-loop",
+                "1",
+                "-i",
+                str(slide_image),
+                "-i",
+                str(avatar_clip),
+            ]
+            if audio_bytes is not None:
+                audio.write_bytes(audio_bytes)
+                command.extend(["-i", str(audio)])
+            command.extend(
                 [
-                    "ffmpeg",
-                    "-y",
-                    "-loop",
-                    "1",
-                    "-i",
-                    str(slide_image),
-                    "-i",
-                    str(avatar_clip),
-                    "-i",
-                    str(audio),
                     "-filter_complex",
                     overlay_filter,
                     "-map",
                     "[outv]",
-                    "-map",
-                    "2:a:0",
+                ]
+            )
+            if audio_bytes is not None:
+                command.extend(["-map", "2:a:0"])
+            else:
+                command.extend(["-map", "1:a:0?"])
+            command.extend(
+                [
                     "-c:v",
                     "libx264",
                     "-c:a",
@@ -67,7 +75,10 @@ class ComposerService:
                     "-t",
                     str(duration_seconds),
                     str(output),
-                ],
+                ]
+            )
+            subprocess.run(
+                command,
                 check=True,
                 capture_output=True,
                 timeout=120,

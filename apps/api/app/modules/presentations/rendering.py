@@ -9,6 +9,7 @@ from pathlib import Path
 from pptx import Presentation as PptxPresentation
 
 logger = logging.getLogger(__name__)
+RENDER_DPI = 300
 
 
 def render_slide_previews(
@@ -19,8 +20,8 @@ def render_slide_previews(
 ) -> dict[int, str]:
     """Render PPT/PPTX slides to PNG previews and store them in object storage.
 
-    Rendering is best-effort: text parsing remains useful in test/CI environments where
-    LibreOffice or Poppler may not be installed.
+    Rendering uses LibreOffice to preserve the original PowerPoint layout and fonts,
+    then exports at higher DPI so the stored preview stays faithful when reused later.
     """
     return _render_slide_images(
         pptx_bytes=pptx_bytes,
@@ -109,7 +110,7 @@ def _render_slide_images(
                     "pdftoppm",
                     "-png",
                     "-r",
-                    "144",
+                    str(RENDER_DPI),
                     str(pdf_path),
                     str(output_prefix),
                 ],

@@ -26,6 +26,15 @@ function generationErrorMessage(status: GenerationStatus): string | null {
   if (status.error_code === "MISSING_RENDERED_PREVIEW") {
     return "Some slides are missing preview images. Please reprocess the presentation or upload it again.";
   }
+  if (status.error_code === "MISSING_AVATAR_ASSET") {
+    return "Please upload an avatar image before generating the video.";
+  }
+  if (status.error_code === "MISSING_WAVESPEED_API_KEY") {
+    return "Please save a WaveSpeed API key before generating the video.";
+  }
+  if (status.error_code === "INVALID_WAVESPEED_CREDENTIALS") {
+    return "WaveSpeed credentials were rejected. Please verify the API key.";
+  }
   if (status.error_code === "GENERATION_JOB_STALLED") {
     return "The previous generation got stuck. Please try again.";
   }
@@ -120,16 +129,28 @@ export default function ProjectEditorPage() {
       : generationStatus.final_video_url || generationStatus.status === "completed"
         ? "Regenerate Video"
         : "Generate Video";
+  const wavespeedSettingsConfigured = Boolean(
+    videoSettings?.wavespeed_api_key_masked && videoSettings?.wavespeed_valid,
+  );
   const hasAvatar =
     Boolean(projectAvatar) ||
     Boolean(videoSettings?.avatar_source_asset_id) ||
     Boolean(videoSettings?.using_debug_avatar_source);
+  const generationDisabledMessage = !videoSettings
+    ? "Wavespeed settings are not configured yet."
+    : !wavespeedSettingsConfigured
+      ? "Wavespeed settings are not configured yet."
+      : !hasAvatar
+        ? "Upload an avatar image before generating video."
+        : !allSlidesHaveDialogue
+          ? "Every slide needs narration before video generation."
+          : !allSlidesHavePreview
+            ? "Every slide needs a rendered image preview before video generation."
+            : isDirty
+              ? "Save narration before generating video."
+              : null;
   const canGenerateVideo = Boolean(
-    videoSettings?.elevenlabs_api_key_masked &&
-      videoSettings.elevenlabs_voice_id &&
-      videoSettings.wavespeed_api_key_masked &&
-      videoSettings.elevenlabs_valid &&
-      videoSettings.wavespeed_valid &&
+      wavespeedSettingsConfigured &&
       hasAvatar &&
       allSlidesHaveDialogue &&
       allSlidesHavePreview &&
@@ -482,7 +503,8 @@ export default function ProjectEditorPage() {
                   <div>
                     <h3 className="text-sm font-semibold text-gray-900">Narration</h3>
                     <p className="mt-1 text-xs text-gray-500">
-                      This text is used for ElevenLabs audio. It does not change the slide image.
+                      This text is sent to Wavespeed for the talking avatar clip. It does not
+                      change the slide image.
                     </p>
                   </div>
                   <button
@@ -553,7 +575,8 @@ export default function ProjectEditorPage() {
                     Video Generation Settings
                   </h3>
                   <p className="mt-1 text-xs text-gray-500">
-                    Credentials are saved backend-side and are never returned raw.
+                    Wavespeed is the default avatar mode. Credentials are saved backend-side and
+                    are never returned raw. ElevenLabs is optional advanced voice support.
                   </p>
                 </div>
                 <span
@@ -660,6 +683,13 @@ export default function ProjectEditorPage() {
               {!hasAvatar ? (
                 <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                   Upload an avatar image before generating video.
+                </div>
+              ) : null}
+              {generationDisabledMessage &&
+              !videoError &&
+              generationStatus.status === "idle" ? (
+                <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+                  {generationDisabledMessage}
                 </div>
               ) : null}
               {videoMessage ? (

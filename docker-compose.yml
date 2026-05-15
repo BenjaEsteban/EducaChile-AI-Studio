@@ -60,6 +60,8 @@ services:
       MINIO_INTERNAL_ENDPOINT: ${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
       MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
       EXTERNAL_PROVIDER_ASSET_BASE_URL: ${EXTERNAL_PROVIDER_ASSET_BASE_URL:-}
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY:-}
+      WAVESPEED_BASE_URL: ${WAVESPEED_BASE_URL:-https://api.wavespeed.ai/api/v3}
     ports:
       - "8000:8000"
     depends_on:
@@ -86,6 +88,8 @@ services:
       MINIO_INTERNAL_ENDPOINT: ${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
       MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
       EXTERNAL_PROVIDER_ASSET_BASE_URL: ${EXTERNAL_PROVIDER_ASSET_BASE_URL:-}
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY:-}
+      WAVESPEED_BASE_URL: ${WAVESPEED_BASE_URL:-https://api.wavespeed.ai/api/v3}
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2 --queues=default,presentations,generation
     depends_on:
       db:

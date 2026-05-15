@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import HTTPException, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ from app.modules.projects.service import MOCK_ORG_ID
 from app.modules.tts.adapters import TTSProviderError, get_tts_provider
 from app.modules.video.adapters import AvatarVideoProviderError, get_avatar_video_provider
 from app.providers.storage import get_storage
+from app.services.wavespeed_client import WavespeedClient, WavespeedClientError
 from app.utils.crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,7 @@ TEST_AUDIO_PATH = Path("/tmp/educa_test_audio.mp3")
 TEST_AVATAR_PATH = Path("/tmp/educa_test_avatar.mp4")
 TEST_SLIDE_PATH = Path("/tmp/test_slide.png")
 TEST_COMPOSED_PATH = Path("/tmp/educa_test_composed.mp4")
+TEST_TALKING_PHOTO_TEXT = "Hello, this is a test talking photo from Educa Chile."
 
 
 def run_elevenlabs_debug(project_id: uuid.UUID, db: Session) -> dict:
@@ -80,45 +83,55 @@ def run_wavespeed_debug(
 ) -> dict:
     _ensure_debug_enabled()
     settings_row = _video_settings(project_id, db)
-    wavespeed_key = decrypt_secret(settings_row.wavespeed_api_key_encrypted)
+    wavespeed_key = decrypt_secret(settings_row.wavespeed_api_key_encrypted) or settings.WAVESPEED_API_KEY
     if not wavespeed_key:
         raise _debug_error("INVALID_WAVESPEED_CREDENTIALS", "WaveSpeed API key missing")
 
-    source_url = avatar_source_url or _configured_avatar_source(project_id, db)
-    if not source_url:
+    source_bytes, source_meta = _configured_avatar_source_bytes(
+        project_id,
+        db,
+        avatar_source_url=avatar_source_url,
+    )
+    if not source_bytes:
         raise _debug_error(
             "MISSING_AVATAR_SOURCE",
             "Set DEBUG_AVATAR_SOURCE_URL, pass avatar_source_url, "
-            "or save an avatar URL in avatar_id",
+            "or save an avatar image in the project avatar settings",
         )
-    _validate_external_provider_url(source_url)
-
-    if not TEST_AUDIO_PATH.exists() or TEST_AUDIO_PATH.stat().st_size <= 0:
-        run_elevenlabs_debug(project_id, db)
-    audio_storage_key, _download_url = _upload_debug_file(
-        project_id=project_id,
-        path=TEST_AUDIO_PATH,
-        content_type="audio/mpeg",
-    )
-    audio_url = _external_debug_download_url(audio_storage_key)
-
-    audio_bytes = TEST_AUDIO_PATH.read_bytes()
     try:
-        clip_bytes = get_avatar_video_provider("wavespeed").generate_avatar_clip(
-            audio_bytes=audio_bytes,
-            duration_seconds=_probe_duration(TEST_AUDIO_PATH),
-            avatar_id=source_url,
-            api_key=wavespeed_key,
-            audio_url=audio_url,
-            avatar_source_url=source_url,
+        client = WavespeedClient(api_key=wavespeed_key)
+        uploaded_image_url = client.upload_image(
+            source_bytes,
+            filename=source_meta.get("filename") or "avatar.png",
+            content_type=source_meta.get("mime_type") or "image/png",
         )
+        video_url = get_avatar_video_provider("wavespeed").generate_avatar_video(
+            image_url=uploaded_image_url,
+            text=TEST_TALKING_PHOTO_TEXT,
+            duration=5,
+            api_key=wavespeed_key,
+        )
+        clip_response = httpx.get(video_url, timeout=180)
+        if clip_response.status_code >= 400:
+            raise AvatarVideoProviderError(
+                f"WaveSpeed output download returned HTTP {clip_response.status_code}",
+                "WAVESPEED_AVATAR_FAILED",
+            )
+        clip_bytes = clip_response.content
     except AvatarVideoProviderError as exc:
+        raise _debug_error(exc.code, str(exc)) from exc
+    except WavespeedClientError as exc:
         raise _debug_error(exc.code, str(exc)) from exc
 
     TEST_AVATAR_PATH.write_bytes(clip_bytes)
     media = _verify_media(TEST_AVATAR_PATH)
     streams = _probe_streams(TEST_AVATAR_PATH)
-    if media["size_bytes"] <= 0 or media["duration_seconds"] <= 0 or not streams["video"]:
+    if (
+        media["size_bytes"] <= 0
+        or media["duration_seconds"] <= 0
+        or not streams["video"]
+        or not streams["audio"]
+    ):
         raise _debug_error("INVALID_AVATAR_CLIP", "WaveSpeed avatar clip is empty or invalid")
 
     storage_key, download_url = _upload_debug_file(
@@ -127,17 +140,17 @@ def run_wavespeed_debug(
         content_type="video/mp4",
     )
     logger.info(
-        "WaveSpeed debug test succeeded: avatar_source_url=%s output=%s size=%s duration=%.2f",
-        source_url,
+        "WaveSpeed debug test succeeded: avatar_source_host=%s output=%s size=%s duration=%.2f",
+        source_meta.get("host"),
         TEST_AVATAR_PATH,
         media["size_bytes"],
         media["duration_seconds"],
     )
     return {
         "ok": True,
-        "avatar_source_url": source_url,
-        "audio_url_is_external": True,
-        "audio_storage_key": audio_storage_key,
+        "avatar_source_host": source_meta.get("host"),
+        "avatar_source_type": source_meta.get("source"),
+        "talking_photo_text": TEST_TALKING_PHOTO_TEXT,
         "output_path": str(TEST_AVATAR_PATH),
         "storage_key": storage_key,
         "download_url": download_url,
@@ -154,8 +167,6 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
             "FFmpeg is not available in this environment.",
         )
     _ensure_test_slide()
-    if not TEST_AUDIO_PATH.exists() or TEST_AUDIO_PATH.stat().st_size <= 0:
-        raise _debug_error("MISSING_AUDIO_ASSET", f"Missing test audio at {TEST_AUDIO_PATH}")
     if not TEST_AVATAR_PATH.exists() or TEST_AVATAR_PATH.stat().st_size <= 0:
         raise _debug_error("MISSING_AVATAR_CLIP", f"Missing test avatar at {TEST_AVATAR_PATH}")
 
@@ -168,8 +179,6 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
         str(TEST_SLIDE_PATH),
         "-i",
         str(TEST_AVATAR_PATH),
-        "-i",
-        str(TEST_AUDIO_PATH),
         "-filter_complex",
         "[0:v]scale=1920:1080,setsar=1[bg];"
         "[1:v]scale=420:-1[av];"
@@ -177,7 +186,7 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
         "-map",
         "[outv]",
         "-map",
-        "2:a:0",
+        "1:a:0?",
         "-c:v",
         "libx264",
         "-c:a",
@@ -467,7 +476,11 @@ def _video_settings(project_id: uuid.UUID, db: Session) -> VideoGenerationSettin
     return settings_row
 
 
-def _configured_avatar_source(project_id: uuid.UUID, db: Session) -> str | None:
+def _configured_avatar_source_bytes(
+    project_id: uuid.UUID,
+    db: Session,
+    avatar_source_url: str | None = None,
+) -> tuple[bytes | None, dict]:
     settings_row = (
         db.query(VideoGenerationSettings)
         .filter(
@@ -476,14 +489,44 @@ def _configured_avatar_source(project_id: uuid.UUID, db: Session) -> str | None:
         )
         .first()
     )
-    if settings_row and settings_row.avatar_source_url:
-        return settings_row.avatar_source_url
+    if avatar_source_url:
+        response = httpx.get(avatar_source_url, timeout=120)
+        if response.status_code < 400:
+            return response.content, {
+                "filename": Path(urlparse(avatar_source_url).path).name or "avatar.png",
+                "mime_type": response.headers.get("content-type") or "image/png",
+                "host": urlparse(avatar_source_url).hostname,
+                "source": "override_url",
+            }
+        return None, {"host": urlparse(avatar_source_url).hostname, "source": "override_url"}
     if settings_row and settings_row.avatar_source_asset_id:
         asset = db.get(Asset, settings_row.avatar_source_asset_id)
         if asset:
-            return _external_debug_download_url(asset.storage_key)
+            storage = get_storage()
+            return storage.download_bytes(asset.storage_key), {
+                "filename": asset.filename,
+                "mime_type": asset.mime_type or "image/png",
+                "host": None,
+                "source": "project_avatar_asset",
+            }
+    if settings_row and settings_row.avatar_source_url:
+        response = httpx.get(settings_row.avatar_source_url, timeout=120)
+        if response.status_code < 400:
+            return response.content, {
+                "filename": Path(urlparse(settings_row.avatar_source_url).path).name or "avatar.png",
+                "mime_type": response.headers.get("content-type") or "image/png",
+                "host": urlparse(settings_row.avatar_source_url).hostname,
+                "source": "settings_url",
+            }
     if settings.DEBUG_AVATAR_SOURCE_URL:
-        return settings.DEBUG_AVATAR_SOURCE_URL
+        response = httpx.get(settings.DEBUG_AVATAR_SOURCE_URL, timeout=120)
+        if response.status_code < 400:
+            return response.content, {
+                "filename": Path(urlparse(settings.DEBUG_AVATAR_SOURCE_URL).path).name or "avatar.png",
+                "mime_type": response.headers.get("content-type") or "image/png",
+                "host": urlparse(settings.DEBUG_AVATAR_SOURCE_URL).hostname,
+                "source": "debug_url",
+            }
     config = (
         db.query(ProjectGenerationConfig)
         .filter(
@@ -494,8 +537,15 @@ def _configured_avatar_source(project_id: uuid.UUID, db: Session) -> str | None:
     )
     avatar_id = config.avatar_id if config else None
     if avatar_id and urlparse(avatar_id).scheme in {"http", "https"}:
-        return avatar_id
-    return None
+        response = httpx.get(avatar_id, timeout=120)
+        if response.status_code < 400:
+            return response.content, {
+                "filename": Path(urlparse(avatar_id).path).name or "avatar.png",
+                "mime_type": response.headers.get("content-type") or "image/png",
+                "host": urlparse(avatar_id).hostname,
+                "source": "config_url",
+            }
+    return None, {"host": None, "source": None}
 
 
 def _verify_media(path: Path) -> dict:

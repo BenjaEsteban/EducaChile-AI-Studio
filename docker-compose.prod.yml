@@ -49,6 +49,8 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
       AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-educachile-assets}
       AZURE_STORAGE_PUBLIC_BASE_URL: ${AZURE_STORAGE_PUBLIC_BASE_URL:-}
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY:-}
+      WAVESPEED_BASE_URL: ${WAVESPEED_BASE_URL:-https://api.wavespeed.ai/api/v3}
       DEFAULT_LIPSYNC_MODEL: ${DEFAULT_LIPSYNC_MODEL:-wavespeed-ai/ltx-2-19b/lipsync}
       FALLBACK_LIPSYNC_MODEL: ${FALLBACK_LIPSYNC_MODEL:-}
       LIPSYNC_PROMPT: ${LIPSYNC_PROMPT:-A front-facing presenter speaking naturally, visible mouth movement, subtle natural head motion, realistic lip sync, stable face, well-lit portrait.}
@@ -71,6 +73,8 @@ services:
       AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
       AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-educachile-assets}
       AZURE_STORAGE_PUBLIC_BASE_URL: ${AZURE_STORAGE_PUBLIC_BASE_URL:-}
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY:-}
+      WAVESPEED_BASE_URL: ${WAVESPEED_BASE_URL:-https://api.wavespeed.ai/api/v3}
       DEFAULT_LIPSYNC_MODEL: ${DEFAULT_LIPSYNC_MODEL:-wavespeed-ai/ltx-2-19b/lipsync}
       FALLBACK_LIPSYNC_MODEL: ${FALLBACK_LIPSYNC_MODEL:-}
       LIPSYNC_PROMPT: ${LIPSYNC_PROMPT:-A front-facing presenter speaking naturally, visible mouth movement, subtle natural head motion, realistic lip sync, stable face, well-lit portrait.}

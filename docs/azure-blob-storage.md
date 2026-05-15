@@ -14,6 +14,8 @@ STORAGE_BACKEND=azure
 AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=YOUR_ACCOUNT;AccountKey=YOUR_KEY;EndpointSuffix=core.windows.net
 AZURE_STORAGE_CONTAINER=educachile-assets
 AZURE_STORAGE_PUBLIC_BASE_URL=https://YOUR_ACCOUNT.blob.core.windows.net
+WAVESPEED_API_KEY=...
+WAVESPEED_BASE_URL=https://api.wavespeed.ai/api/v3
 ```
 
 5. Deploy the same values to both `api` and `worker`.
@@ -30,16 +32,15 @@ MINIO_INTERNAL_ENDPOINT=http://minio:9000
 MINIO_PUBLIC_ENDPOINT=http://localhost:9000
 ```
 
-WaveSpeed cannot fetch `localhost` or Docker service URLs. For local video generation with WaveSpeed, configure `EXTERNAL_PROVIDER_ASSET_BASE_URL` with a public tunnel or use Azure/external storage.
+WaveSpeed talking-photo generation no longer requires a public asset URL for the avatar image when the project avatar is uploaded and stored in Azure. The worker downloads the avatar image from storage, uploads it to WaveSpeed, and passes the temporary WaveSpeed upload URL to the talking-photo endpoint.
 
-## Lipsync Settings
+## Talking Photo Settings
 
-The WaveSpeed lipsync adapter supports these production settings:
+The default avatar mode uses Wavespeed AI Talking Photos:
 
 ```env
-DEFAULT_LIPSYNC_MODEL=wavespeed-ai/ltx-2-19b/lipsync
-FALLBACK_LIPSYNC_MODEL=
-LIPSYNC_PROMPT=A front-facing presenter speaking naturally, visible mouth movement, subtle natural head motion, realistic lip sync, stable face, well-lit portrait.
+WAVESPEED_API_KEY=...
+WAVESPEED_BASE_URL=https://api.wavespeed.ai/api/v3
 ```
 
-If the generated avatar clip is detected as almost static and `FALLBACK_LIPSYNC_MODEL` is configured, the worker retries once with the fallback model.
+ElevenLabs remains optional for future advanced voice modes.
