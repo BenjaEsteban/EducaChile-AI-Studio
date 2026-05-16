@@ -33,6 +33,7 @@ def test_start_generation_accepts_slides_with_rendered_previews(
         "app.modules.generation.service.app_settings.DEBUG_AVATAR_SOURCE_URL",
         "https://public.example.test/avatar.png",
     )
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ALLOW_DUMMY_TTS", True)
     monkeypatch.setattr(
         "app.modules.generation.service.app_settings.EXTERNAL_PROVIDER_ASSET_BASE_URL",
         "https://public.example.test",
@@ -95,6 +96,74 @@ def test_start_generation_accepts_slides_with_rendered_previews(
     assert body["generation_job"]["progress_percentage"] == 0.0
 
 
+def test_start_generation_rejects_dummy_tts_when_audio_lipsync_requires_real_tts(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Dummy TTS Guard"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.DEBUG_AVATAR_SOURCE_URL",
+        "https://public.example.test/avatar.png",
+    )
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ALLOW_DUMMY_TTS", False)
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.EXTERNAL_PROVIDER_ASSET_BASE_URL",
+        "https://public.example.test",
+    )
+
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "wavespeed_api_key": "wavespeed-secret-9876",
+        },
+    )
+    client.post(f"/api/v1/projects/{project['id']}/video-settings/validate")
+
+    presentation = Presentation(
+        project_id=uuid.UUID(project["id"]),
+        organization_id=MOCK_ORG_ID,
+        title="Dummy TTS deck",
+        original_filename="dummy-tts.pptx",
+        storage_key="projects/dummy-tts.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notes 1",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Dialogue 1",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["code"] == "MISSING_TTS_PROVIDER"
+    assert "real TTS provider" in detail["message"]
+
+
 def test_video_settings_save_masks_keys_and_preserves_existing_keys(client: TestClient):
     project = client.post(PROJECTS_BASE, json={"name": "Video Settings Project"}).json()
 
@@ -128,8 +197,9 @@ def test_video_settings_save_masks_keys_and_preserves_existing_keys(client: Test
     assert body["elevenlabs_voice_id"] == "voice_updated"
 
 
-def test_video_settings_validate_updates_status(client: TestClient):
+def test_video_settings_validate_updates_status(client: TestClient, monkeypatch):
     project = client.post(PROJECTS_BASE, json={"name": "Validate Video Settings"}).json()
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ALLOW_DUMMY_TTS", True)
     client.put(
         f"/api/v1/projects/{project['id']}/video-settings",
         json={
@@ -242,7 +312,19 @@ def test_running_generation_job_only_blocks_active_statuses(client: TestClient, 
     assert repo.get_running_generation_job(project["id"], MOCK_ORG_ID).id == queued.id
 
 
-def test_generation_status_marks_stale_running_job_failed(client: TestClient, db_session):
+def test_generation_status_marks_stale_running_job_failed(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.GENERATION_STALLED_AFTER_SECONDS",
+        300,
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.PROVIDER_OPERATION_STALLED_AFTER_SECONDS",
+        300,
+    )
     project = client.post(PROJECTS_BASE, json={"name": "Stale Generation"}).json()
     stale_time = datetime.now(UTC) - timedelta(minutes=6)
     stale_job = GenerationJob(
@@ -294,7 +376,16 @@ def test_start_generation_returns_structured_conflict_for_active_job(
 def test_start_generation_marks_stale_job_failed_before_conflict(
     client: TestClient,
     db_session,
+    monkeypatch,
 ):
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.GENERATION_STALLED_AFTER_SECONDS",
+        300,
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.PROVIDER_OPERATION_STALLED_AFTER_SECONDS",
+        300,
+    )
     project = client.post(PROJECTS_BASE, json={"name": "Stale Generate Retry"}).json()
     stale_job = GenerationJob(
         organization_id=MOCK_ORG_ID,
@@ -317,6 +408,40 @@ def test_start_generation_marks_stale_job_failed_before_conflict(
     assert refreshed_job.error_code == "GENERATION_JOB_STALLED"
 
 
+def test_generation_status_keeps_active_job_when_heartbeat_is_fresh(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.GENERATION_STALLED_AFTER_SECONDS",
+        300,
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.service.app_settings.PROVIDER_OPERATION_STALLED_AFTER_SECONDS",
+        300,
+    )
+    project = client.post(PROJECTS_BASE, json={"name": "Fresh Heartbeat"}).json()
+    active_job = GenerationJob(
+        organization_id=MOCK_ORG_ID,
+        project_id=project["id"],
+        status="generating_avatar",
+        progress_percentage=25.0,
+        current_step="Polling Wavespeed for slide 1 of 5, chunk 2 of 12",
+        updated_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+    db_session.add(active_job)
+    db_session.commit()
+
+    res = client.get(f"/api/v1/projects/{project['id']}/generation-status")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "generating_avatar"
+    assert body["error_code"] is None
+    assert body["message"] == active_job.current_step
+
+
 def test_start_generation_rejects_only_when_preview_images_are_missing(
     client: TestClient,
     db_session,
@@ -329,6 +454,7 @@ def test_start_generation_rejects_only_when_preview_images_are_missing(
         "app.modules.generation.service.app_settings.DEBUG_AVATAR_SOURCE_URL",
         "https://public.example.test/avatar.png",
     )
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ALLOW_DUMMY_TTS", True)
     monkeypatch.setattr(
         "app.modules.generation.service.app_settings.EXTERNAL_PROVIDER_ASSET_BASE_URL",
         "https://public.example.test",
@@ -394,6 +520,7 @@ def test_start_generation_can_regenerate_missing_previews_from_pptx(
         "app.modules.generation.service.app_settings.DEBUG_AVATAR_SOURCE_URL",
         "https://public.example.test/avatar.png",
     )
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ALLOW_DUMMY_TTS", True)
     monkeypatch.setattr(
         "app.modules.generation.service.app_settings.EXTERNAL_PROVIDER_ASSET_BASE_URL",
         "https://public.example.test",

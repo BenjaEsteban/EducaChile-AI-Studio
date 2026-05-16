@@ -14,8 +14,12 @@ The user uploads a PPT/PPTX, edits the slides in a canvas-like editor, configure
 - Storage: MinIO / S3-compatible storage
 - Async jobs: Redis / Celery workers
 - Video composition: FFmpeg
-- Default avatar provider: WaveSpeed AI Talking Photos
+- Default avatar provider: WaveSpeed audio-driven lip sync
+- WaveSpeed AI Talking Photos remains a fallback/dev mode
 - Optional advanced TTS provider: ElevenLabs
+- Default avatar generation mode: `audio_lipsync`
+- Default lip sync provider: `wavespeed_infinitetalk`
+- Default TTS speed: `0.85`
 
 ## Current user flow
 
@@ -40,19 +44,22 @@ The user uploads a PPT/PPTX, edits the slides in a canvas-like editor, configure
 - For the MVP, only these video settings are required:
   - WaveSpeed API Key
   - ElevenLabs API Key and Voice ID are optional advanced settings
+  - `TTS_LANGUAGE=es`
+  - `TTS_SPEED=0.85`
+  - `ENABLE_SUBTITLES=false`
 
 ## Video generation pipeline
 
 When the user clicks Generate Video inside the editor, the async pipeline should:
 
 1. Load edited slides and dialogue/notes.
-2. Generate avatar/talking-photo clip per slide with WaveSpeed using the narration text.
-3. Generate audio per slide only if an advanced voice mode is enabled.
-4. Render the edited slide canvas.
+2. Generate Spanish narration audio per slide at a calm pace.
+3. Generate an audio-driven avatar clip per slide with WaveSpeed InfiniteTalk using the narration audio.
+4. Render the slide preview image.
 5. Use FFmpeg to compose:
    - slide render as background
    - avatar clip as overlay
-   - avatar clip audio as the audio track by default
+   - generated narration audio as the audio track by default
 6. Generate one MP4 per slide.
 7. Concatenate all slide videos into final.mp4.
 8. Show progress and final preview/download in the editor.

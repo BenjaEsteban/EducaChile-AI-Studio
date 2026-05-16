@@ -12,6 +12,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.modules.composer.service import ComposerService
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.projects.models import Asset, ProjectGenerationConfig
 from app.modules.projects.service import MOCK_ORG_ID
@@ -43,7 +44,8 @@ def run_elevenlabs_debug(project_id: uuid.UUID, db: Session) -> dict:
         audio_bytes, _duration = get_tts_provider("elevenlabs").generate_audio(
             text=TEST_AUDIO_TEXT,
             voice_id=voice_id,
-            language="es",
+            language=settings.TTS_LANGUAGE,
+            speed=settings.TTS_SPEED,
             api_key=api_key,
         )
     except TTSProviderError as exc:
@@ -105,13 +107,66 @@ def run_wavespeed_debug(
             filename=source_meta.get("filename") or "avatar.png",
             content_type=source_meta.get("mime_type") or "image/png",
         )
-        video_url = get_avatar_video_provider("wavespeed").generate_avatar_video(
-            image_url=uploaded_image_url,
-            text=TEST_TALKING_PHOTO_TEXT,
-            duration=5,
-            api_key=wavespeed_key,
-        )
-        clip_response = httpx.get(video_url, timeout=180)
+        provider = get_avatar_video_provider("wavespeed")
+        if settings.AVATAR_GENERATION_MODE.strip().lower() == "audio_lipsync" and (
+            settings.AVATAR_LIPSYNC_PROVIDER or "wavespeed_infinitetalk"
+        ).strip().lower() == "wavespeed_infinitetalk":
+            audio_bytes: bytes | None = None
+            audio_download_url: str | None = None
+            audio_duration_seconds: float | None = None
+            if settings_row.elevenlabs_api_key_encrypted and settings_row.elevenlabs_voice_id:
+                audio_key = decrypt_secret(settings_row.elevenlabs_api_key_encrypted)
+                if audio_key and settings_row.elevenlabs_voice_id:
+                    try:
+                        audio_bytes, audio_duration_seconds = get_tts_provider("elevenlabs").generate_audio(
+                            text=TEST_TALKING_PHOTO_TEXT,
+                            voice_id=settings_row.elevenlabs_voice_id,
+                            language=settings.TTS_LANGUAGE,
+                            speed=settings.TTS_SPEED,
+                            api_key=audio_key,
+                        )
+                    except TTSProviderError:
+                        audio_bytes = None
+            if audio_bytes:
+                TEST_AUDIO_PATH.write_bytes(audio_bytes)
+                audio_storage_key, audio_download_url = _upload_debug_file(
+                    project_id=project_id,
+                    path=TEST_AUDIO_PATH,
+                    content_type="audio/mpeg",
+                )
+                logger.info(
+                    "WaveSpeed debug audio prepared: storage_key=%s",
+                    audio_storage_key,
+                )
+            if audio_download_url:
+                video_url = provider.generate_avatar_video_from_audio(
+                    image_url=uploaded_image_url,
+                    audio_url=audio_download_url,
+                    image_bytes=source_bytes,
+                    audio_bytes=audio_bytes,
+                    image_filename=source_meta.get("filename") or "avatar.png",
+                    image_content_type=source_meta.get("mime_type") or "image/png",
+                    audio_filename=Path(audio_storage_key).name if audio_storage_key else "educa_test_audio.mp3",
+                    audio_content_type="audio/mpeg",
+                    prompt=None,
+                    api_key=wavespeed_key,
+                    audio_duration_seconds=audio_duration_seconds,
+                )
+            else:
+                video_url = provider.generate_avatar_video(
+                    image_url=uploaded_image_url,
+                    text=TEST_TALKING_PHOTO_TEXT,
+                    duration=5,
+                    api_key=wavespeed_key,
+                )
+        else:
+            video_url = provider.generate_avatar_video(
+                image_url=uploaded_image_url,
+                text=TEST_TALKING_PHOTO_TEXT,
+                duration=5,
+                api_key=wavespeed_key,
+            )
+        clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
         if clip_response.status_code >= 400:
             raise AvatarVideoProviderError(
                 f"WaveSpeed output download returned HTTP {clip_response.status_code}",
@@ -124,13 +179,19 @@ def run_wavespeed_debug(
         raise _debug_error(exc.code, str(exc)) from exc
 
     TEST_AVATAR_PATH.write_bytes(clip_bytes)
+    _verify_media(TEST_AVATAR_PATH)
+    raw_streams = _probe_streams(TEST_AVATAR_PATH)
+    provider_audio_present = raw_streams["audio"]
+    if provider_audio_present:
+        stripped_clip = ComposerService().strip_audio_from_video(clip_bytes)
+        TEST_AVATAR_PATH.write_bytes(stripped_clip)
     media = _verify_media(TEST_AVATAR_PATH)
     streams = _probe_streams(TEST_AVATAR_PATH)
     if (
         media["size_bytes"] <= 0
         or media["duration_seconds"] <= 0
         or not streams["video"]
-        or not streams["audio"]
+        or streams["audio"]
     ):
         raise _debug_error("INVALID_AVATAR_CLIP", "WaveSpeed avatar clip is empty or invalid")
 
@@ -154,6 +215,8 @@ def run_wavespeed_debug(
         "output_path": str(TEST_AVATAR_PATH),
         "storage_key": storage_key,
         "download_url": download_url,
+        "provider_audio_present": provider_audio_present,
+        "provider_streams": raw_streams,
         "streams": streams,
         **media,
     }
@@ -169,6 +232,8 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
     _ensure_test_slide()
     if not TEST_AVATAR_PATH.exists() or TEST_AVATAR_PATH.stat().st_size <= 0:
         raise _debug_error("MISSING_AVATAR_CLIP", f"Missing test avatar at {TEST_AVATAR_PATH}")
+    if not TEST_AUDIO_PATH.exists() or TEST_AUDIO_PATH.stat().st_size <= 0:
+        raise _debug_error("MISSING_AUDIO_ASSET", f"Missing test audio at {TEST_AUDIO_PATH}")
 
     command = [
         "ffmpeg",
@@ -179,6 +244,8 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
         str(TEST_SLIDE_PATH),
         "-i",
         str(TEST_AVATAR_PATH),
+        "-i",
+        str(TEST_AUDIO_PATH),
         "-filter_complex",
         "[0:v]scale=1920:1080,setsar=1[bg];"
         "[1:v]scale=420:-1[av];"
@@ -186,7 +253,7 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
         "-map",
         "[outv]",
         "-map",
-        "1:a:0?",
+        "2:a:0",
         "-c:v",
         "libx264",
         "-c:a",
@@ -199,7 +266,7 @@ def run_ffmpeg_debug(project_id: uuid.UUID) -> dict:
         str(TEST_COMPOSED_PATH),
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True, timeout=180)
+        subprocess.run(command, check=True, capture_output=True, timeout=settings.FFMPEG_TIMEOUT_SECONDS)
     except subprocess.CalledProcessError as exc:
         raise _debug_error(
             "VIDEO_COMPOSITION_FAILED",
@@ -490,7 +557,7 @@ def _configured_avatar_source_bytes(
         .first()
     )
     if avatar_source_url:
-        response = httpx.get(avatar_source_url, timeout=120)
+        response = httpx.get(avatar_source_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
         if response.status_code < 400:
             return response.content, {
                 "filename": Path(urlparse(avatar_source_url).path).name or "avatar.png",
@@ -510,7 +577,7 @@ def _configured_avatar_source_bytes(
                 "source": "project_avatar_asset",
             }
     if settings_row and settings_row.avatar_source_url:
-        response = httpx.get(settings_row.avatar_source_url, timeout=120)
+        response = httpx.get(settings_row.avatar_source_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
         if response.status_code < 400:
             return response.content, {
                 "filename": Path(urlparse(settings_row.avatar_source_url).path).name or "avatar.png",
@@ -519,7 +586,7 @@ def _configured_avatar_source_bytes(
                 "source": "settings_url",
             }
     if settings.DEBUG_AVATAR_SOURCE_URL:
-        response = httpx.get(settings.DEBUG_AVATAR_SOURCE_URL, timeout=120)
+        response = httpx.get(settings.DEBUG_AVATAR_SOURCE_URL, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
         if response.status_code < 400:
             return response.content, {
                 "filename": Path(urlparse(settings.DEBUG_AVATAR_SOURCE_URL).path).name or "avatar.png",
@@ -537,7 +604,7 @@ def _configured_avatar_source_bytes(
     )
     avatar_id = config.avatar_id if config else None
     if avatar_id and urlparse(avatar_id).scheme in {"http", "https"}:
-        response = httpx.get(avatar_id, timeout=120)
+        response = httpx.get(avatar_id, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
         if response.status_code < 400:
             return response.content, {
                 "filename": Path(urlparse(avatar_id).path).name or "avatar.png",

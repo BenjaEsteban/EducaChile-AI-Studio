@@ -8,7 +8,18 @@ from pptx.dml.color import RGBColor
 from sqlalchemy.orm import configure_mappers
 
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
-from app.modules.generation.pipeline import GenerationContext, generate_avatar_clip_for_slide
+from app.modules.generation.pipeline import (
+    _build_narration_chunks,
+    _can_reuse_slide_audio_asset,
+    GenerationContext,
+    _ensure_avatar_base_video_asset,
+    _load_avatar_source_url,
+    _normalize_tts_text,
+    _slide_audio_chunk_specs,
+    _slide_segment_duration_seconds,
+    generate_audio_for_slide,
+    generate_avatar_clip_for_slide,
+)
 from app.modules.jobs.models import Job, JobStatus, JobType
 from app.modules.organizations.models import Organization
 from app.modules.projects.models import Asset, Presentation, PresentationStatus, Project, Slide
@@ -398,12 +409,14 @@ def test_enqueue_passes_job_and_presentation_ids():
     assert kwargs["presentation_id"] == str(presentation_id)
 
 
-def test_generate_avatar_clip_uses_talking_photo_flow(monkeypatch, db_session):
+def test_generate_avatar_clip_uses_audio_lipsync_flow(monkeypatch, db_session):
     storage = InMemoryStorageProvider()
     avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
     storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
     slide_preview_key = f"presentations/{uuid.uuid4()}/previews/slide-1.png"
     storage.upload_file(slide_preview_key, b"slide-preview", "image/png")
+    audio_key = f"projects/{uuid.uuid4()}/audio/slide-1.mp3"
+    storage.upload_file(audio_key, b"audio-bytes", "audio/mpeg")
 
     project = Project(
         organization_id=MOCK_ORG_ID,
@@ -454,6 +467,19 @@ def test_generate_avatar_clip_uses_talking_photo_flow(monkeypatch, db_session):
             size_bytes=len(b"avatar-bytes"),
         )
     )
+    audio_asset = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=slide.id,
+        asset_type="slide_audio",
+        storage_key=audio_key,
+        filename="slide-1.mp3",
+        mime_type="audio/mpeg",
+        size_bytes=len(b"audio-bytes"),
+        duration_seconds=5.0,
+        metadata_json={"generation_job_id": "job-123", "slide_position": 1},
+    )
+    db_session.add(audio_asset)
     db_session.commit()
 
     class FakeResponse:
@@ -462,36 +488,123 @@ def test_generate_avatar_clip_uses_talking_photo_flow(monkeypatch, db_session):
             self.status_code = status_code
 
     class FakeProvider:
-        def generate_avatar_video(self, image_url, text, duration=5, seed=-1, api_key=None):
-            assert image_url == "https://wavespeed.test/uploaded.png"
-            assert text == "Narration text for talking photo"
+        def generate_avatar_video_from_audio(
+            self,
+            image_url,
+            audio_url,
+            duration=5,
+            seed=-1,
+            prompt=None,
+            resolution=None,
+            api_key=None,
+            audio_duration_seconds=None,
+            image_bytes=None,
+            audio_bytes=None,
+            image_filename=None,
+            image_content_type=None,
+            audio_filename=None,
+            audio_content_type=None,
+            retry_on_mismatch=True,
+            minimum_duration_ratio=0.8,
+            heartbeat_callback=None,
+        ):
+            assert image_bytes == b"avatar-bytes"
+            assert audio_bytes == b"audio-bytes"
+            assert image_filename == "avatar.png"
+            assert image_content_type == "image/png"
+            assert audio_filename == "slide-1-chunk-1.mp3"
+            assert audio_content_type == "audio/mpeg"
+            assert prompt is None
             assert duration == 5
+            assert resolution == "480p"
+            assert audio_duration_seconds == 5.0
+            assert retry_on_mismatch is True
+            assert minimum_duration_ratio == 0.8
+            assert heartbeat_callback is not None
+            self.last_image_url = "https://wavespeed.test/uploaded-image.png"
+            self.last_audio_url = "https://wavespeed.test/uploaded-audio.mp3"
+            self.last_external_checks = {
+                "image": {"validated": True, "status_code": 200, "host": "wavespeed.test", "path": "/uploaded-image.png"},
+                "audio": {"validated": True, "status_code": 200, "host": "wavespeed.test", "path": "/uploaded-audio.mp3"},
+            }
+            self.last_duration_ratio = 1.0
             self.last_request_id = "request-123"
             return "https://cdn.test/out.mp4"
 
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_GENERATION_MODE", "infinitetalk_image")
     monkeypatch.setattr(
-        "app.modules.generation.pipeline.WavespeedClient.upload_image",
-        lambda self, file_bytes, filename, content_type: "https://wavespeed.test/uploaded.png",
+        "app.modules.generation.pipeline.settings.AVATAR_LIPSYNC_PROVIDER",
+        "wavespeed_infinitetalk",
     )
     monkeypatch.setattr(
         "app.modules.generation.pipeline.get_avatar_video_provider",
         lambda *_args, **_kwargs: FakeProvider(),
     )
     monkeypatch.setattr(
+        "app.modules.generation.pipeline._talking_photo_duration_from_audio",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("audio_lipsync must not use talking-photo duration logic")
+        ),
+    )
+    monkeypatch.setattr(
         "app.modules.generation.pipeline.httpx.get",
         lambda url, timeout=None: FakeResponse(),
     )
     monkeypatch.setattr(
+        "app.modules.generation.pipeline.httpx.head",
+        lambda url, timeout=None, follow_redirects=True: FakeResponse(status_code=200),
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.ComposerService.normalize_audio_to_mp3",
+        lambda self, audio_bytes: b"normalized-audio",
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.ComposerService.strip_audio_from_video",
+        lambda self, video_bytes: b"avatar-video-bytes",
+    )
+    monkeypatch.setattr(
         "app.modules.generation.pipeline._probe_media_info",
-        lambda *_args, **_kwargs: {
-            "duration_seconds": 5.0,
-            "has_video": True,
-            "has_audio": True,
-            "video_codec": "h264",
-            "audio_codec": "aac",
-            "width": 1280,
-            "height": 720,
-        },
+        lambda media_bytes, *_args, **_kwargs: (
+            {
+                "duration_seconds": 5.0,
+                "has_video": True,
+                "has_audio": True,
+                "video_codec": "h264",
+                "audio_codec": "aac",
+                "width": 1280,
+                "height": 720,
+            }
+            if media_bytes == b"video-bytes"
+            else {
+                "duration_seconds": 5.0,
+                "has_video": False,
+                "has_audio": True,
+                "video_codec": None,
+                "audio_codec": "aac",
+                "width": None,
+                "height": None,
+            }
+            if media_bytes in {b"audio-bytes", b"normalized-audio"}
+            else {
+                "duration_seconds": 5.0,
+                "has_video": True,
+                "has_audio": False,
+                "video_codec": "h264",
+                "audio_codec": None,
+                "width": 1280,
+                "height": 720,
+            }
+            if media_bytes == b"avatar-video-bytes"
+            else {
+                "duration_seconds": 5.0,
+                "has_video": False,
+                "has_audio": False,
+                "video_codec": None,
+                "audio_codec": None,
+                "width": None,
+                "height": None,
+            }
+        ),
     )
     monkeypatch.setattr(
         "app.modules.generation.pipeline._analyze_video_motion",
@@ -538,12 +651,947 @@ def test_generate_avatar_clip_uses_talking_photo_flow(monkeypatch, db_session):
         slide,
         1,
         1,
-        None,
+        audio_asset,
     )
 
     assert asset.asset_type == "generated_avatar_clip"
-    assert asset.metadata_json["mode"] == "ai-talking-photos"
+    assert asset.metadata_json["mode"] == "infinitetalk_image"
+    assert asset.metadata_json["selected_provider"] == "wavespeed_infinitetalk"
     assert asset.metadata_json["provider"] == "wavespeed"
     assert asset.metadata_json["wavespeed_request_id"] == "request-123"
+    assert asset.metadata_json["source_audio_url"] == "https://wavespeed.test/uploaded-audio.mp3"
+    assert asset.metadata_json["chunks"][0]["text"] == "Narration text for talking photo"
+    assert asset.metadata_json["chunks"][0]["audio_url"] == "https://wavespeed.test/uploaded-audio.mp3"
+    assert asset.metadata_json["chunks"][0]["measured_tts_duration"] == 5.0
     assert asset.metadata_json["ffprobe"]["has_video"] is True
-    assert asset.metadata_json["ffprobe"]["has_audio"] is True
+    assert asset.metadata_json["ffprobe"]["has_audio"] is False
+    assert asset.metadata_json["chunk_count"] == 1
+    assert asset.metadata_json["chunks"][0]["provider_audio_present"] is True
+    assert asset.metadata_json["chunks"][0]["stripped_clip_ffprobe"]["has_audio"] is False
+    assert asset.metadata_json["chunks"][0]["image_url"] == "https://wavespeed.test/uploaded-image.png"
+    assert asset.metadata_json["chunks"][0]["image_url_external_check_result"]["validated"] is True
+    assert asset.metadata_json["chunks"][0]["audio_url_external_check_result"]["validated"] is True
+
+
+def test_generate_avatar_clip_uses_fast_lipsync_base_video(monkeypatch, db_session):
+    storage = InMemoryStorageProvider()
+    avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
+    storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
+    slide_preview_key = f"presentations/{uuid.uuid4()}/previews/slide-1.png"
+    storage.upload_file(slide_preview_key, b"slide-preview", "image/png")
+    audio_key = f"projects/{uuid.uuid4()}/audio/slide-1.mp3"
+    storage.upload_file(audio_key, b"audio-bytes", "audio/mpeg")
+
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Fast Lipsync Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    slide = Slide(
+        presentation_id=presentation.id,
+        position=1,
+        title="Slide 1",
+        notes="Narration text",
+        thumbnail_key=slide_preview_key,
+        metadata_={
+            "dialogue": "Narration text for fast lipsync",
+            "rendered_image_key": slide_preview_key,
+            "slide_preview": {
+                "asset_type": "slide_preview",
+                "storage_key": slide_preview_key,
+                "render_source": "ppt_render",
+                "includes_text": True,
+            },
+        },
+    )
+    db_session.add(slide)
+    db_session.flush()
+    db_session.add(
+        Asset(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            slide_id=None,
+            asset_type="avatar_source",
+            storage_key=avatar_key,
+            filename="avatar.png",
+            mime_type="image/png",
+            size_bytes=len(b"avatar-bytes"),
+        )
+    )
+    audio_asset = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=slide.id,
+        asset_type="slide_audio",
+        storage_key=audio_key,
+        filename="slide-1.mp3",
+        mime_type="audio/mpeg",
+        size_bytes=len(b"audio-bytes"),
+        duration_seconds=6.0,
+        metadata_json={
+            "generation_job_id": "job-123",
+            "slide_position": 1,
+            "chunks": [
+                {
+                    "index": 1,
+                    "text": "Narration text for fast lipsync",
+                    "word_count": 4,
+                    "estimated_duration_seconds": 6.0,
+                    "measured_tts_duration": 6.0,
+                    "audio_storage_key": audio_key,
+                    "audio_url": "https://wavespeed.test/uploaded-audio.mp3",
+                }
+            ],
+        },
+    )
+    db_session.add(audio_asset)
+    db_session.commit()
+
+    class FakeResponse:
+        def __init__(self, content=b"video-bytes", status_code=200):
+            self.content = content
+            self.status_code = status_code
+
+    class FakeProvider:
+        def generate_avatar_video_from_base_video(
+            self,
+            *,
+            base_video_url,
+            audio_url,
+            duration=5,
+            seed=-1,
+            api_key=None,
+            audio_duration_seconds=None,
+            base_video_bytes=None,
+            base_video_filename=None,
+            base_video_content_type=None,
+            audio_bytes=None,
+            audio_filename=None,
+            audio_content_type=None,
+            sync_mode=None,
+            model_name=None,
+            retry_on_mismatch=True,
+            minimum_duration_ratio=0.8,
+            heartbeat_callback=None,
+        ):
+            assert base_video_bytes == b"base-video-bytes"
+            assert audio_bytes == b"audio-bytes"
+            assert base_video_filename == "avatar-base.mp4"
+            assert audio_filename == "slide-1-chunk-1.mp3"
+            assert base_video_content_type == "video/mp4"
+            assert audio_content_type == "audio/mpeg"
+            assert sync_mode == "loop"
+            assert model_name == "wavespeed-ai/sync-lipsync-3"
+            assert duration == 6
+            assert audio_duration_seconds == 6.0
+            assert retry_on_mismatch is True
+            assert minimum_duration_ratio == 0.8
+            assert heartbeat_callback is not None
+            self.last_image_url = "https://wavespeed.test/base-uploaded.mp4"
+            self.last_audio_url = "https://wavespeed.test/audio-uploaded.mp3"
+            self.last_external_checks = {
+                "video": {"validated": True, "status_code": 200, "host": "wavespeed.test", "path": "/base-uploaded.mp4"},
+                "audio": {"validated": True, "status_code": 200, "host": "wavespeed.test", "path": "/audio-uploaded.mp3"},
+            }
+            self.last_duration_ratio = 1.0
+            self.last_request_id = "request-fast-123"
+            return "https://cdn.test/fast.mp4"
+
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_GENERATION_MODE", "fast_lipsync")
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_LIPSYNC_PROVIDER", "wavespeed_sync_lipsync_3")
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_SYNC_MODE", "loop")
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_LIPSYNC_MODEL_PATH", "wavespeed-ai/sync-lipsync-3")
+    monkeypatch.setattr("app.modules.generation.pipeline.get_avatar_video_provider", lambda *_args, **_kwargs: FakeProvider())
+    monkeypatch.setattr("app.modules.generation.pipeline._image_to_video_clip", lambda image_bytes, duration_seconds: b"base-video-bytes")
+    monkeypatch.setattr("app.modules.generation.pipeline._probe_media_info", lambda media_bytes, *_args, **_kwargs: (
+        {
+            "duration_seconds": 6.0,
+            "has_video": True,
+            "has_audio": False,
+            "video_codec": "h264",
+            "audio_codec": None,
+            "width": 1280,
+            "height": 720,
+        }
+        if media_bytes == b"base-video-bytes"
+        else {
+            "duration_seconds": 6.0,
+            "has_video": False,
+            "has_audio": True,
+            "video_codec": None,
+            "audio_codec": "aac",
+            "width": None,
+            "height": None,
+        }
+        if media_bytes == b"audio-bytes"
+        else {
+            "duration_seconds": 6.0,
+            "has_video": True,
+            "has_audio": False,
+            "video_codec": "h264",
+            "audio_codec": None,
+            "width": 1280,
+            "height": 720,
+        }
+    ))
+    monkeypatch.setattr("app.modules.generation.pipeline.httpx.get", lambda url, timeout=None: FakeResponse())
+    monkeypatch.setattr("app.modules.generation.pipeline.httpx.head", lambda url, timeout=None, follow_redirects=True: FakeResponse(status_code=200))
+    monkeypatch.setattr("app.modules.generation.pipeline.ComposerService.strip_audio_from_video", lambda self, video_bytes: video_bytes)
+    monkeypatch.setattr("app.modules.generation.pipeline.storage_object_exists", lambda *_: True)
+
+    job = GenerationJob(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        status="queued",
+        progress_percentage=0.0,
+    )
+    db_session.add(job)
+    db_session.flush()
+    context = GenerationContext(
+        generation_job_id=job.id,
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=presentation,
+        slides=[slide],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key=None,
+        elevenlabs_voice_id=None,
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url=None,
+        avatar_source_storage_key=avatar_key,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{job.id}",
+    )
+
+    asset = generate_avatar_clip_for_slide(
+        db_session,
+        storage,
+        job,
+        context,
+        slide,
+        1,
+        1,
+        audio_asset,
+    )
+
+    assert asset.asset_type == "generated_avatar_clip"
+    assert asset.metadata_json["mode"] == "fast_lipsync"
+    assert asset.metadata_json["selected_provider"] == "wavespeed_sync_lipsync_3"
+    assert asset.metadata_json["provider"] == "wavespeed"
+    assert asset.metadata_json["wavespeed_request_id"] == "request-fast-123"
+    assert asset.metadata_json["source_audio_url"] == "https://wavespeed.test/audio-uploaded.mp3"
+    assert asset.metadata_json["source_image_url"] == "https://wavespeed.test/base-uploaded.mp4"
+    assert asset.metadata_json["chunks"][0]["fallback_used"] is False
+
+
+def test_generate_avatar_clip_falls_back_to_static_avatar_when_provider_times_out(
+    monkeypatch,
+    db_session,
+):
+    storage = InMemoryStorageProvider()
+    avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
+    storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
+    slide_preview_key = f"presentations/{uuid.uuid4()}/previews/slide-1.png"
+    storage.upload_file(slide_preview_key, b"slide-preview", "image/png")
+    audio_key = f"projects/{uuid.uuid4()}/audio/slide-1.mp3"
+    storage.upload_file(audio_key, b"audio-bytes", "audio/mpeg")
+
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Fast Lipsync Fallback Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    slide = Slide(
+        presentation_id=presentation.id,
+        position=1,
+        title="Slide 1",
+        notes="Narration text",
+        thumbnail_key=slide_preview_key,
+        metadata_={
+            "dialogue": "Narration text for fallback",
+            "rendered_image_key": slide_preview_key,
+            "slide_preview": {
+                "asset_type": "slide_preview",
+                "storage_key": slide_preview_key,
+                "render_source": "ppt_render",
+                "includes_text": True,
+            },
+        },
+    )
+    db_session.add(slide)
+    db_session.flush()
+    db_session.add(
+        Asset(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            slide_id=None,
+            asset_type="avatar_source",
+            storage_key=avatar_key,
+            filename="avatar.png",
+            mime_type="image/png",
+            size_bytes=len(b"avatar-bytes"),
+        )
+    )
+    audio_asset = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=slide.id,
+        asset_type="slide_audio",
+        storage_key=audio_key,
+        filename="slide-1.mp3",
+        mime_type="audio/mpeg",
+        size_bytes=len(b"audio-bytes"),
+        duration_seconds=6.0,
+        metadata_json={
+            "generation_job_id": "job-123",
+            "slide_position": 1,
+            "chunks": [
+                {
+                    "index": 1,
+                    "text": "Narration text for fallback",
+                    "word_count": 4,
+                    "estimated_duration_seconds": 6.0,
+                    "measured_tts_duration": 6.0,
+                    "audio_storage_key": audio_key,
+                    "audio_url": "https://wavespeed.test/uploaded-audio.mp3",
+                }
+            ],
+        },
+    )
+    db_session.add(audio_asset)
+    db_session.commit()
+
+    class FakeProvider:
+        def generate_avatar_video_from_base_video(self, **_kwargs):
+            raise AvatarVideoProviderError("WaveSpeed prediction timed out", "WAVESPEED_AVATAR_FAILED")
+
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_GENERATION_MODE", "fast_lipsync")
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_LIPSYNC_PROVIDER", "wavespeed_sync_lipsync_3")
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.ENABLE_STATIC_AVATAR_FALLBACK", True)
+    monkeypatch.setattr("app.modules.generation.pipeline.settings.AVATAR_PROVIDER_MAX_RETRIES", 1)
+    monkeypatch.setattr("app.modules.generation.pipeline.get_avatar_video_provider", lambda *_args, **_kwargs: FakeProvider())
+    monkeypatch.setattr("app.modules.generation.pipeline._image_to_video_clip", lambda image_bytes, duration_seconds: b"base-video-bytes")
+    monkeypatch.setattr("app.modules.generation.pipeline._probe_media_info", lambda media_bytes, *_args, **_kwargs: (
+        {
+            "duration_seconds": 6.0,
+            "has_video": True,
+            "has_audio": False,
+            "video_codec": "h264",
+            "audio_codec": None,
+            "width": 1280,
+            "height": 720,
+        }
+        if media_bytes in {b"base-video-bytes", b"static-video-bytes"}
+        else {
+            "duration_seconds": 6.0,
+            "has_video": False,
+            "has_audio": True,
+            "video_codec": None,
+            "audio_codec": "aac",
+            "width": None,
+            "height": None,
+        }
+    ))
+    monkeypatch.setattr("app.modules.generation.pipeline._static_avatar_fallback_clip", lambda *_args, **_kwargs: (b"static-video-bytes", "provider timeout"))
+    monkeypatch.setattr("app.modules.generation.pipeline.httpx.get", lambda url, timeout=None: type("R", (), {"content": b"static-video-bytes", "status_code": 200})())
+    monkeypatch.setattr("app.modules.generation.pipeline.httpx.head", lambda url, timeout=None, follow_redirects=True: type("R", (), {"status_code": 200})())
+    monkeypatch.setattr("app.modules.generation.pipeline.ComposerService.strip_audio_from_video", lambda self, video_bytes: video_bytes)
+    monkeypatch.setattr("app.modules.generation.pipeline.storage_object_exists", lambda *_: True)
+
+    job = GenerationJob(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        status="queued",
+        progress_percentage=0.0,
+    )
+    db_session.add(job)
+    db_session.flush()
+    context = GenerationContext(
+        generation_job_id=job.id,
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=presentation,
+        slides=[slide],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key=None,
+        elevenlabs_voice_id=None,
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url=None,
+        avatar_source_storage_key=avatar_key,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{job.id}",
+    )
+
+    asset = generate_avatar_clip_for_slide(
+        db_session,
+        storage,
+        job,
+        context,
+        slide,
+        1,
+        1,
+        audio_asset,
+    )
+
+    assert asset.metadata_json["fallback_used"] is True
+    assert asset.metadata_json["fallback_reason"] == "provider timeout"
+
+
+def test_avatar_base_video_asset_is_reused(monkeypatch, db_session):
+    storage = InMemoryStorageProvider()
+    avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
+    storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
+
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Base Video Reuse Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    context = GenerationContext(
+        generation_job_id=uuid.uuid4(),
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=presentation,
+        slides=[],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key=None,
+        elevenlabs_voice_id=None,
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url=None,
+        avatar_source_storage_key=avatar_key,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{uuid.uuid4()}",
+    )
+
+    monkeypatch.setattr("app.modules.generation.pipeline._image_to_video_clip", lambda image_bytes, duration_seconds: b"base-video-bytes")
+    monkeypatch.setattr("app.modules.generation.pipeline._probe_media_info", lambda media_bytes, *_args, **_kwargs: {
+        "duration_seconds": 12.0,
+        "has_video": True,
+        "has_audio": False,
+        "video_codec": "h264",
+        "audio_codec": None,
+        "width": 1280,
+        "height": 720,
+    })
+    monkeypatch.setattr("app.modules.generation.pipeline.storage_object_exists", lambda *_: True)
+
+    asset1, bytes1, _meta1 = _ensure_avatar_base_video_asset(db_session, storage, context)
+    asset2, bytes2, _meta2 = _ensure_avatar_base_video_asset(db_session, storage, context)
+
+    assert asset1.id == asset2.id
+    assert bytes1 == bytes2 == b"base-video-bytes"
+    assert asset1.asset_type == "avatar_base_video"
+    assert asset1.metadata_json["avatar_source_storage_key"] == avatar_key
+
+
+def test_generate_audio_for_slide_accepts_small_overflow_with_tolerance(monkeypatch, db_session):
+    storage = InMemoryStorageProvider()
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Audio Tolerance Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    slide = Slide(
+        presentation_id=presentation.id,
+        position=1,
+        title="Slide 1",
+        notes="Narración breve de prueba.",
+        metadata_={"dialogue": "Narración breve de prueba."},
+    )
+    db_session.add(slide)
+    db_session.commit()
+
+    class FakeProvider:
+        def generate_audio(self, **_kwargs):
+            return b"audio-bytes", 0.0
+
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK", 20)
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_AUDIO_CHUNK_DURATION_TOLERANCE_SECONDS", 1.0)
+    monkeypatch.setattr("app.modules.generation.pipeline.get_tts_provider", lambda *_args, **_kwargs: FakeProvider())
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.ComposerService.normalize_audio_to_mp3",
+        lambda self, audio_bytes: audio_bytes,
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline._probe_media_info",
+        lambda media_bytes, *_args, **_kwargs: {
+            "duration_seconds": 20.04,
+            "has_video": False,
+            "has_audio": True,
+            "video_codec": None,
+            "audio_codec": "aac",
+            "width": None,
+            "height": None,
+        },
+    )
+    monkeypatch.setattr("app.modules.generation.pipeline.storage_object_exists", lambda *_: True)
+
+    job = GenerationJob(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        status="queued",
+        progress_percentage=0.0,
+    )
+    db_session.add(job)
+    db_session.flush()
+    context = GenerationContext(
+        generation_job_id=job.id,
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=presentation,
+        slides=[slide],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key="secret",
+        elevenlabs_voice_id="voice-id",
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url="https://example.test/avatar.png",
+        avatar_source_storage_key=None,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{job.id}",
+    )
+
+    asset = generate_audio_for_slide(db_session, storage, job, context, slide, 1, 1)
+
+    assert asset.asset_type == "slide_audio"
+    assert asset.duration_seconds == 20.04
+    assert asset.metadata_json["chunk_count"] == 1
+
+
+def test_generate_audio_for_slide_splits_when_chunk_exceeds_tolerance(monkeypatch, db_session):
+    storage = InMemoryStorageProvider()
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Audio Split Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    dialogue = " ".join(["palabra"] * 90)
+    slide = Slide(
+        presentation_id=presentation.id,
+        position=1,
+        title="Slide 1",
+        notes=dialogue,
+        metadata_={"dialogue": dialogue},
+    )
+    db_session.add(slide)
+    db_session.commit()
+
+    call_count = {"count": 0}
+
+    class FakeProvider:
+        def generate_audio(self, text, **_kwargs):
+            call_count["count"] += 1
+            return f"audio-{call_count['count']}".encode(), 0.0
+
+    def fake_probe(media_bytes, *_args, **_kwargs):
+        mapping = {
+            b"audio-1": {
+                "duration_seconds": 22.5,
+                "has_video": False,
+                "has_audio": True,
+                "video_codec": None,
+                "audio_codec": "aac",
+                "width": None,
+                "height": None,
+            },
+            b"audio-2": {
+                "duration_seconds": 10.0,
+                "has_video": False,
+                "has_audio": True,
+                "video_codec": None,
+                "audio_codec": "aac",
+                "width": None,
+                "height": None,
+            },
+            b"audio-3": {
+                "duration_seconds": 10.0,
+                "has_video": False,
+                "has_audio": True,
+                "video_codec": None,
+                "audio_codec": "aac",
+                "width": None,
+                "height": None,
+            },
+            b"joined-audio": {
+                "duration_seconds": 20.0,
+                "has_video": False,
+                "has_audio": True,
+                "video_codec": None,
+                "audio_codec": "aac",
+                "width": None,
+                "height": None,
+            },
+        }
+        return mapping[media_bytes]
+
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK", 20)
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_AUDIO_CHUNK_DURATION_TOLERANCE_SECONDS", 1.0)
+    monkeypatch.setattr("app.modules.generation.pipeline.get_tts_provider", lambda *_args, **_kwargs: FakeProvider())
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.ComposerService.normalize_audio_to_mp3",
+        lambda self, audio_bytes: audio_bytes,
+    )
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.ComposerService.concatenate_audio_tracks",
+        lambda self, tracks: b"joined-audio",
+    )
+    monkeypatch.setattr("app.modules.generation.pipeline._probe_media_info", fake_probe)
+    monkeypatch.setattr("app.modules.generation.pipeline.storage_object_exists", lambda *_: True)
+
+    job = GenerationJob(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        status="queued",
+        progress_percentage=0.0,
+    )
+    db_session.add(job)
+    db_session.flush()
+    context = GenerationContext(
+        generation_job_id=job.id,
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=presentation,
+        slides=[slide],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key="secret",
+        elevenlabs_voice_id="voice-id",
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url="https://example.test/avatar.png",
+        avatar_source_storage_key=None,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{job.id}",
+    )
+
+    asset = generate_audio_for_slide(db_session, storage, job, context, slide, 1, 1)
+
+    assert call_count["count"] >= 2
+    assert asset.asset_type == "slide_audio"
+    assert asset.metadata_json["chunk_count"] >= 2
+
+
+def test_load_avatar_source_url_uses_public_storage_url(db_session):
+    storage = InMemoryStorageProvider()
+    avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
+    storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
+
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Avatar URL Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    asset = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=None,
+        asset_type="avatar_source",
+        storage_key=avatar_key,
+        filename="avatar.png",
+        mime_type="image/png",
+        size_bytes=len(b"avatar-bytes"),
+    )
+    db_session.add(asset)
+    db_session.flush()
+
+    context = GenerationContext(
+        generation_job_id=uuid.uuid4(),
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        presentation=None,  # type: ignore[arg-type]
+        slides=[],
+        settings=VideoGenerationSettings(
+            organization_id=MOCK_ORG_ID,
+            project_id=project.id,
+            validation_status="saved",
+        ),
+        elevenlabs_api_key=None,
+        elevenlabs_voice_id=None,
+        wavespeed_api_key="wavespeed-secret",
+        avatar_source_url=None,
+        avatar_source_storage_key=avatar_key,
+        output_prefix=f"orgs/{MOCK_ORG_ID}/projects/{project.id}/generation/{uuid.uuid4()}",
+    )
+
+    url, metadata = _load_avatar_source_url(db_session, storage, context)
+
+    assert url == f"https://storage.example.test/download/{avatar_key}"
+    assert metadata["storage_key"] == avatar_key
+    assert metadata["source"] == "storage"
+
+
+def test_slide_segment_duration_uses_audio_duration_and_pause():
+    audio_asset = Asset(duration_seconds=12.0)
+    avatar_asset = Asset(duration_seconds=9.0)
+
+    assert _slide_segment_duration_seconds(audio_asset, avatar_asset) == 12.5
+    try:
+        _slide_segment_duration_seconds(None, avatar_asset)
+    except Exception as exc:
+        assert "controlled TTS narration track" in str(exc)
+    else:
+        raise AssertionError("slide duration must require audio")
+
+
+def test_normalize_tts_text_adds_sentence_punctuation():
+    text = "Hola mundo\n\nEsto es una prueba"
+    normalized = _normalize_tts_text(text)
+
+    assert normalized == "Hola mundo. Esto es una prueba."
+
+
+def test_build_narration_chunks_splits_long_text(monkeypatch):
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_TTS_CHARS_PER_CHUNK", 120)
+    monkeypatch.setattr(
+        "app.modules.generation.pipeline.app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK",
+        20,
+    )
+    text = (
+        "Este es un párrafo largo con varias oraciones. "
+        "Necesitamos dividirlo cuidadosamente sin cortar palabras ni perder acentos. "
+        "La narración debe mantenerse natural y clara para la voz en español. "
+        "Además, cada fragmento debe quedar dentro de un tamaño razonable. "
+    ) * 2
+
+    chunks = _build_narration_chunks(text)
+
+    assert len(chunks) > 1
+    assert all(chunk["text_length"] <= 120 for chunk in chunks)
+    assert all(chunk["expected_duration_seconds"] <= 20 for chunk in chunks)
+
+
+def test_build_narration_chunks_caps_chunk_count(monkeypatch):
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_TTS_CHARS_PER_CHUNK", 700)
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK", 30)
+    monkeypatch.setattr("app.modules.generation.pipeline.app_settings.MAX_CHUNKS_PER_SLIDE", 4)
+    text = ("Este es un texto largo y natural para probar el límite de fragmentos. " * 30).strip()
+
+    chunks = _build_narration_chunks(text)
+
+    assert len(chunks) <= 4
+
+
+def test_can_reuse_slide_audio_asset_rejects_legacy_single_chunk_audio(db_session):
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Legacy Audio Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    slide = Slide(
+        presentation_id=presentation.id,
+        position=1,
+        title="Slide 1",
+        notes=" ".join(["palabra"] * 320),
+        metadata_={"dialogue": " ".join(["palabra"] * 320)},
+    )
+    db_session.add(slide)
+    db_session.flush()
+    asset = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=slide.id,
+        asset_type="slide_audio",
+        storage_key="projects/audio/legacy.mp3",
+        filename="legacy.mp3",
+        mime_type="audio/mpeg",
+        size_bytes=100,
+        duration_seconds=20.0,
+        metadata_json={"generation_job_id": "job-legacy", "slide_position": 1},
+    )
+    db_session.add(asset)
+    db_session.commit()
+
+    assert _can_reuse_slide_audio_asset(asset, slide, 1) is False
+
+
+def test_slide_audio_chunk_specs_requires_chunk_metadata_for_long_narration():
+    audio_asset = Asset(
+        duration_seconds=20.0,
+        metadata_json={"generation_job_id": "job-legacy", "slide_position": 1},
+    )
+    dialogue = " ".join(["palabra"] * 320)
+
+    try:
+        _slide_audio_chunk_specs(audio_asset, dialogue)
+    except Exception as exc:
+        assert "missing chunk metadata" in str(exc)
+    else:
+        raise AssertionError("long narration must require chunk metadata")
+
+
+def test_slide_audio_chunk_specs_rejects_missing_text_or_audio_fields(db_session):
+    project = Project(
+        organization_id=MOCK_ORG_ID,
+        owner_id=MOCK_USER_ID,
+        name="Bad Chunk Project",
+    )
+    db_session.add(project)
+    db_session.flush()
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=MOCK_ORG_ID,
+        title="deck.pptx",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    audio_asset_missing_text = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=None,
+        asset_type="slide_audio",
+        storage_key="projects/audio/slide-1.mp3",
+        filename="slide-1.mp3",
+        mime_type="audio/mpeg",
+        size_bytes=100,
+        duration_seconds=10.0,
+        metadata_json={
+            "generation_job_id": "job-1",
+            "slide_position": 1,
+            "chunks": [
+                {
+                    "index": 1,
+                    "word_count": 2,
+                    "estimated_duration": 1.0,
+                    "audio_storage_key": "projects/audio/slide-1.mp3",
+                    "audio_url": "https://storage.example.test/download/projects/audio/slide-1.mp3",
+                }
+            ],
+        },
+    )
+
+    try:
+        _slide_audio_chunk_specs(audio_asset_missing_text, "")
+    except Exception as exc:
+        assert "missing required narration text" in str(exc)
+    else:
+        raise AssertionError("malformed chunks must be rejected with a clear error")
+
+    audio_asset_missing_url = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=None,
+        asset_type="slide_audio",
+        storage_key="projects/audio/slide-1.mp3",
+        filename="slide-1.mp3",
+        mime_type="audio/mpeg",
+        size_bytes=100,
+        duration_seconds=10.0,
+        metadata_json={
+            "generation_job_id": "job-1",
+            "slide_position": 1,
+            "chunks": [
+                {
+                    "index": 1,
+                    "text": "Hola mundo",
+                    "word_count": 2,
+                    "estimated_duration": 1.0,
+                    "audio_storage_key": "projects/audio/slide-1.mp3",
+                }
+            ],
+        },
+    )
+
+    try:
+        _slide_audio_chunk_specs(audio_asset_missing_url, "Hola mundo")
+    except Exception as exc:
+        assert "missing required audio URL" in str(exc)
+    else:
+        raise AssertionError("malformed chunks must be rejected with a clear error")

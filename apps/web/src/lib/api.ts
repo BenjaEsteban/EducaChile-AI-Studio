@@ -338,6 +338,7 @@ export interface GenerationStatus {
   error_code: string | null;
   error_message: string | null;
   final_video_url: string | null;
+  updated_at: string | null;
 }
 
 export interface DebugGenerationAsset {

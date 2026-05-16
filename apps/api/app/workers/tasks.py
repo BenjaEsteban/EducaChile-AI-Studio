@@ -25,6 +25,7 @@ from app.modules.generation.pipeline import (
     generate_audio_for_slide,
     generate_avatar_clip_for_slide,
     mark_generation_failed,
+    update_generation_job_progress,
     validate_generation_job,
 )
 from app.modules.presentations.rendering import render_slide_previews
@@ -642,8 +643,8 @@ parse_presentation = celery_app.register_task(ParsePresentationTask())
 
 class GenerateVideoTask(JobTask):
     name = "app.workers.tasks.generate_video"
-    soft_time_limit = 1800
-    time_limit = 2100
+    soft_time_limit = settings.CELERY_TASK_SOFT_TIME_LIMIT
+    time_limit = settings.CELERY_TASK_TIME_LIMIT
 
     def run_job(
         self,
@@ -677,8 +678,60 @@ class GenerateVideoTask(JobTask):
                 )
 
                 total_slides = len(context.slides)
-                avatar_clip_assets = [
-                    generate_avatar_clip_for_slide(
+
+                def _heartbeat(payload: dict[str, object]) -> None:
+                    current_step = str(payload.get("current_step") or generation_job.current_step or "Processing")
+                    current_slide = payload.get("current_slide")
+                    total_slides_payload = payload.get("total_slides")
+                    progress = float(payload.get("progress_percentage") or generation_job.progress_percentage or 0.0)
+                    status = str(payload.get("status") or generation_job.status or "generating_avatar")
+                    with worker_db_session() as heartbeat_db:
+                        heartbeat_job = heartbeat_db.get(GenerationJob, generation_uuid)
+                        if heartbeat_job:
+                            update_generation_job_progress(
+                                heartbeat_db,
+                                heartbeat_job,
+                                status=status if status in {
+                                    "queued",
+                                    "validating",
+                                    "generating_audio",
+                                    "generating_avatar",
+                                    "rendering_slides",
+                                    "composing_slide",
+                                    "composing_video",
+                                    "completed",
+                                    "failed",
+                                    "cancelled",
+                                } else "generating_avatar",
+                                progress_percentage=progress,
+                                current_step=current_step,
+                                current_slide=int(current_slide) if current_slide is not None else heartbeat_job.current_slide,
+                                total_slides=int(total_slides_payload) if total_slides_payload is not None else heartbeat_job.total_slides,
+                            )
+                    meta = {
+                        "status": status,
+                        "progress": progress,
+                        "current_step": current_step,
+                        "current_slide": current_slide,
+                        "total_slides": total_slides_payload,
+                        "stage": payload.get("stage"),
+                        "chunk_index": payload.get("chunk_index"),
+                        "chunk_count": payload.get("chunk_count"),
+                        "elapsed_seconds": payload.get("elapsed_seconds"),
+                        "timeout_seconds": payload.get("timeout_seconds"),
+                        "outputs_present": payload.get("outputs_present"),
+                    }
+                    try:
+                        self.update_state(state="PROGRESS", meta=meta)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not update Celery heartbeat for generation job %s: %s",
+                            generation_uuid,
+                            exc,
+                        )
+
+                audio_assets = [
+                    generate_audio_for_slide(
                         db,
                         storage,
                         generation_job,
@@ -686,10 +739,23 @@ class GenerateVideoTask(JobTask):
                         slide,
                         slide_index,
                         total_slides,
-                        None,
                     )
                     for slide_index, slide in enumerate(context.slides, 1)
                 ]
+                avatar_clip_assets = [
+                        generate_avatar_clip_for_slide(
+                            db,
+                            storage,
+                            generation_job,
+                            context,
+                            slide,
+                            slide_index,
+                            total_slides,
+                            audio_assets[slide_index - 1],
+                            heartbeat_callback=_heartbeat,
+                        )
+                        for slide_index, slide in enumerate(context.slides, 1)
+                    ]
 
                 segment_assets = [
                     compose_segment_for_slide(
@@ -700,7 +766,7 @@ class GenerateVideoTask(JobTask):
                         slide,
                         slide_index,
                         total_slides,
-                        None,
+                        audio_assets[slide_index - 1],
                         avatar_clip_assets[slide_index - 1],
                     )
                     for slide_index, slide in enumerate(context.slides, 1)
@@ -743,6 +809,7 @@ class GenerateVideoTask(JobTask):
                         exc.message,
                         current_step=exc.stage,
                         current_slide=exc.slide_index,
+                        details=getattr(exc, "details", None),
                     )
             logger.exception(
                 "Generation job %s: failed at slide %s during stage %s: %s",

@@ -1,8 +1,13 @@
+import logging
 import subprocess
 import tempfile
 import shutil
 from pathlib import Path
 from typing import TypedDict
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class AvatarOverlay(TypedDict):
@@ -13,14 +18,65 @@ class AvatarOverlay(TypedDict):
 
 
 class ComposerService:
+    def normalize_audio_to_mp3(self, audio_bytes: bytes) -> bytes:
+        _ensure_ffmpeg_available()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            input_path = tmpdir / "input.bin"
+            output_path = tmpdir / "output.mp3"
+            input_path.write_bytes(audio_bytes)
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(input_path),
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "4",
+                    str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+            )
+            return output_path.read_bytes()
+
+    def strip_audio_from_video(self, video_bytes: bytes) -> bytes:
+        _ensure_ffmpeg_available()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            input_path = tmpdir / "input.mp4"
+            output_path = tmpdir / "output.mp4"
+            input_path.write_bytes(video_bytes)
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(input_path),
+                    "-an",
+                    "-c:v",
+                    "copy",
+                    str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+            )
+            return output_path.read_bytes()
+
     def compose_slide_video(
         self,
         slide_image_bytes: bytes,
         avatar_clip_bytes: bytes,
-        audio_bytes: bytes | None,
+        audio_bytes: bytes,
         duration_seconds: float,
         avatar_overlay: AvatarOverlay,
         resolution: str = "1080p",
+        audio_pad_seconds: float = 0.0,
     ) -> bytes:
         _ensure_ffmpeg_available()
         width, height = _resolution_size(resolution)
@@ -48,9 +104,8 @@ class ComposerService:
                 "-i",
                 str(avatar_clip),
             ]
-            if audio_bytes is not None:
-                audio.write_bytes(audio_bytes)
-                command.extend(["-i", str(audio)])
+            audio.write_bytes(audio_bytes)
+            command.extend(["-i", str(audio)])
             command.extend(
                 [
                     "-filter_complex",
@@ -59,29 +114,122 @@ class ComposerService:
                     "[outv]",
                 ]
             )
-            if audio_bytes is not None:
-                command.extend(["-map", "2:a:0"])
-            else:
-                command.extend(["-map", "1:a:0?"])
+            command.extend(["-map", "2:a:0"])
+            if audio_pad_seconds > 0:
+                command.extend(["-af", f"apad=pad_dur={audio_pad_seconds}"])
             command.extend(
                 [
                     "-c:v",
                     "libx264",
+                    "-preset",
+                    "veryfast",
                     "-c:a",
                     "aac",
                     "-pix_fmt",
                     "yuv420p",
+                    "-r",
+                    "30",
                     "-shortest",
                     "-t",
                     str(duration_seconds),
                     str(output),
                 ]
             )
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+                )
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+                if stderr:
+                    logger.error("FFmpeg slide composition failed stderr: %s", stderr[-2000:])
+                raise RuntimeError(
+                    f"FFmpeg slide composition failed: {stderr[-2000:]}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                stderr = exc.stderr.decode("utf-8", errors="ignore") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+                if stderr:
+                    logger.error("FFmpeg slide composition timed out stderr: %s", stderr[-2000:])
+                raise RuntimeError(
+                    f"FFmpeg slide composition timed out after {settings.FFMPEG_TIMEOUT_SECONDS} seconds"
+                ) from exc
+            return output.read_bytes()
+
+    def concatenate_audio_tracks(self, audio_tracks: list[bytes]) -> bytes:
+        _ensure_ffmpeg_available()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            list_file = tmpdir / "audio.txt"
+            paths = []
+            for index, audio in enumerate(audio_tracks, 1):
+                path = tmpdir / f"audio-{index}.mp3"
+                path.write_bytes(audio)
+                paths.append(path)
+            list_file.write_text(
+                "\n".join(f"file '{path.as_posix()}'" for path in paths),
+                encoding="utf-8",
+            )
+            output = tmpdir / "final.mp3"
             subprocess.run(
-                command,
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file),
+                    "-map",
+                    "0:a:0",
+                    "-c",
+                    "copy",
+                    str(output),
+                ],
                 check=True,
                 capture_output=True,
-                timeout=120,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+            )
+            return output.read_bytes()
+
+    def concatenate_video_tracks(self, video_tracks: list[bytes]) -> bytes:
+        _ensure_ffmpeg_available()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            list_file = tmpdir / "videos.txt"
+            paths = []
+            for index, video in enumerate(video_tracks, 1):
+                path = tmpdir / f"video-{index}.mp4"
+                path.write_bytes(video)
+                paths.append(path)
+            list_file.write_text(
+                "\n".join(f"file '{path.as_posix()}'" for path in paths),
+                encoding="utf-8",
+            )
+            output = tmpdir / "final.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file),
+                    "-map",
+                    "0:v:0",
+                    "-an",
+                    "-c",
+                    "copy",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
             )
             return output.read_bytes()
 
@@ -120,7 +268,7 @@ class ComposerService:
                 ],
                 check=True,
                 capture_output=True,
-                timeout=180,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
             )
             return output.read_bytes()
 

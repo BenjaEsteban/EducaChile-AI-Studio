@@ -203,6 +203,7 @@ class GenerationService:
             error_code=generation_job.error_code,
             error_message=generation_job.error_message,
             final_video_url=final_video_url,
+            updated_at=generation_job.updated_at,
         )
 
     def final_video(self, project_id: uuid.UUID) -> FinalVideoRead:
@@ -295,17 +296,36 @@ class GenerationService:
                 project_id=project_id,
                 validation_status="valid",
                 wavespeed_valid=True,
-                elevenlabs_valid=True,
+                elevenlabs_valid=(app_settings.TTS_PROVIDER != "elevenlabs"),
             )
 
         elevenlabs_key = decrypt_secret(settings.elevenlabs_api_key_encrypted)
         wavespeed_key = decrypt_secret(settings.wavespeed_api_key_encrypted) or app_settings.WAVESPEED_API_KEY
-        elevenlabs_configured = bool(settings.elevenlabs_api_key_encrypted or settings.elevenlabs_voice_id)
-        settings.elevenlabs_valid = (
-            _is_valid_key(elevenlabs_key) and bool(settings.elevenlabs_voice_id)
-            if elevenlabs_configured
-            else True
-        )
+        tts_provider = (app_settings.TTS_PROVIDER or "none").strip().lower()
+        avatar_mode = (app_settings.AVATAR_GENERATION_MODE or "fast_lipsync").strip().lower()
+        if tts_provider == "none" and not app_settings.ALLOW_DUMMY_TTS:
+            settings.elevenlabs_valid = False
+            settings.wavespeed_valid = _is_valid_key(wavespeed_key)
+            settings.last_validated_at = datetime.now(UTC)
+            settings.validation_status = "invalid"
+            saved = self.repo.save_video_settings(settings)
+            message = (
+                f"{avatar_mode} requires a real TTS provider. Configure TTS_PROVIDER=elevenlabs "
+                "or set ALLOW_DUMMY_TTS=true for local development."
+            )
+            return VideoSettingsValidationRead(
+                **self._settings_read(saved).model_dump(),
+                message=message,
+            )
+        if tts_provider == "elevenlabs":
+            elevenlabs_configured = bool(settings.elevenlabs_api_key_encrypted or settings.elevenlabs_voice_id)
+            settings.elevenlabs_valid = (
+                _is_valid_key(elevenlabs_key) and bool(settings.elevenlabs_voice_id)
+                if elevenlabs_configured
+                else False
+            )
+        else:
+            settings.elevenlabs_valid = True
         settings.wavespeed_valid = _is_valid_key(wavespeed_key)
         settings.last_validated_at = datetime.now(UTC)
         settings.validation_status = "valid" if settings.wavespeed_valid and settings.elevenlabs_valid else "invalid"
@@ -361,12 +381,26 @@ class GenerationService:
                 project_id=project_id,
                 validation_status="valid",
                 wavespeed_valid=True,
-                elevenlabs_valid=True,
+                elevenlabs_valid=(app_settings.TTS_PROVIDER != "elevenlabs"),
             )
         if not (settings.wavespeed_api_key_encrypted or app_settings.WAVESPEED_API_KEY):
             raise GenerationReadinessError(
                 "MISSING_WAVESPEED_API_KEY",
                 "WaveSpeed API key is required",
+            )
+        tts_provider = (app_settings.TTS_PROVIDER or "none").strip().lower()
+        avatar_mode = (app_settings.AVATAR_GENERATION_MODE or "fast_lipsync").strip().lower()
+        if tts_provider == "none" and not app_settings.ALLOW_DUMMY_TTS:
+            raise GenerationReadinessError(
+                "MISSING_TTS_PROVIDER",
+                f"{avatar_mode} requires a real TTS provider. Configure TTS_PROVIDER=elevenlabs or set ALLOW_DUMMY_TTS=true for local development.",
+            )
+        if tts_provider == "elevenlabs" and not (
+            settings.elevenlabs_api_key_encrypted and settings.elevenlabs_voice_id
+        ):
+            raise GenerationReadinessError(
+                "MISSING_ELEVENLABS_API_KEY",
+                "ElevenLabs API key is required for the selected TTS provider",
             )
         if not _has_avatar_source(settings):
             raise GenerationReadinessError(
@@ -447,7 +481,7 @@ class GenerationService:
                     if app_settings.WAVESPEED_API_KEY and len(app_settings.WAVESPEED_API_KEY) >= 4
                     else None
                 ),
-                elevenlabs_valid=False,
+                elevenlabs_valid=(app_settings.TTS_PROVIDER != "elevenlabs"),
                 wavespeed_valid=env_wavespeed_valid,
                 avatar_source_url=None,
                 avatar_source_asset_id=None,
@@ -481,7 +515,11 @@ class GenerationService:
                 and bool(app_settings.DEBUG_AVATAR_SOURCE_URL)
                 and not app_settings.is_production
             ),
-            elevenlabs_valid=settings.elevenlabs_valid,
+            elevenlabs_valid=(
+                settings.elevenlabs_valid
+                if (app_settings.TTS_PROVIDER or "none").strip().lower() == "elevenlabs"
+                else True
+            ),
             wavespeed_valid=wavespeed_valid,
             validation_status=validation_status,  # type: ignore[arg-type]
             last_validated_at=settings.last_validated_at,
@@ -493,15 +531,17 @@ class GenerationService:
             return
         now = datetime.now(UTC)
         for generation_job in self.repo.list_running_generation_jobs(project_id, MOCK_ORG_ID):
-            if not _is_stale_generation_job(generation_job, now):
+            threshold_seconds = _stalled_threshold_seconds(generation_job)
+            if not _is_stale_generation_job(generation_job, now, threshold_seconds):
                 continue
             logger.warning(
                 "Marking stale generation job failed: project_id=%s generation_job_id=%s "
-                "status=%s updated_at=%s",
+                "status=%s updated_at=%s threshold_seconds=%s",
                 project_id,
                 generation_job.id,
                 generation_job.status,
                 generation_job.updated_at,
+                threshold_seconds,
             )
             generation_job.status = "failed"
             generation_job.error_code = "GENERATION_JOB_STALLED"
@@ -579,7 +619,13 @@ def _slide_preview_storage_key(slide) -> str | None:
     return None
 
 
-def _is_stale_generation_job(generation_job: GenerationJob, now: datetime) -> bool:
+def _stalled_threshold_seconds(generation_job: GenerationJob) -> int:
+    if generation_job.status in {"generating_avatar", "composing_slide", "composing_video"}:
+        return max(1, int(app_settings.PROVIDER_OPERATION_STALLED_AFTER_SECONDS))
+    return max(1, int(app_settings.GENERATION_STALLED_AFTER_SECONDS))
+
+
+def _is_stale_generation_job(generation_job: GenerationJob, now: datetime, threshold_seconds: int) -> bool:
     if generation_job.status not in RUNNING_GENERATION_STATUSES:
         return False
     updated_at = generation_job.updated_at
@@ -587,4 +633,4 @@ def _is_stale_generation_job(generation_job: GenerationJob, now: datetime) -> bo
         return False
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=UTC)
-    return now - updated_at > timedelta(minutes=5)
+    return now - updated_at > timedelta(seconds=threshold_seconds)

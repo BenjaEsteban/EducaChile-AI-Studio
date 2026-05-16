@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pptx import Presentation as PptxPresentation
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 RENDER_DPI = 300
 
@@ -94,7 +96,7 @@ def _render_slide_images(
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
             )
 
             pdf_path = tmpdir / "presentation.pdf"
@@ -117,7 +119,7 @@ def _render_slide_images(
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=settings.FFMPEG_TIMEOUT_SECONDS,
             )
 
             preview_keys: dict[int, str] = {}
