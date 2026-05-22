@@ -121,6 +121,61 @@ def test_wavespeed_audio_lipsync_flow_uses_image_and_audio(monkeypatch):
     assert "prompt" not in requests[0]["json"]
 
 
+def test_wavespeed_image_audio_infinitetalk_mode_uses_image_and_audio(monkeypatch):
+    requests = []
+
+    class FakeResponse:
+        def __init__(self, payload=None, status_code=200, content=b"video-bytes"):
+            self._payload = payload or {}
+            self.status_code = status_code
+            self.content = content
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, headers=None, json=None, content=None, files=None, timeout=None):
+        requests.append({"url": url, "headers": headers or {}, "json": json})
+        if url.endswith("/wavespeed-ai/infinitetalk"):
+            return FakeResponse({"data": {"id": "request-456"}})
+        return FakeResponse({"data": {"download_url": "https://wavespeed.test/uploaded.png"}})
+
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("/predictions/request-456/result"):
+            return FakeResponse({"data": {"status": "completed", "outputs": ["https://cdn.test/out.mp4"]}})
+        if url == "https://cdn.test/out.mp4":
+            return FakeResponse(content=b"video-bytes")
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.wavespeed_client.httpx.post", fake_post)
+    monkeypatch.setattr("app.services.wavespeed_client.httpx.get", fake_get)
+    monkeypatch.setattr("app.modules.video.adapters.httpx.head", lambda *_args, **_kwargs: FakeResponse(status_code=200))
+    monkeypatch.setattr("app.modules.video.adapters.httpx.get", fake_get)
+    monkeypatch.setattr("app.modules.video.adapters._probe_duration", lambda *_args: 1.0)
+    monkeypatch.setattr("app.modules.video.adapters._has_video_stream", lambda *_args: True)
+    monkeypatch.setattr("app.modules.video.adapters._has_audio_stream", lambda *_args: True)
+    monkeypatch.setattr("app.modules.video.adapters.settings.AVATAR_GENERATION_MODE", "image_audio_infinitetalk")
+    monkeypatch.setattr("app.modules.video.adapters.settings.AVATAR_IMAGE_AUDIO_PROVIDER", "wavespeed_infinitetalk_fast")
+    monkeypatch.setattr("app.modules.video.adapters.settings.AVATAR_IMAGE_AUDIO_RESOLUTION", "480p")
+
+    provider = WavespeedAvatarVideoProvider()
+    clip = provider.generate_avatar_clip(
+        audio_bytes=b"audio-bytes",
+        duration_seconds=5,
+        avatar_id="https://example.test/avatar.png",
+        audio_url="https://example.test/audio.mp3",
+        avatar_source_url="https://example.test/avatar.png",
+        text="hola mundo",
+        api_key="secret",
+    )
+
+    assert clip == b"video-bytes"
+    assert requests[0]["url"].endswith("/wavespeed-ai/infinitetalk")
+    assert requests[0]["json"]["image"] == "https://example.test/avatar.png"
+    assert requests[0]["json"]["audio"] == "https://example.test/audio.mp3"
+    assert requests[0]["json"]["resolution"] == "480p"
+    assert "prompt" not in requests[0]["json"]
+
+
 def test_wavespeed_sync_lipsync_flow_uses_video_and_audio(monkeypatch):
     requests = []
 

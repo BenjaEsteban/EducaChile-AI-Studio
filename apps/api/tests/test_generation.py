@@ -96,6 +96,471 @@ def test_start_generation_accepts_slides_with_rendered_previews(
     assert body["generation_job"]["progress_percentage"] == 0.0
 
 
+def test_start_generation_uses_project_generation_config_for_elevenlabs_without_env_key(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Project Config TTS"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", None)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", None)
+    monkeypatch.setattr(
+        "app.modules.generation.service.enqueue_generate_video",
+        lambda **_kwargs: "celery-task-1",
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/generation-config",
+        json={
+            "tts_provider": "elevenlabs",
+            "video_provider": "wavespeed",
+            "voice_id": "voice-project-1",
+            "elevenlabs_api_key": "project-elevenlabs-secret",
+            "wavespeed_api_key": "wavespeed-secret-1234",
+        },
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "avatar_source_url": "https://public.example.test/avatar.png",
+        },
+    )
+
+    project_id = uuid.UUID(project["id"])
+    presentation = Presentation(
+        project_id=project_id,
+        organization_id=MOCK_ORG_ID,
+        title="Project Config deck",
+        original_filename="project-config.pptx",
+        storage_key="projects/project-config.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notas",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Diálogo",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert res.status_code == 200
+    assert res.json()["generation_job"]["status"] == "queued"
+
+
+def test_video_settings_validate_and_generate_video_use_project_config_credentials(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Validate Then Generate"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", None)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", None)
+    enqueue_called = {"called": False}
+
+    def _enqueue_generate_video(**_kwargs):
+        enqueue_called["called"] = True
+        return "celery-task-validate-generate"
+
+    monkeypatch.setattr("app.modules.generation.service.enqueue_generate_video", _enqueue_generate_video)
+
+    client.put(
+        f"/api/v1/projects/{project['id']}/generation-config",
+        json={
+            "tts_provider": "elevenlabs",
+            "video_provider": "wavespeed",
+            "voice_id": "voice-project-1",
+            "elevenlabs_api_key": "project-elevenlabs-secret",
+            "wavespeed_api_key": "wavespeed-secret-1234",
+        },
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "avatar_source_url": "https://public.example.test/avatar.png",
+        },
+    )
+
+    validate_res = client.post(f"/api/v1/projects/{project['id']}/video-settings/validate")
+    assert validate_res.status_code == 200
+    validate_body = validate_res.json()
+    assert validate_body["validation_status"] == "valid"
+    assert validate_body["elevenlabs_valid"] is True
+
+    project_id = uuid.UUID(project["id"])
+    presentation = Presentation(
+        project_id=project_id,
+        organization_id=MOCK_ORG_ID,
+        title="Validate Then Generate deck",
+        original_filename="validate-generate.pptx",
+        storage_key="projects/validate-generate.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notas",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Diálogo",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    generate_res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert generate_res.status_code == 200
+    assert generate_res.json()["generation_job"]["status"] == "queued"
+    assert enqueue_called["called"] is True
+
+
+def test_video_settings_validate_uses_project_config_without_env_or_video_settings_row(
+    client: TestClient,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Project Config Validate Only"}).json()
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", None)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", None)
+
+    client.put(
+        f"/api/v1/projects/{project['id']}/generation-config",
+        json={
+            "tts_provider": "elevenlabs",
+            "video_provider": "wavespeed",
+            "voice_id": "voice-project-1",
+            "elevenlabs_api_key": "project-elevenlabs-secret",
+            "wavespeed_api_key": "wavespeed-secret-1234",
+        },
+    )
+
+    validate_res = client.post(f"/api/v1/projects/{project['id']}/video-settings/validate")
+
+    assert validate_res.status_code == 200
+    validate_body = validate_res.json()
+    assert validate_body["validation_status"] == "valid"
+    assert validate_body["elevenlabs_valid"] is True
+
+
+def test_generate_video_uses_saved_video_settings_credentials_without_env_key(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Video Settings Saved TTS"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", None)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", None)
+    enqueue_called = {"called": False}
+
+    def _enqueue_generate_video(**_kwargs):
+        enqueue_called["called"] = True
+        return "celery-task-video-settings"
+
+    monkeypatch.setattr("app.modules.generation.service.enqueue_generate_video", _enqueue_generate_video)
+
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "elevenlabs_api_key": "saved-video-settings-secret",
+            "elevenlabs_voice_id": "voice-saved",
+            "wavespeed_api_key": "wavespeed-secret-1234",
+        },
+    )
+    validate_res = client.post(f"/api/v1/projects/{project['id']}/video-settings/validate")
+    assert validate_res.status_code == 200
+    assert validate_res.json()["elevenlabs_valid"] is True
+
+    project_id = uuid.UUID(project["id"])
+    presentation = Presentation(
+        project_id=project_id,
+        organization_id=MOCK_ORG_ID,
+        title="Video Settings Saved TTS deck",
+        original_filename="video-settings-saved.pptx",
+        storage_key="projects/video-settings-saved.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notas",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Diálogo",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert res.status_code == 200
+    assert res.json()["generation_job"]["status"] == "queued"
+    assert enqueue_called["called"] is True
+
+
+def test_start_generation_uses_env_fallback_for_elevenlabs_when_project_config_missing(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Env TTS Fallback"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", "env-elevenlabs-secret")
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", "env-voice-id")
+    monkeypatch.setattr(
+        "app.modules.generation.service.enqueue_generate_video",
+        lambda **_kwargs: "celery-task-2",
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "wavespeed_api_key": "wavespeed-secret-1234",
+            "avatar_source_url": "https://public.example.test/avatar.png",
+        },
+    )
+
+    project_id = uuid.UUID(project["id"])
+    presentation = Presentation(
+        project_id=project_id,
+        organization_id=MOCK_ORG_ID,
+        title="Env Fallback deck",
+        original_filename="env-fallback.pptx",
+        storage_key="projects/env-fallback.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notas",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Diálogo",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert res.status_code == 200
+    assert res.json()["generation_job"]["status"] == "queued"
+
+
+def test_start_generation_logs_decrypt_failed_when_encryption_key_mismatch(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+    caplog,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Decrypt Failure Project"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", None)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", None)
+    monkeypatch.setattr(
+        "app.modules.generation.service.enqueue_generate_video",
+        lambda **_kwargs: "celery-task-4",
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/generation-config",
+        json={
+            "tts_provider": "elevenlabs",
+            "video_provider": "wavespeed",
+            "voice_id": "voice-project-1",
+            "elevenlabs_api_key": "project-elevenlabs-secret",
+            "wavespeed_api_key": "wavespeed-secret-1234",
+        },
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "avatar_source_url": "https://public.example.test/avatar.png",
+        },
+    )
+
+    project_id = uuid.UUID(project["id"])
+    presentation = Presentation(
+        project_id=project_id,
+        organization_id=MOCK_ORG_ID,
+        title="Decrypt Failure deck",
+        original_filename="decrypt-failure.pptx",
+        storage_key="projects/decrypt-failure.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notas",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Diálogo",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr("app.utils.crypto.settings.ENCRYPTION_KEY", "wrong-encryption-key")
+
+    with caplog.at_level("INFO"):
+        res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert res.status_code == 409
+    assert "missing_reason=decrypt_failed" in caplog.text
+
+
+def test_start_generation_rejects_missing_elevenlabs_credentials_with_project_config(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
+    project = client.post(PROJECTS_BASE, json={"name": "Missing TTS Project Config"}).json()
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_API_KEY", None)
+    monkeypatch.setattr("app.modules.generation.service.app_settings.ELEVENLABS_VOICE_ID", None)
+    monkeypatch.setattr(
+        "app.modules.generation.service.enqueue_generate_video",
+        lambda **_kwargs: "celery-task-3",
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/generation-config",
+        json={
+            "tts_provider": "elevenlabs",
+            "video_provider": "wavespeed",
+            "wavespeed_api_key": "wavespeed-secret-1234",
+        },
+    )
+    client.put(
+        f"/api/v1/projects/{project['id']}/video-settings",
+        json={
+            "avatar_source_url": "https://public.example.test/avatar.png",
+        },
+    )
+
+    presentation = Presentation(
+        project_id=uuid.UUID(project["id"]),
+        organization_id=MOCK_ORG_ID,
+        title="Missing TTS deck",
+        original_filename="missing-tts.pptx",
+        storage_key="projects/missing-tts.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=1,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    storage_key = f"presentations/{presentation.id}/previews/slide-1.png"
+    storage.upload_file(storage_key, b"preview-bytes", "image/png")
+    db_session.add(
+        Slide(
+            presentation_id=presentation.id,
+            position=1,
+            title="Slide 1",
+            notes="Notas",
+            thumbnail_key=storage_key,
+            metadata_={
+                "dialogue": "Diálogo",
+                "rendered_image_key": storage_key,
+                "slide_preview": {
+                    "asset_type": "slide_preview",
+                    "storage_key": storage_key,
+                    "render_source": "ppt_render",
+                    "includes_text": True,
+                },
+            },
+        )
+    )
+    db_session.commit()
+
+    res = client.post(f"/api/v1/projects/{project['id']}/generate-video")
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["code"] == "MISSING_ELEVENLABS_API_KEY"
+    assert "project settings" in detail["message"]
+
+
 def test_start_generation_rejects_dummy_tts_when_audio_lipsync_requires_real_tts(
     client: TestClient,
     db_session,

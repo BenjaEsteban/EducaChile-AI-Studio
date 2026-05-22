@@ -2,6 +2,7 @@ import logging
 import ipaddress
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -108,9 +109,13 @@ def run_wavespeed_debug(
             content_type=source_meta.get("mime_type") or "image/png",
         )
         provider = get_avatar_video_provider("wavespeed")
-        if settings.AVATAR_GENERATION_MODE.strip().lower() == "audio_lipsync" and (
-            settings.AVATAR_LIPSYNC_PROVIDER or "wavespeed_infinitetalk"
-        ).strip().lower() == "wavespeed_infinitetalk":
+        avatar_mode = settings.AVATAR_GENERATION_MODE.strip().lower()
+        image_audio_provider = (
+            settings.AVATAR_IMAGE_AUDIO_PROVIDER
+            or settings.AVATAR_LIPSYNC_PROVIDER
+            or "wavespeed_infinitetalk_fast"
+        ).strip().lower()
+        if avatar_mode in {"audio_lipsync", "image_audio_infinitetalk", "infinitetalk_image"} and image_audio_provider in {"wavespeed_infinitetalk", "wavespeed_infinitetalk_fast"}:
             audio_bytes: bytes | None = None
             audio_download_url: str | None = None
             audio_duration_seconds: float | None = None
@@ -355,6 +360,86 @@ def list_generation_debug_assets(project_id: uuid.UUID, db: Session) -> dict:
     }
 
 
+def avatar_pipeline_debug(
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    db: Session,
+    slide_number: int | None = None,
+) -> dict:
+    _ensure_debug_enabled()
+    job = db.get(GenerationJob, job_id)
+    if job is None or job.project_id != project_id or job.organization_id != MOCK_ORG_ID:
+        raise _debug_error("GENERATION_JOB_NOT_FOUND", "Generation job not found")
+
+    assets_query = db.query(Asset).filter(
+        Asset.project_id == project_id,
+        Asset.organization_id == MOCK_ORG_ID,
+    )
+    assets_query = assets_query.filter(
+        or_(
+            Asset.storage_key.contains(str(job_id)),
+            Asset.id == job.final_asset_id,
+            Asset.asset_type.in_(["generated_avatar_clip", "slide_segment_video", "avatar_base_video"]),
+        )
+    )
+    assets = assets_query.order_by(Asset.created_at.asc()).all()
+    storage = get_storage()
+    asset_reads = [_debug_asset_read(asset, storage) for asset in assets]
+    slides = _debug_assets_by_slide(asset_reads)
+    selected_slide = None
+    if slide_number is not None:
+        selected_slide = next((slide for slide in slides if slide.get("slide_position") == slide_number), None)
+    elif slides:
+        selected_slide = slides[-1]
+
+    if selected_slide:
+        avatar_asset = selected_slide.get("avatar_clip_asset")
+        segment_asset = selected_slide.get("segment_asset")
+        selected_slide["avatar_debug_frame_assets"] = _debug_frame_assets(
+            project_id=project_id,
+            storage=storage,
+            asset=avatar_asset,
+            label=f"avatar-slide-{selected_slide.get('slide_position') or slide_number}",
+        )
+        selected_slide["segment_debug_frame_assets"] = _debug_frame_assets(
+            project_id=project_id,
+            storage=storage,
+            asset=segment_asset,
+            label=f"segment-slide-{selected_slide.get('slide_position') or slide_number}",
+        )
+
+    summary = selected_slide or {}
+
+    return {
+        "ok": True,
+        "project_id": str(project_id),
+        "organization_id": str(MOCK_ORG_ID),
+        "job": _debug_job_read(job),
+        "slide_number": slide_number,
+        "mode": summary.get("avatar_generation_mode"),
+        "provider": summary.get("avatar_provider_name"),
+        "provider_request_type": summary.get("provider_request_type"),
+        "prediction_id": summary.get("provider_prediction_id"),
+        "input_audio_duration": summary.get("input_audio_duration"),
+        "provider_output_duration": summary.get("provider_output_duration"),
+        "provider_output_storage_key": summary.get("provider_output_storage_key"),
+        "provider_output_has_green_background": summary.get("provider_output_has_green_background"),
+        "provider_output_green_ratio": summary.get("provider_output_green_ratio"),
+        "provider_output_has_motion": summary.get("provider_output_has_motion"),
+        "provider_requires_chromakey": summary.get("provider_requires_chromakey"),
+        "final_overlay_source": summary.get("final_avatar_overlay_source"),
+        "fallback_used": summary.get("fallback_used"),
+        "fallback_reason": summary.get("fallback_reason"),
+        "debug_frame_asset_urls": {
+            "avatar": summary.get("avatar_debug_frame_assets"),
+            "segment": summary.get("segment_debug_frame_assets"),
+        },
+        "selected_slide": selected_slide,
+        "slides": slides,
+        "diagnostics": _debug_generation_diagnostics(slides, None),
+    }
+
+
 def _debug_job_read(job: GenerationJob | None) -> dict | None:
     if job is None:
         return None
@@ -428,6 +513,38 @@ def _debug_assets_by_slide(asset_reads: list[dict]) -> list[dict]:
             entry["audio_asset"] = asset
         elif asset["asset_type"] in {"generated_avatar_clip", "avatar_clip"}:
             entry["avatar_clip_asset"] = asset
+            entry["avatar_video_storage_key"] = asset["storage_key"]
+            entry["provider_output_storage_key"] = asset["storage_key"]
+            entry["final_avatar_output_storage_key"] = metadata.get("final_avatar_output_storage_key") or asset["storage_key"]
+            entry["avatar_generation_mode"] = metadata.get("mode")
+            entry["requested_avatar_generation_mode"] = metadata.get("requested_avatar_generation_mode")
+            entry["effective_avatar_generation_mode"] = metadata.get("effective_avatar_generation_mode")
+            entry["avatar_provider_name"] = metadata.get("avatar_provider_name") or metadata.get("provider_name")
+            entry["provider_request_type"] = metadata.get("provider_request_type")
+            entry["provider_endpoint"] = metadata.get("provider_endpoint")
+            entry["provider_prediction_id"] = metadata.get("provider_prediction_id") or metadata.get("wavespeed_request_id")
+            entry["provider_output_url_present"] = metadata.get("provider_output_url_present")
+            entry["provider_output_url_host"] = metadata.get("provider_output_url_host")
+            entry["provider_output_duration"] = metadata.get("provider_output_duration") or metadata.get("avatar_video_duration")
+            entry["provider_output_has_green_background"] = metadata.get("provider_output_has_green_background")
+            entry["provider_output_has_motion"] = metadata.get("provider_output_has_motion")
+            entry["provider_requires_chromakey"] = metadata.get("provider_requires_chromakey")
+            entry["provider_output_green_ratio"] = metadata.get("provider_output_green_ratio")
+            entry["provider_status_history"] = metadata.get("provider_status_history")
+            entry["input_image_url_present"] = metadata.get("input_image_url_present")
+            entry["input_video_url_present"] = metadata.get("input_video_url_present")
+            entry["input_audio_url_present"] = metadata.get("input_audio_url_present")
+            entry["input_video_duration"] = metadata.get("input_video_duration")
+            entry["input_audio_duration"] = metadata.get("input_audio_duration")
+            entry["sync_mode"] = metadata.get("sync_mode")
+            entry["resolution"] = metadata.get("resolution")
+            entry["final_avatar_overlay_source"] = metadata.get("final_overlay_source")
+            entry["fallback_used"] = metadata.get("fallback_used")
+            entry["fallback_reason"] = metadata.get("fallback_reason")
+            entry["apply_avatar_chromakey"] = metadata.get("apply_avatar_chromakey")
+            entry["avatar_base_video_source"] = metadata.get("avatar_base_video_source")
+            entry["avatar_base_video_is_real_motion"] = metadata.get("avatar_base_video_is_real_motion")
+            entry["avatar_base_video_has_green_background"] = metadata.get("avatar_base_video_has_green_background")
             entry["motion_analysis"] = metadata.get("motion_analysis")
             entry["avatar_clip_duration_seconds"] = asset.get("duration_seconds")
             entry["avatar_clip_ffprobe"] = metadata.get("ffprobe")
@@ -436,6 +553,7 @@ def _debug_assets_by_slide(asset_reads: list[dict]) -> list[dict]:
             entry["appears_static"] = motion.get("almost_static")
         elif asset["asset_type"] in {"slide_segment_video", "slide_video"}:
             entry["segment_asset"] = asset
+            entry["final_avatar_output_storage_key"] = metadata.get("final_avatar_output_storage_key") or entry.get("final_avatar_output_storage_key")
             entry["slide_preview_source"] = metadata.get("slide_preview_source")
             entry["selected_slide_preview_asset"] = metadata.get(
                 "selected_slide_preview_asset"
@@ -461,6 +579,35 @@ def _debug_assets_by_slide(asset_reads: list[dict]) -> list[dict]:
             entry["composition_motion_warning"] = metadata.get(
                 "composition_motion_warning"
             )
+            entry["avatar_generation_mode"] = metadata.get("mode")
+            entry["requested_avatar_generation_mode"] = metadata.get("requested_avatar_generation_mode")
+            entry["effective_avatar_generation_mode"] = metadata.get("effective_avatar_generation_mode")
+            entry["avatar_provider_name"] = metadata.get("avatar_provider_name") or metadata.get("provider_name")
+            entry["provider_request_type"] = metadata.get("provider_request_type")
+            entry["provider_endpoint"] = metadata.get("provider_endpoint")
+            entry["provider_prediction_id"] = metadata.get("provider_prediction_id") or metadata.get("wavespeed_request_id")
+            entry["provider_output_url_present"] = metadata.get("provider_output_url_present")
+            entry["provider_output_url_host"] = metadata.get("provider_output_url_host")
+            entry["provider_output_duration"] = metadata.get("provider_output_duration") or metadata.get("avatar_video_duration")
+            entry["provider_output_has_green_background"] = metadata.get("provider_output_has_green_background")
+            entry["provider_output_has_motion"] = metadata.get("provider_output_has_motion")
+            entry["provider_requires_chromakey"] = metadata.get("provider_requires_chromakey")
+            entry["provider_output_green_ratio"] = metadata.get("provider_output_green_ratio")
+            entry["provider_status_history"] = metadata.get("provider_status_history")
+            entry["input_image_url_present"] = metadata.get("input_image_url_present")
+            entry["input_video_url_present"] = metadata.get("input_video_url_present")
+            entry["input_audio_url_present"] = metadata.get("input_audio_url_present")
+            entry["input_video_duration"] = metadata.get("input_video_duration")
+            entry["input_audio_duration"] = metadata.get("input_audio_duration")
+            entry["sync_mode"] = metadata.get("sync_mode")
+            entry["resolution"] = metadata.get("resolution")
+            entry["final_avatar_overlay_source"] = metadata.get("final_overlay_source")
+            entry["fallback_used"] = metadata.get("fallback_used")
+            entry["fallback_reason"] = metadata.get("fallback_reason")
+            entry["apply_avatar_chromakey"] = metadata.get("apply_avatar_chromakey")
+            entry["avatar_base_video_source"] = metadata.get("avatar_base_video_source")
+            entry["avatar_base_video_is_real_motion"] = metadata.get("avatar_base_video_is_real_motion")
+            entry["avatar_base_video_has_green_background"] = metadata.get("avatar_base_video_has_green_background")
     return sorted(
         grouped.values(),
         key=lambda item: item["slide_position"] if item["slide_position"] is not None else 999999,
@@ -522,6 +669,69 @@ def _debug_generation_diagnostics(slides: list[dict], final_video_asset: dict | 
         "final_video_storage_key": final_video_asset.get("storage_key") if final_video_asset else None,
         "recommended_action": recommended_action,
     }
+
+
+def _debug_frame_assets(
+    *,
+    project_id: uuid.UUID,
+    storage,
+    asset: dict | None,
+    label: str,
+) -> dict:
+    if not asset:
+        return {}
+    storage_key = asset.get("storage_key")
+    if not storage_key:
+        return {}
+    try:
+        media_bytes = storage.download_bytes(storage_key)
+    except Exception as exc:
+        return {"error": str(exc), "storage_key": storage_key}
+    duration_seconds = float(asset.get("duration_seconds") or 0.0)
+    frame_specs = [
+        ("first", 0.0),
+        ("middle", max(duration_seconds / 2.0, 0.0)),
+        ("last", max(duration_seconds - 0.1, 0.0)),
+    ]
+    results: dict[str, dict] = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        media_path = Path(tmpdir) / f"{label}.mp4"
+        media_path.write_bytes(media_bytes)
+        for frame_name, timestamp in frame_specs:
+            frame_path = Path(tmpdir) / f"{label}-{frame_name}.png"
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        f"{timestamp:.3f}",
+                        "-i",
+                        str(media_path),
+                        "-frames:v",
+                        "1",
+                        str(frame_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+                )
+                frame_key, download_url = _upload_debug_file(
+                    project_id=project_id,
+                    path=frame_path,
+                    content_type="image/png",
+                )
+                results[frame_name] = {
+                    "storage_key": frame_key,
+                    "download_url": download_url,
+                    "timestamp_seconds": round(timestamp, 3),
+                }
+            except Exception as exc:
+                results[frame_name] = {
+                    "error": str(exc),
+                    "timestamp_seconds": round(timestamp, 3),
+                }
+    return results
 
 
 def _ensure_debug_enabled() -> None:

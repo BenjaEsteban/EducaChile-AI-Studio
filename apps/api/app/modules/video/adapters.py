@@ -75,7 +75,11 @@ class AvatarVideoProvider:
                 "MISSING_AVATAR_SOURCE",
             )
         mode = (settings.AVATAR_GENERATION_MODE or "fast_lipsync").strip().lower()
-        lipsync_provider = (settings.AVATAR_LIPSYNC_PROVIDER or "wavespeed_infinitetalk").strip().lower()
+        image_audio_provider = (
+            settings.AVATAR_IMAGE_AUDIO_PROVIDER
+            or settings.AVATAR_LIPSYNC_PROVIDER
+            or "wavespeed_infinitetalk_fast"
+        ).strip().lower()
         if mode == "fast_lipsync":
             if not (avatar_base_video_url or avatar_base_video_bytes):
                 raise AvatarVideoProviderError(
@@ -113,22 +117,23 @@ class AvatarVideoProvider:
                 seed=-1,
                 api_key=api_key,
             )
-        elif mode == "audio_lipsync":
+        elif mode in {"audio_lipsync", "image_audio_infinitetalk", "infinitetalk_image"}:
             if not audio_url:
                 raise AvatarVideoProviderError(
                     "Audio URL is missing",
                     "MISSING_AUDIO_ASSET",
                 )
-            if lipsync_provider == "wavespeed_infinitetalk":
+            if image_audio_provider in {"wavespeed_infinitetalk", "wavespeed_infinitetalk_fast"}:
                 video_url = self.generate_avatar_video_from_audio(
                     image_url=image_url,
                     audio_url=audio_url,
                     duration=_validate_duration(duration_seconds),
                     seed=-1,
                     prompt=None,
+                    resolution=settings.AVATAR_IMAGE_AUDIO_RESOLUTION,
                     api_key=api_key,
                 )
-            elif lipsync_provider in {"wavespeed_text", "ai_talking_photos"}:
+            elif image_audio_provider in {"wavespeed_text", "ai_talking_photos"}:
                 if not narration:
                     raise AvatarVideoProviderError(
                         "Narration text is missing",
@@ -191,12 +196,39 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
             seed=seed,
         )
         self.last_request_id = request_id
+        self.last_request_context = {
+            "avatar_generation_mode": settings.AVATAR_GENERATION_MODE,
+            "avatar_provider_name": self.provider_name,
+            "provider_endpoint": f"{client.base_url}/wavespeed-ai/ai-talking-photos",
+            "provider_request_type": "image_plus_text",
+            "input_image_url_present": bool(image_url),
+            "input_video_url_present": False,
+            "input_audio_url_present": False,
+            "input_video_duration": None,
+            "input_audio_duration": None,
+            "sync_mode": None,
+            "resolution": None,
+        }
+        status_history: list[dict[str, object]] = []
+
+        def _collect_heartbeat(payload: dict[str, object]) -> None:
+            status_history.append(
+                {
+                    "status": payload.get("status"),
+                    "elapsed_seconds": payload.get("elapsed_seconds"),
+                    "outputs_present": payload.get("outputs_present"),
+                }
+            )
+
+        self.last_status_history = status_history
         return _poll_wavespeed_prediction(
             client=client,
             request_id=request_id,
             timeout_seconds=settings.WAVESPEED_PREDICTION_TIMEOUT_SECONDS,
             poll_interval_seconds=settings.WAVESPEED_POLL_INTERVAL_SECONDS,
             audio_duration_seconds=None,
+            debug_context=self.last_request_context,
+            heartbeat_callback=_collect_heartbeat,
         )
 
     def generate_avatar_video_from_base_video(
@@ -225,12 +257,22 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
         if effective_audio_duration <= 0 and base_video_bytes:
             effective_audio_duration = _probe_duration(base_video_bytes, ".mp4")
         timeout_seconds = max(
-            int(settings.AVATAR_PROVIDER_CHUNK_TIMEOUT_SECONDS),
+            int(settings.AVATAR_PROVIDER_SLIDE_TIMEOUT_SECONDS),
             int(math.ceil(max(effective_audio_duration or 0.0, 0.0) * 20)),
         )
         attempts = 2 if retry_on_mismatch else 1
         last_details: dict | None = None
         for attempt in range(1, attempts + 1):
+            if not base_video_url and not base_video_bytes:
+                raise AvatarVideoProviderError(
+                    "Avatar base video URL is missing",
+                    "MISSING_AVATAR_SOURCE",
+                )
+            if not audio_url and not audio_bytes:
+                raise AvatarVideoProviderError(
+                    "Audio URL is missing",
+                    "MISSING_AUDIO_ASSET",
+                )
             prepared_video_url, video_check = _resolve_external_media_url(
                 client=client,
                 media_url=base_video_url,
@@ -254,6 +296,33 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
                 "video": video_check,
                 "audio": audio_check,
             }
+            self.last_request_context = {
+                "avatar_generation_mode": settings.AVATAR_GENERATION_MODE,
+                "avatar_provider_name": self.provider_name,
+                "provider_endpoint": f"{client.base_url}/{(model_name or settings.AVATAR_LIPSYNC_MODEL_PATH).strip('/')}",
+                "provider_request_type": "video_plus_audio",
+                "input_image_url_present": False,
+                "input_video_url_present": bool(prepared_video_url),
+                "input_audio_url_present": bool(prepared_audio_url),
+                "input_video_duration": _probe_duration(base_video_bytes, ".mp4") if base_video_bytes else None,
+                "input_audio_duration": effective_audio_duration,
+                "sync_mode": sync_mode or settings.AVATAR_SYNC_MODE,
+                "resolution": settings.AVATAR_LIPSYNC_RESOLUTION,
+            }
+            status_history: list[dict[str, object]] = []
+
+            def _collect_heartbeat(payload: dict[str, object]) -> None:
+                status_history.append(
+                    {
+                        "status": payload.get("status"),
+                        "elapsed_seconds": payload.get("elapsed_seconds"),
+                        "outputs_present": payload.get("outputs_present"),
+                    }
+                )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(payload)
+
+            self.last_status_history = status_history
             logger.info(
                 "WaveSpeed sync lipsync media prepared: attempt=%s video_host=%s audio_host=%s video_access=%s audio_access=%s sync_mode=%s model_name=%s",
                 attempt,
@@ -273,13 +342,15 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
                 model_path=model_name or settings.AVATAR_LIPSYNC_MODEL_PATH,
             )
             self.last_request_id = request_id
+            self.last_request_context["prediction_id"] = request_id
             video_url = _poll_wavespeed_prediction(
                 client=client,
                 request_id=request_id,
                 timeout_seconds=timeout_seconds,
                 poll_interval_seconds=settings.WAVESPEED_POLL_INTERVAL_SECONDS,
                 audio_duration_seconds=effective_audio_duration,
-                heartbeat_callback=heartbeat_callback,
+                heartbeat_callback=_collect_heartbeat,
+                debug_context=self.last_request_context,
             )
             clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
             if clip_response.status_code >= 400:
@@ -371,6 +442,16 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
         attempts = 2 if retry_on_mismatch else 1
         last_details: dict | None = None
         for attempt in range(1, attempts + 1):
+            if not image_url and not image_bytes:
+                raise AvatarVideoProviderError(
+                    "Avatar image URL is missing",
+                    "MISSING_AVATAR_SOURCE",
+                )
+            if not audio_url and not audio_bytes:
+                raise AvatarVideoProviderError(
+                    "Audio URL is missing",
+                    "MISSING_AUDIO_ASSET",
+                )
             prepared_image_url, image_check = _resolve_external_media_url(
                 client=client,
                 media_url=image_url,
@@ -393,6 +474,33 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
                 "image": image_check,
                 "audio": audio_check,
             }
+            self.last_request_context = {
+                "avatar_generation_mode": settings.AVATAR_GENERATION_MODE,
+                "avatar_provider_name": self.provider_name,
+                "provider_endpoint": f"{client.base_url}/wavespeed-ai/infinitetalk",
+                "provider_request_type": "image_plus_audio",
+                "input_image_url_present": bool(prepared_image_url),
+                "input_video_url_present": False,
+                "input_audio_url_present": bool(prepared_audio_url),
+                "input_video_duration": None,
+                "input_audio_duration": measured_audio_duration,
+                "sync_mode": None,
+                "resolution": effective_resolution,
+            }
+            status_history: list[dict[str, object]] = []
+
+            def _collect_heartbeat(payload: dict[str, object]) -> None:
+                status_history.append(
+                    {
+                        "status": payload.get("status"),
+                        "elapsed_seconds": payload.get("elapsed_seconds"),
+                        "outputs_present": payload.get("outputs_present"),
+                    }
+                )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(payload)
+
+            self.last_status_history = status_history
             logger.info(
                 "WaveSpeed InfiniteTalk media prepared: attempt=%s image_host=%s audio_host=%s image_access=%s audio_access=%s resolution=%s audio_duration_seconds=%s",
                 attempt,
@@ -411,13 +519,15 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
                 seed=seed,
             )
             self.last_request_id = request_id
+            self.last_request_context["prediction_id"] = request_id
             video_url = _poll_wavespeed_prediction(
                 client=client,
                 request_id=request_id,
                 timeout_seconds=timeout_seconds,
                 poll_interval_seconds=settings.WAVESPEED_POLL_INTERVAL_SECONDS,
                 audio_duration_seconds=measured_audio_duration,
-                heartbeat_callback=heartbeat_callback,
+                heartbeat_callback=_collect_heartbeat,
+                debug_context=self.last_request_context,
             )
             clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
             if clip_response.status_code >= 400:
@@ -494,21 +604,25 @@ def _poll_wavespeed_prediction(
     poll_interval_seconds: int,
     audio_duration_seconds: float | None,
     heartbeat_callback: Callable[[dict[str, object]], None] | None = None,
+    debug_context: dict[str, object] | None = None,
 ) -> str:
     start = time.monotonic()
     last_prediction: dict | None = None
+    status_history: list[dict[str, object]] = []
     while True:
         elapsed = time.monotonic() - start
         if elapsed >= timeout_seconds:
             safe_last_prediction = _safe_prediction_snapshot(last_prediction)
             logger.error(
-                "WaveSpeed prediction timed out: prediction_id=%s elapsed_seconds=%.2f timeout_seconds=%s audio_duration_seconds=%s last_status=%s last_response=%s",
+                "WaveSpeed prediction timed out: prediction_id=%s elapsed_seconds=%.2f timeout_seconds=%s audio_duration_seconds=%s last_status=%s last_response=%s debug_context=%s status_history=%s",
                 request_id,
                 elapsed,
                 timeout_seconds,
                 audio_duration_seconds,
                 (last_prediction or {}).get("status"),
                 safe_last_prediction,
+                debug_context,
+                status_history,
             )
             raise AvatarVideoProviderError(
                 f"WaveSpeed prediction timed out after {elapsed:.2f}s (prediction_id={request_id}, last_status={(last_prediction or {}).get('status')})",
@@ -520,21 +634,30 @@ def _poll_wavespeed_prediction(
         status_value = _prediction_status(prediction)
         outputs = _prediction_outputs(prediction)
         logger.info(
-            "WaveSpeed poll: prediction_id=%s status=%s elapsed_seconds=%.2f timeout_seconds=%s audio_duration_seconds=%s outputs_present=%s",
+            "WaveSpeed poll: prediction_id=%s status=%s elapsed_seconds=%.2f timeout_seconds=%s audio_duration_seconds=%s outputs_present=%s debug_context=%s",
             request_id,
             status_value,
             elapsed,
             timeout_seconds,
             audio_duration_seconds,
             bool(outputs),
+            debug_context,
+        )
+        status_history.append(
+            {
+                "status": status_value,
+                "elapsed_seconds": elapsed,
+                "outputs_present": bool(outputs),
+            }
         )
         if status_value == "processing" and elapsed >= min(300, timeout_seconds / 2):
             logger.warning(
-                "WaveSpeed prediction still processing: prediction_id=%s elapsed_seconds=%.2f timeout_seconds=%s audio_duration_seconds=%s",
+                "WaveSpeed prediction still processing: prediction_id=%s elapsed_seconds=%.2f timeout_seconds=%s audio_duration_seconds=%s debug_context=%s",
                 request_id,
                 elapsed,
                 timeout_seconds,
                 audio_duration_seconds,
+                debug_context,
             )
         if heartbeat_callback is not None:
             try:
@@ -547,6 +670,7 @@ def _poll_wavespeed_prediction(
                         "audio_duration_seconds": audio_duration_seconds,
                         "outputs_present": bool(outputs),
                         "last_prediction": _safe_prediction_snapshot(prediction),
+                        "debug_context": debug_context,
                     }
                 )
             except Exception:
@@ -560,19 +684,34 @@ def _poll_wavespeed_prediction(
             raise AvatarVideoProviderError(
                 "WaveSpeed result has no output URL",
                 "WAVESPEED_AVATAR_FAILED",
-                details={"prediction_id": request_id, "last_prediction": _safe_prediction_snapshot(prediction)},
+                details={
+                    "prediction_id": request_id,
+                    "last_prediction": _safe_prediction_snapshot(prediction),
+                    "debug_context": debug_context,
+                    "status_history": status_history,
+                },
             )
         if status_value in {"failed", "error", "canceled", "cancelled"}:
             raise AvatarVideoProviderError(
                 str(prediction.get("error") or prediction.get("message") or "WaveSpeed prediction failed"),
                 "WAVESPEED_AVATAR_FAILED",
-                details={"prediction_id": request_id, "last_prediction": _safe_prediction_snapshot(prediction)},
+                details={
+                    "prediction_id": request_id,
+                    "last_prediction": _safe_prediction_snapshot(prediction),
+                    "debug_context": debug_context,
+                    "status_history": status_history,
+                },
             )
         if status_value not in {"created", "processing", "queued", "running", ""}:
             raise AvatarVideoProviderError(
                 f"Unexpected WaveSpeed prediction status: {status_value}",
                 "WAVESPEED_AVATAR_FAILED",
-                details={"prediction_id": request_id, "last_prediction": _safe_prediction_snapshot(prediction)},
+                details={
+                    "prediction_id": request_id,
+                    "last_prediction": _safe_prediction_snapshot(prediction),
+                    "debug_context": debug_context,
+                    "status_history": status_history,
+                },
             )
         sleep_for = min(max(1, poll_interval_seconds), max(1, timeout_seconds - int(elapsed)))
         time.sleep(sleep_for)

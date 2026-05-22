@@ -108,11 +108,14 @@ class WavespeedClient:
             "duration": duration,
             "seed": seed,
         }
+        request_shape = _safe_payload_shape(payload)
         logger.info(
-            "Submitting WaveSpeed talking photo request: image_host=%s duration=%s text_present=%s",
+            "Submitting WaveSpeed talking photo request: endpoint=%s image_host=%s duration=%s text_present=%s payload_shape=%s",
+            url,
             _url_host(image_url),
             duration,
             bool(text.strip()),
+            request_shape,
         )
         response = httpx.post(
             url,
@@ -162,12 +165,15 @@ class WavespeedClient:
         }
         if prompt:
             payload["prompt"] = prompt.strip()
+        request_shape = _safe_payload_shape(payload)
         logger.info(
-            "Submitting WaveSpeed InfiniteTalk request: image_host=%s audio_host=%s resolution=%s prompt_present=%s",
+            "Submitting WaveSpeed InfiniteTalk request: endpoint=%s image_host=%s audio_host=%s resolution=%s prompt_present=%s payload_shape=%s",
+            url,
             _url_host(image_url),
             _url_host(audio_url),
             resolution,
             bool(prompt and prompt.strip()),
+            request_shape,
         )
         response = httpx.post(
             url,
@@ -219,12 +225,15 @@ class WavespeedClient:
         }
         if resolution:
             payload["resolution"] = resolution
+        request_shape = _safe_payload_shape(payload)
         logger.info(
-            "Submitting WaveSpeed sync lipsync request: video_host=%s audio_host=%s sync_mode=%s resolution=%s",
+            "Submitting WaveSpeed sync lipsync request: endpoint=%s video_host=%s audio_host=%s sync_mode=%s resolution=%s payload_shape=%s",
+            url,
             _url_host(video_url),
             _url_host(audio_url),
             sync_mode,
             resolution,
+            request_shape,
         )
         response = httpx.post(
             url,
@@ -324,6 +333,32 @@ def _extract_request_id(payload: dict[str, Any]) -> str | None:
         if isinstance(get_url, str) and get_url:
             return get_url.rsplit("/", 2)[-2] if "/predictions/" in get_url else None
     return None
+
+
+def _safe_payload_shape(payload: dict[str, Any]) -> dict[str, Any]:
+    def _host(value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return httpx.URL(value).host
+        except Exception:
+            return None
+
+    return {
+        "keys": sorted(payload.keys()),
+        "image_present": bool(payload.get("image")),
+        "video_present": bool(payload.get("video")),
+        "audio_present": bool(payload.get("audio")),
+        "text_present": bool(payload.get("text")),
+        "prompt_present": bool(payload.get("prompt")),
+        "seed_present": payload.get("seed") is not None,
+        "duration_present": payload.get("duration") is not None,
+        "resolution": payload.get("resolution"),
+        "sync_mode": payload.get("sync_mode"),
+        "image_host": _host(payload.get("image")),
+        "video_host": _host(payload.get("video")),
+        "audio_host": _host(payload.get("audio")),
+    }
 
 
 def _validate_duration(duration: int) -> int:

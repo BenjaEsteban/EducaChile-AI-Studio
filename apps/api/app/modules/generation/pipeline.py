@@ -20,10 +20,18 @@ from sqlalchemy.orm import Session
 from app.config import settings as app_settings
 from app.modules.composer.service import ComposerService
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
-from app.modules.projects.models import Asset, Presentation, Slide
+from app.modules.projects.models import Asset, Presentation, ProjectGenerationConfig, Slide
 from app.modules.tts.adapters import TTSProviderError, get_tts_provider
 from app.modules.video.adapters import AvatarVideoProviderError, get_avatar_video_provider
 from app.services.wavespeed_client import WavespeedClient, WavespeedClientError
+from app.services.wavespeed_official_client import (
+    INFINITETALK_FAST_MODEL,
+    SPANISH_LIPSYNC_PROMPT,
+    WaveSpeedOfficialClient,
+    WaveSpeedOfficialError,
+    download_video,
+    public_url_accessible,
+)
 from app.utils.crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -45,6 +53,14 @@ class GenerationContext:
     output_prefix: str
 
 
+@dataclass
+class TTSCredentialsResolution:
+    provider: str
+    api_key: str | None
+    voice_id: str | None
+    credentials_source: str
+
+
 class PipelineError(RuntimeError):
     def __init__(
         self,
@@ -63,6 +79,94 @@ class PipelineError(RuntimeError):
         self.slide_index = slide_index
         self.chunk_index = chunk_index
         self.details = details
+
+
+def resolve_tts_credentials(
+    project_config: ProjectGenerationConfig | None,
+    settings_module=app_settings,
+) -> TTSCredentialsResolution:
+    config_provider = ""
+    config_api_key = None
+    config_voice_id = None
+    if project_config is not None:
+        config_provider = (project_config.tts_provider or "").strip().lower()
+        config_api_key = decrypt_secret(project_config.elevenlabs_api_key_encrypted)
+        config_voice_id = (project_config.voice_id or "").strip() or None
+
+    env_provider = (settings_module.TTS_PROVIDER or "none").strip().lower()
+    provider = config_provider or env_provider
+
+    if provider != "elevenlabs":
+        return TTSCredentialsResolution(
+            provider=provider,
+            api_key=None,
+            voice_id=None,
+            credentials_source="project_config" if config_provider else "env_fallback",
+        )
+
+    if config_api_key and config_voice_id:
+        return TTSCredentialsResolution(
+            provider=provider,
+            api_key=config_api_key,
+            voice_id=config_voice_id,
+            credentials_source="project_config",
+        )
+
+    env_api_key = (settings_module.ELEVENLABS_API_KEY or "").strip() or None
+    env_voice_id = (settings_module.ELEVENLABS_VOICE_ID or "").strip() or None
+    if env_api_key and env_voice_id:
+        return TTSCredentialsResolution(
+            provider=provider,
+            api_key=env_api_key,
+            voice_id=env_voice_id,
+            credentials_source="env_fallback",
+        )
+
+    return TTSCredentialsResolution(
+        provider=provider,
+        api_key=None,
+        voice_id=None,
+        credentials_source="missing",
+    )
+
+
+def resolve_saved_tts_credentials(
+    db: Session,
+    project_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    settings_module=app_settings,
+) -> TTSCredentialsResolution:
+    project_config = (
+        db.query(ProjectGenerationConfig)
+        .filter(
+            ProjectGenerationConfig.project_id == project_id,
+            ProjectGenerationConfig.organization_id == organization_id,
+        )
+        .first()
+    )
+    project_resolution = resolve_tts_credentials(project_config, settings_module)
+    if project_resolution.provider != "elevenlabs":
+        return project_resolution
+    if project_resolution.api_key and project_resolution.voice_id:
+        return project_resolution
+
+    video_settings = (
+        db.query(VideoGenerationSettings)
+        .filter(VideoGenerationSettings.project_id == project_id)
+        .first()
+    )
+    if video_settings is not None:
+        fallback_api_key = decrypt_secret(video_settings.elevenlabs_api_key_encrypted)
+        fallback_voice_id = (video_settings.elevenlabs_voice_id or "").strip() or None
+        if fallback_api_key and fallback_voice_id:
+            return TTSCredentialsResolution(
+                provider="elevenlabs",
+                api_key=fallback_api_key,
+                voice_id=fallback_voice_id,
+                credentials_source="video_settings",
+            )
+
+    return project_resolution
 
 
 def validate_generation_job(
@@ -94,12 +198,6 @@ def validate_generation_job(
         .first()
     )
     if settings_row is None:
-        if not app_settings.WAVESPEED_API_KEY:
-            raise PipelineError(
-                "validation_failed",
-                "Video settings are not configured",
-                stage="validating",
-            )
         settings_row = VideoGenerationSettings(
             organization_id=organization_id,
             project_id=project_id,
@@ -107,19 +205,49 @@ def validate_generation_job(
             wavespeed_valid=True,
             elevenlabs_valid=False,
         )
-    wavespeed_api_key = decrypt_secret(settings_row.wavespeed_api_key_encrypted) or app_settings.WAVESPEED_API_KEY
+    wavespeed_api_key = (app_settings.WAVESPEED_API_KEY or "").strip()
     if not wavespeed_api_key:
         raise PipelineError(
             "validation_failed",
-            "WaveSpeed API key is missing",
+            "WAVESPEED_API_KEY is missing in worker environment",
             stage="validating",
         )
-    if _requires_tts_audio() and not _tts_provider_configured(settings_row):
-        raise PipelineError(
-            "validation_failed",
-            "ElevenLabs API key is missing",
-            stage="validating",
-        )
+    tts_resolution = resolve_saved_tts_credentials(
+        db,
+        project_id,
+        organization_id,
+        app_settings,
+    )
+    logger.info(
+        "Generation job %s: TTS credentials resolved provider=%s credentials_source=%s elevenlabs_api_key_present=%s elevenlabs_voice_id_present=%s",
+        job.id,
+        tts_resolution.provider,
+        tts_resolution.credentials_source,
+        bool(tts_resolution.api_key),
+        bool(tts_resolution.voice_id),
+    )
+    if tts_resolution.provider == "none":
+        if not app_settings.ALLOW_DUMMY_TTS:
+            raise PipelineError(
+                "validation_failed",
+                "Please configure a real TTS provider before generating the video.",
+                stage="validating",
+            )
+    elif tts_resolution.provider == "elevenlabs":
+        if not tts_resolution.api_key or not tts_resolution.voice_id:
+            if not tts_resolution.api_key and not (app_settings.ELEVENLABS_API_KEY or "").strip():
+                missing_message = "ELEVENLABS_API_KEY is missing in worker environment"
+            elif not tts_resolution.voice_id and not (app_settings.ELEVENLABS_VOICE_ID or "").strip():
+                missing_message = "ELEVENLABS_VOICE_ID is missing in worker environment"
+            else:
+                missing_message = (
+                    "Please configure ElevenLabs API key and voice ID in project settings before generating video."
+                )
+            raise PipelineError(
+                "validation_failed",
+                missing_message,
+                stage="validating",
+            )
     avatar_source_url, avatar_source_storage_key = _avatar_source_reference(
         db,
         settings_row,
@@ -141,8 +269,8 @@ def validate_generation_job(
         presentation=presentation,
         slides=slides,
         settings=settings_row,
-        elevenlabs_api_key=decrypt_secret(settings_row.elevenlabs_api_key_encrypted),
-        elevenlabs_voice_id=settings_row.elevenlabs_voice_id,
+        elevenlabs_api_key=tts_resolution.api_key,
+        elevenlabs_voice_id=tts_resolution.voice_id,
         wavespeed_api_key=wavespeed_api_key,
         avatar_source_url=avatar_source_url,
         avatar_source_storage_key=avatar_source_storage_key,
@@ -191,7 +319,13 @@ def generate_audio_for_slide(
     _stage_progress(db, job, "generating_audio", slide_index - 1, total_slides, 5, 20, slide_index)
     metadata = slide.metadata_ or {}
     dialogue = _normalize_tts_text(str(metadata.get("dialogue") or slide.notes or ""))
-    tts_provider_name = (app_settings.TTS_PROVIDER or "none").strip().lower()
+    tts_resolution = resolve_saved_tts_credentials(
+        db,
+        context.project_id,
+        context.organization_id,
+        app_settings,
+    )
+    tts_provider_name = tts_resolution.provider
     chunks = _build_narration_chunks(dialogue)
     if not chunks:
         raise PipelineError(
@@ -201,15 +335,18 @@ def generate_audio_for_slide(
             slide_index=slide_index,
         )
     logger.info(
-        "Generation job %s: generating TTS audio for slide %s/%s provider=%s text_length=%s word_count=%s chunk_count=%s speed=%s",
+        "Generation job %s: generating TTS audio for slide %s/%s provider=%s credentials_source=%s text_length=%s word_count=%s chunk_count=%s speed=%s elevenlabs_api_key_present=%s elevenlabs_voice_id_present=%s",
         job.id,
         slide_index,
         total_slides,
         tts_provider_name,
+        tts_resolution.credentials_source,
         len(dialogue),
         _word_count(dialogue),
         len(chunks),
         app_settings.TTS_SPEED,
+        bool(tts_resolution.api_key),
+        bool(tts_resolution.voice_id),
     )
     try:
         provider = get_tts_provider(tts_provider_name)
@@ -237,10 +374,10 @@ def generate_audio_for_slide(
             )
             chunk_audio_raw, _chunk_reported_duration = provider.generate_audio(
                 text=chunk_text,
-                voice_id=context.elevenlabs_voice_id,
+                voice_id=tts_resolution.voice_id,
                 language=app_settings.TTS_LANGUAGE,
                 speed=app_settings.TTS_SPEED,
-                api_key=context.elevenlabs_api_key,
+                api_key=tts_resolution.api_key,
             )
             chunk_audio_mp3 = composer.normalize_audio_to_mp3(chunk_audio_raw)
             chunk_audio_info = _probe_media_info(chunk_audio_mp3, ".mp3")
@@ -446,6 +583,9 @@ def generate_avatar_clip_for_slide(
     slide_index: int,
     total_slides: int,
     audio_asset: Asset | None = None,
+    avatar_base_video_asset: Asset | None = None,
+    avatar_base_video_bytes: bytes | None = None,
+    avatar_base_video_metadata: dict | None = None,
     heartbeat_callback=None,
 ) -> Asset:
     existing = _find_valid_asset(
@@ -469,6 +609,10 @@ def generate_avatar_clip_for_slide(
     dialogue = _normalize_tts_text(str(metadata.get("dialogue") or slide.notes or ""))
     mode = _avatar_generation_mode()
     lipsync_provider = _avatar_lipsync_provider()
+    image_audio_provider = _avatar_image_audio_provider()
+    image_audio_resolution = _avatar_image_audio_resolution()
+    image_audio_mode = mode in {"infinitetalk_image", "audio_lipsync", "image_audio_infinitetalk"}
+    effective_provider_name = image_audio_provider if image_audio_mode else lipsync_provider
     if mode == "wavespeed_text" and not dialogue:
         raise PipelineError(
             "avatar_generation_failed",
@@ -514,26 +658,17 @@ def generate_avatar_clip_for_slide(
                 stage="generating_avatar",
                 slide_index=slide_index,
         )
-        avatar_base_video_asset: Asset | None = None
-        avatar_base_video_bytes: bytes | None = None
         avatar_base_video_metadata: dict | None = None
+        final_avatar_output_storage_key: str | None = None
+        provider_lipsync_output_storage_key: str | None = None
         if mode == "fast_lipsync":
-            avatar_base_video_asset, avatar_base_video_bytes, avatar_base_video_metadata = _ensure_avatar_base_video_asset(
-                db=db,
-                storage=storage,
-                context=context,
-            )
-        avatar_base_video_url = None
-        if avatar_base_video_asset is not None:
-            try:
-                avatar_base_video_url = _asset_public_url(storage, avatar_base_video_asset.storage_key)
-            except PipelineError as exc:
-                logger.warning(
-                    "Generation job %s: could not build a public avatar base video URL for slide %s, using uploaded bytes only: %s",
-                    job.id,
-                    slide_index,
-                    exc,
+            if avatar_base_video_asset is None or avatar_base_video_bytes is None:
+                avatar_base_video_asset, avatar_base_video_bytes, avatar_base_video_metadata = _ensure_avatar_base_video_asset(
+                    db=db,
+                    storage=storage,
+                    context=context,
                 )
+        avatar_base_video_url = ""
         chunk_avatar_bytes: list[bytes] = []
         chunk_metadata: list[dict] = []
         audio_source_urls: list[str] = []
@@ -636,9 +771,10 @@ def generate_avatar_clip_for_slide(
             chunk_retry_used = False
             request_id: str | None = None
             if mode == "fast_lipsync":
+                retry_error: Exception | None = None
                 try:
                     video_url = provider.generate_avatar_video_from_base_video(
-                        base_video_url=avatar_base_video_url or avatar_source_metadata.get("download_url") or avatar_source_metadata.get("source_url") or "",
+                        base_video_url=avatar_base_video_url,
                         audio_url=chunk_audio_url,
                         duration=max(5, int(math.ceil(chunk_measured_tts_duration or chunk_audio_duration))),
                         seed=-1,
@@ -655,12 +791,12 @@ def generate_avatar_clip_for_slide(
                         retry_on_mismatch=True,
                         minimum_duration_ratio=0.8,
                         heartbeat_callback=_avatar_poll_heartbeat,
-                    )
+                        )
                     request_id = getattr(provider, "last_request_id", None)
                 except (AvatarVideoProviderError, WavespeedClientError) as exc:
+                    retry_error = exc
                     if not app_settings.ENABLE_STATIC_AVATAR_FALLBACK:
                         raise
-                    retry_error = exc
                     if int(app_settings.AVATAR_PROVIDER_MAX_RETRIES) > 0:
                         logger.warning(
                             "Generation job %s: fast_lipsync provider failed for slide %s chunk %s, retrying once with fresh uploads: %s",
@@ -672,7 +808,7 @@ def generate_avatar_clip_for_slide(
                         chunk_retry_used = True
                         try:
                             video_url = provider.generate_avatar_video_from_base_video(
-                                base_video_url=avatar_base_video_url or avatar_source_metadata.get("download_url") or avatar_source_metadata.get("source_url") or "",
+                                base_video_url=avatar_base_video_url,
                                 audio_url=chunk_audio_url,
                                 duration=max(5, int(math.ceil(chunk_measured_tts_duration or chunk_audio_duration))),
                                 seed=-1,
@@ -691,32 +827,34 @@ def generate_avatar_clip_for_slide(
                                 heartbeat_callback=_avatar_poll_heartbeat,
                             )
                             request_id = getattr(provider, "last_request_id", None)
+                            retry_error = None
                         except (AvatarVideoProviderError, WavespeedClientError) as retry_exc:
                             retry_error = retry_exc
-                    fallback_used = True
-                    fallback_reason = str(retry_error)
-                    provider_timeout = "timed out" in fallback_reason.lower()
-                    logger.warning(
-                        "Generation job %s: fast_lipsync provider failed for slide %s chunk %s, falling back to static avatar: %s",
-                        job.id,
-                        slide_index,
-                        chunk_index,
-                        retry_error,
-                    )
-                    raw_clip, fallback_reason = _static_avatar_fallback_clip(
-                        storage,
-                        context,
-                        chunk_measured_tts_duration,
-                        str(retry_error),
-                    )
-            elif mode in {"infinitetalk_image", "audio_lipsync"} and lipsync_provider == "wavespeed_infinitetalk":
+                    if retry_error is not None:
+                        fallback_used = True
+                        fallback_reason = str(retry_error)
+                        provider_timeout = "timed out" in fallback_reason.lower()
+                        logger.warning(
+                            "Generation job %s: fast_lipsync provider failed for slide %s chunk %s, falling back to static avatar: %s",
+                            job.id,
+                            slide_index,
+                            chunk_index,
+                            retry_error,
+                        )
+                        raw_clip, fallback_reason = _static_avatar_fallback_clip(
+                            storage,
+                            context,
+                            chunk_measured_tts_duration,
+                            str(retry_error),
+                        )
+            elif image_audio_mode and image_audio_provider in {"wavespeed_infinitetalk", "wavespeed_infinitetalk_fast"}:
                 video_url = provider.generate_avatar_video_from_audio(
                     image_url=avatar_source_metadata.get("download_url") or avatar_source_metadata.get("source_url") or "",
                     audio_url=chunk_audio_url,
                     duration=max(5, int(math.ceil(chunk_measured_tts_duration or chunk_audio_duration))),
                     seed=-1,
                     prompt=None,
-                    resolution=app_settings.AVATAR_LIPSYNC_RESOLUTION,
+                    resolution=image_audio_resolution,
                     api_key=context.wavespeed_api_key,
                     audio_duration_seconds=chunk_audio_duration,
                     image_bytes=avatar_source_bytes,
@@ -764,6 +902,29 @@ def generate_avatar_clip_for_slide(
                     chunk_index=chunk_index,
                 )
             request_ids.append(request_id)
+            provider_request_context = getattr(provider, "last_request_context", {}) or {}
+            provider_status_history = getattr(provider, "last_status_history", []) or []
+            logger.info(
+                "Generation job %s: slide %s chunk %s provider debug mode=%s provider=%s request_type=%s endpoint=%s "
+                "input_image_url_present=%s input_video_url_present=%s input_audio_url_present=%s input_video_duration=%s "
+                "input_audio_duration=%s sync_mode=%s resolution=%s prediction_id=%s provider_status_history=%s",
+                job.id,
+                slide_index,
+                chunk_index,
+                provider_request_context.get("avatar_generation_mode") or mode,
+                provider_request_context.get("avatar_provider_name") or effective_provider_name,
+                provider_request_context.get("provider_request_type"),
+                provider_request_context.get("provider_endpoint"),
+                provider_request_context.get("input_image_url_present"),
+                provider_request_context.get("input_video_url_present"),
+                provider_request_context.get("input_audio_url_present"),
+                provider_request_context.get("input_video_duration"),
+                provider_request_context.get("input_audio_duration"),
+                provider_request_context.get("sync_mode"),
+                provider_request_context.get("resolution"),
+                request_id,
+                provider_status_history,
+            )
             if raw_clip is None:
                 if not video_url:
                     raise AvatarVideoProviderError(
@@ -805,6 +966,8 @@ def generate_avatar_clip_for_slide(
                     slide_index=slide_index,
                     chunk_index=chunk_index,
                 )
+            provider_green_background = _detect_green_background(raw_clip)
+            chunk_motion = _analyze_video_motion(clip)
             audio_source_url = getattr(provider, "last_audio_url", None) or chunk_audio_url
             image_source_url = (
                 getattr(provider, "last_image_url", None)
@@ -846,6 +1009,18 @@ def generate_avatar_clip_for_slide(
             chunk_metadata.append(
                 {
                     "chunk_index": chunk_index,
+                    "avatar_generation_mode": mode,
+                    "effective_avatar_generation_mode": mode,
+                    "avatar_provider_name": effective_provider_name,
+                    "provider_request_type": provider_request_context.get("provider_request_type"),
+                    "provider_endpoint": provider_request_context.get("provider_endpoint"),
+                    "input_image_url_present": provider_request_context.get("input_image_url_present"),
+                    "input_video_url_present": provider_request_context.get("input_video_url_present"),
+                    "input_audio_url_present": provider_request_context.get("input_audio_url_present"),
+                    "input_video_duration": provider_request_context.get("input_video_duration"),
+                    "input_audio_duration": provider_request_context.get("input_audio_duration"),
+                    "sync_mode": provider_request_context.get("sync_mode"),
+                    "resolution": provider_request_context.get("resolution") or app_settings.AVATAR_LIPSYNC_RESOLUTION,
                     "text": chunk_text,
                     "text_length": len(chunk_text),
                     "word_count": chunk_word_count,
@@ -862,10 +1037,18 @@ def generate_avatar_clip_for_slide(
                     "audio_url_external_check_result": external_checks.get("audio"),
                     "avatar_video_url_host": urlparse(video_url).hostname,
                     "request_id": request_id,
-                    "resolution": app_settings.AVATAR_LIPSYNC_RESOLUTION,
                     "provider_audio_present": provider_audio_present,
+                    "provider_output_has_motion": not bool(chunk_motion.get("almost_static")),
+                    "provider_output_has_green_background": provider_green_background.get("detected"),
+                    "provider_requires_chromakey": bool(provider_green_background.get("detected")),
+                    "provider_output_url_present": bool(video_url),
+                    "provider_output_url_host": urlparse(video_url).hostname if video_url else None,
+                    "provider_output_duration": float(clip_info.get("duration_seconds") or 0.0),
+                    "provider_output_green_ratio": provider_green_background.get("green_ratio"),
                     "provider_clip_ffprobe": raw_clip_info,
                     "stripped_clip_ffprobe": clip_info,
+                    "provider_motion_analysis": chunk_motion,
+                    "provider_status_history": provider_status_history,
                     "outputs_present": bool(raw_clip_info.get("has_video")),
                     "duration_ratio": duration_ratio,
                     "fallback_used": fallback_used,
@@ -875,7 +1058,7 @@ def generate_avatar_clip_for_slide(
                 }
             )
             logger.info(
-                "Generation job %s: slide %s chunk %s avatar ready prediction_id=%s resolution=%s provider_audio_present=%s avatar_duration=%.2f outputs_present=%s duration_ratio=%.2f fallback_used=%s provider_timeout=%s chunk_retry=%s",
+                "Generation job %s: slide %s chunk %s avatar ready prediction_id=%s resolution=%s provider_audio_present=%s avatar_duration=%.2f outputs_present=%s provider_output_url_present=%s provider_output_has_motion=%s provider_output_has_green_background=%s duration_ratio=%.2f fallback_used=%s provider_timeout=%s chunk_retry=%s",
                 job.id,
                 slide_index,
                 chunk_index,
@@ -884,6 +1067,9 @@ def generate_avatar_clip_for_slide(
                 provider_audio_present,
                 float(clip_info.get("duration_seconds") or 0.0),
                 bool(raw_clip_info.get("has_video")),
+                bool(video_url),
+                not bool(chunk_motion.get("almost_static")),
+                provider_green_background.get("detected"),
                 float(duration_ratio or 0.0),
                 fallback_used,
                 provider_timeout,
@@ -894,35 +1080,106 @@ def generate_avatar_clip_for_slide(
         else:
             clip = composer.concatenate_video_tracks(chunk_avatar_bytes)
         clip = composer.strip_audio_from_video(clip) if _probe_media_info(clip, ".mp4").get("has_audio") else clip
+        avatar_info = _probe_media_info(clip, ".mp4")
+        duration = float(avatar_info.get("duration_seconds") or 0)
+        fallback_used_any = any(chunk.get("fallback_used") for chunk in chunk_metadata)
+        fallback_reason_any = next(
+            (chunk.get("fallback_reason") for chunk in chunk_metadata if chunk.get("fallback_reason")),
+            None,
+        )
+        final_avatar_output_storage_key = f"{context.output_prefix}/avatar/slide-{slide_index}.mp4"
+        provider_lipsync_output_storage_key = None if fallback_used_any else final_avatar_output_storage_key
         avatar_metadata = {
             "provider": "wavespeed",
+            "provider_name": "wavespeed",
             "mode": mode,
-            "source_image_url": getattr(provider, "last_image_url", None)
-            or avatar_source_metadata.get("storage_key")
+            "requested_avatar_generation_mode": app_settings.AVATAR_GENERATION_MODE,
+            "effective_avatar_generation_mode": mode,
+            "avatar_provider_name": effective_provider_name,
+            "provider_request_type": chunk_metadata[-1].get("provider_request_type") if chunk_metadata else None,
+            "provider_endpoint": chunk_metadata[-1].get("provider_endpoint") if chunk_metadata else None,
+            "avatar_overlay_type": (
+                "static_avatar_fallback"
+                if fallback_used_any or mode == "static_avatar"
+                else "provider_lipsync_video"
+                if mode == "fast_lipsync"
+                else "image_audio_infinitetalk_video"
+                if mode in {"infinitetalk_image", "audio_lipsync", "image_audio_infinitetalk"}
+                else "provider_lipsync_video"
+            ),
+            "source_avatar_image_url": avatar_source_metadata.get("download_url")
+            or avatar_source_metadata.get("source_url")
             or context.avatar_source_url,
+            "avatar_base_video_url": getattr(provider, "last_image_url", None)
+            if mode == "fast_lipsync"
+            else None,
+            "avatar_base_video_asset_id": str(avatar_base_video_asset.id) if avatar_base_video_asset else None,
+            "avatar_base_video_storage_key": avatar_base_video_asset.storage_key if avatar_base_video_asset else None,
+            "avatar_base_video_provider": (avatar_base_video_metadata or {}).get("base_video_provider"),
+            "avatar_base_video_fallback_used": bool((avatar_base_video_metadata or {}).get("fallback_used")),
+            "avatar_base_video_source": (avatar_base_video_metadata or {}).get("avatar_base_video_source"),
+            "avatar_base_video_is_real_motion": (avatar_base_video_metadata or {}).get("avatar_base_video_is_real_motion"),
+            "avatar_base_video_metadata": avatar_base_video_metadata,
             "source_audio_url": audio_source_urls[0] if len(audio_source_urls) == 1 else None,
             "source_audio_urls": audio_source_urls,
             "wavespeed_request_id": request_ids[-1] if request_ids else None,
+            "provider_prediction_id": request_ids[-1] if request_ids else None,
+            "provider_name": "wavespeed",
             "wavespeed_request_ids": request_ids,
+            "provider_status_history": getattr(provider, "last_status_history", []) or [],
+            "provider_output_duration": duration,
+            "provider_output_url_present": bool(video_url),
+            "provider_output_url_host": urlparse(video_url).hostname if video_url else None,
             "request_text_length": len(dialogue),
             "request_duration": (
                 audio_duration_seconds
                 if mode in {"fast_lipsync", "infinitetalk_image", "audio_lipsync", "static_avatar"}
                 else _talking_photo_duration_from_audio(audio_duration_seconds, dialogue)
             ),
-            "selected_provider": lipsync_provider,
+            "selected_provider": effective_provider_name,
             "audio_duration_seconds": audio_duration_seconds,
             "chunk_count": len(chunk_specs),
             "chunks": chunk_metadata,
             "resolution": app_settings.AVATAR_LIPSYNC_RESOLUTION,
+            "input_image_url_present": bool(avatar_source_bytes),
+            "input_video_url_present": mode == "fast_lipsync",
+            "input_audio_url_present": True,
+            "provider_request_type": (
+                "video_plus_audio"
+                if mode == "fast_lipsync"
+                else "image_plus_audio"
+                if image_audio_mode
+                else "image_plus_text"
+                if mode in {"wavespeed_text", "ai_talking_photos"}
+                else "static_fallback"
+            ),
             "provider_audio_present": any(
                 chunk.get("provider_audio_present") for chunk in chunk_metadata
             ),
-            "fallback_used": any(chunk.get("fallback_used") for chunk in chunk_metadata),
-            "fallback_reason": next(
-                (chunk.get("fallback_reason") for chunk in chunk_metadata if chunk.get("fallback_reason")),
-                None,
+            "provider_output_has_motion": any(
+                chunk.get("provider_output_has_motion") for chunk in chunk_metadata
             ),
+            "provider_output_has_green_background": any(
+                chunk.get("provider_output_has_green_background") for chunk in chunk_metadata
+            ),
+            "provider_requires_chromakey": any(
+                chunk.get("provider_output_has_green_background") for chunk in chunk_metadata
+            ),
+            "provider_motion_analysis": chunk_metadata[-1].get("provider_motion_analysis") if chunk_metadata else {},
+            "fallback_used": fallback_used_any,
+            "fallback_reason": fallback_reason_any,
+            "green_screen_background": False,
+            "provider_lipsync_output_present": not fallback_used_any,
+            "provider_lipsync_output_duration": duration,
+            "provider_lipsync_output_storage_key": provider_lipsync_output_storage_key,
+            "provider_output_green_ratio": max(
+                [float(chunk.get("provider_output_green_ratio") or 0.0) for chunk in chunk_metadata] or [0.0]
+            ),
+            "final_overlay_source": (
+                "provider_lipsync_output" if not fallback_used_any else "static_avatar_fallback"
+            ),
+            "provider_output_url_present": bool(video_url),
+            "provider_output_url_host": urlparse(video_url).hostname if video_url else None,
         }
     except subprocess.CalledProcessError as exc:
         raise PipelineError(
@@ -939,8 +1196,6 @@ def generate_avatar_clip_for_slide(
             slide_index=slide_index,
             details=getattr(exc, "details", None),
         ) from exc
-    avatar_info = _probe_media_info(clip, ".mp4")
-    duration = float(avatar_info.get("duration_seconds") or 0)
     if duration <= 0 or not avatar_info.get("has_video"):
         raise PipelineError(
             "avatar_generation_failed",
@@ -973,14 +1228,46 @@ def generate_avatar_clip_for_slide(
             slide_index,
             motion.get("motion_score"),
         )
-    key = f"{context.output_prefix}/avatar/slide-{slide_index}.mp4"
-    storage.upload_file(key, clip, "video/mp4")
+    if audio_duration_seconds > 0 and duration > 0:
+        duration_tolerance = float(app_settings.MAX_AUDIO_CHUNK_DURATION_TOLERANCE_SECONDS)
+        if duration < max(0.0, audio_duration_seconds - duration_tolerance):
+            raise PipelineError(
+                "avatar_generation_failed",
+                (
+                    f"Avatar overlay duration does not match slide audio duration. "
+                    f"This would freeze the avatar (avatar={duration:.2f}s audio={audio_duration_seconds:.2f}s tolerance={duration_tolerance:.2f}s)."
+                ),
+                stage="generating_avatar",
+                slide_index=slide_index,
+                details={
+                    "avatar_video_storage_key": final_avatar_output_storage_key,
+                    "provider_lipsync_output_storage_key": provider_lipsync_output_storage_key,
+                    "final_avatar_output_storage_key": final_avatar_output_storage_key,
+                    "avatar_overlay_type": avatar_metadata.get("avatar_overlay_type"),
+                    "fallback_used": fallback_used_any,
+                    "fallback_reason": fallback_reason_any,
+                    "avatar_duration": duration,
+                    "audio_duration": audio_duration_seconds,
+                    "duration_tolerance": duration_tolerance,
+                    "avatar_base_video_source": (avatar_base_video_metadata or {}).get("avatar_base_video_source"),
+                    "avatar_base_video_is_real_motion": (avatar_base_video_metadata or {}).get("avatar_base_video_is_real_motion"),
+                },
+            )
+    if final_avatar_output_storage_key is None or duration <= 0:
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"Avatar output was not produced for slide {slide_index} chunk {last_chunk_index}.",
+            stage="generating_avatar",
+            slide_index=slide_index,
+            chunk_index=last_chunk_index,
+        )
+    storage.upload_file(final_avatar_output_storage_key, clip, "video/mp4")
     asset = _create_asset(
         db,
         context=context,
         slide=slide,
         asset_type="generated_avatar_clip",
-        storage_key=key,
+        storage_key=final_avatar_output_storage_key,
         filename=f"avatar-slide-{slide_index}.mp4",
         mime_type="video/mp4",
         size_bytes=len(clip),
@@ -990,16 +1277,239 @@ def generate_avatar_clip_for_slide(
             "slide_position": slide_index,
             "generation_job_id": str(job.id),
             "provider": "wavespeed",
+            "provider_name": "wavespeed",
+            "provider_prediction_id": request_ids[-1] if request_ids else None,
             "model_used": (
-                app_settings.DEFAULT_LIPSYNC_MODEL
+                app_settings.AVATAR_LIPSYNC_MODEL_PATH
+                if mode == "fast_lipsync"
+                else app_settings.DEFAULT_LIPSYNC_MODEL
                 if lipsync_provider == "wavespeed_infinitetalk"
                 else "wavespeed-ai-talking-photos"
             ),
+            "avatar_overlay_type": avatar_metadata.get("avatar_overlay_type"),
+            "avatar_video_storage_key": final_avatar_output_storage_key,
+            "provider_lipsync_output_storage_key": provider_lipsync_output_storage_key,
+            "final_avatar_output_storage_key": final_avatar_output_storage_key,
+            "avatar_video_duration": duration,
+            "avatar_video_has_motion_checked": True,
+            "avatar_video_has_motion": not motion.get("almost_static"),
             "ffprobe": avatar_info,
             "motion_analysis": motion,
+            "avatar_base_video_asset_id": str(avatar_base_video_asset.id) if avatar_base_video_asset else None,
+            "avatar_base_video_storage_key": avatar_base_video_asset.storage_key if avatar_base_video_asset else None,
+            "avatar_base_video_fallback_used": bool(
+                (avatar_base_video_metadata or {}).get("fallback_used")
+            ),
+            "avatar_base_video_source": (avatar_base_video_metadata or {}).get("avatar_base_video_source"),
+            "avatar_base_video_is_real_motion": (avatar_base_video_metadata or {}).get("avatar_base_video_is_real_motion"),
+            "avatar_base_video_metadata": avatar_base_video_metadata,
+            "provider_lipsync_output_present": not fallback_used_any,
+            "provider_lipsync_output_duration": duration,
+            "final_overlay_source": "provider_lipsync_output" if not fallback_used_any else "static_avatar_fallback",
         },
     )
     _stage_progress(db, job, "generating_avatar", slide_index, total_slides, 25, 35, slide_index)
+    return asset
+
+
+def generate_wavespeed_slide_video_for_slide(
+    db: Session,
+    storage,
+    job: GenerationJob,
+    context: GenerationContext,
+    slide: Slide,
+    slide_index: int,
+    total_slides: int,
+    audio_asset: Asset | None,
+) -> Asset:
+    existing = _find_valid_asset(
+        db,
+        storage,
+        context,
+        slide,
+        slide_index,
+        "wavespeed_slide_video",
+    )
+    if existing:
+        logger.info(
+            "Generation job %s: reusing existing WaveSpeed slide video for slide %s",
+            job.id,
+            slide_index,
+        )
+        _stage_progress(db, job, "generating_avatar", slide_index, total_slides, 25, 60, slide_index)
+        return existing
+
+    if not (app_settings.WAVESPEED_API_KEY or "").strip():
+        raise PipelineError(
+            "avatar_generation_failed",
+            "WAVESPEED_API_KEY is missing in worker environment",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+    if not context.avatar_source_url and not context.avatar_source_storage_key:
+        raise PipelineError(
+            "avatar_generation_failed",
+            "Avatar image is required for WaveSpeed generation",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+    if audio_asset is None:
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"Slide audio is missing for slide_id={slide.id}",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+
+    logger.info(
+        "Generation job %s: generating WaveSpeed InfiniteTalk Fast video for slide %s/%s",
+        job.id,
+        slide_index,
+        total_slides,
+    )
+    _stage_progress(db, job, "generating_avatar", slide_index - 1, total_slides, 25, 60, slide_index)
+
+    client = WaveSpeedOfficialClient(api_key=app_settings.WAVESPEED_API_KEY)
+    audio_bytes = storage.download_bytes(audio_asset.storage_key)
+    audio_info = _probe_media_info(audio_bytes, ".mp3")
+    audio_duration = float(audio_info.get("duration_seconds") or 0.0)
+    if audio_duration <= 0 or not audio_info.get("has_audio"):
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"Slide audio is missing or invalid for slide_id={slide.id}",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+    max_audio_seconds = float(app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK)
+    duration_tolerance = float(app_settings.MAX_AUDIO_CHUNK_DURATION_TOLERANCE_SECONDS)
+    if audio_duration > max_audio_seconds + duration_tolerance:
+        raise PipelineError(
+            "avatar_generation_failed",
+            (
+                f"Slide audio is too long for WaveSpeed generation "
+                f"(slide_id={slide.id}, duration={audio_duration:.2f}s, max={max_audio_seconds:.2f}s). "
+                "Shorten the slide dialogue or increase MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK."
+            ),
+            stage="generating_avatar",
+            slide_index=slide_index,
+            details={
+                "slide_id": str(slide.id),
+                "audio_duration_seconds": audio_duration,
+                "max_lipsync_audio_seconds_per_chunk": max_audio_seconds,
+            },
+        )
+
+    avatar_source_bytes, avatar_source_metadata = _load_avatar_source_bytes(
+        db=db,
+        storage=storage,
+        context=context,
+    )
+    if not avatar_source_bytes:
+        raise PipelineError(
+            "avatar_generation_failed",
+            "Avatar image is required for WaveSpeed generation",
+            stage="generating_avatar",
+            slide_index=slide_index,
+        )
+
+    try:
+        audio_url, audio_source = _prepare_wavespeed_input_url(
+            storage=storage,
+            storage_key=audio_asset.storage_key,
+            media_bytes=audio_bytes,
+            filename=f"slide-{slide_index}.mp3",
+            content_type=audio_asset.mime_type or "audio/mpeg",
+            label=f"slide {slide_index} audio",
+            client=client,
+        )
+        avatar_image_url, avatar_source = _prepare_wavespeed_avatar_image_url(
+            storage=storage,
+            context=context,
+            avatar_source_bytes=avatar_source_bytes,
+            avatar_source_metadata=avatar_source_metadata,
+            client=client,
+        )
+        logger.info(
+            "Generation job %s: WaveSpeed slide %s input ready audio_url=%s audio_source=%s avatar_image_url=%s avatar_source=%s audio_duration=%.2f prompt_present=%s model=%s",
+            job.id,
+            slide_index,
+            _safe_provider_url_for_log(audio_url),
+            audio_source,
+            _safe_provider_url_for_log(avatar_image_url),
+            avatar_source,
+            audio_duration,
+            bool(SPANISH_LIPSYNC_PROMPT),
+            INFINITETALK_FAST_MODEL,
+        )
+        video_url = client.run_infinitetalk_fast(
+            image_url=avatar_image_url,
+            audio_url=audio_url,
+        )
+        logger.info(
+            "Generation job %s: WaveSpeed slide %s returned video_url=%s",
+            job.id,
+            slide_index,
+            _safe_provider_url_for_log(video_url),
+        )
+        video_bytes = download_video(video_url)
+    except WaveSpeedOfficialError as exc:
+        raise PipelineError(
+            "avatar_generation_failed",
+            str(exc),
+            stage="generating_avatar",
+            slide_index=slide_index,
+            details=exc.details,
+        ) from exc
+
+    video_info = _probe_media_info(video_bytes, ".mp4")
+    video_duration = float(video_info.get("duration_seconds") or 0.0)
+    if video_duration <= 0 or not video_info.get("has_video"):
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"WaveSpeed generated an invalid video for slide_id={slide.id}",
+            stage="generating_avatar",
+            slide_index=slide_index,
+            details={"ffprobe": video_info},
+        )
+    key = f"{context.output_prefix}/wavespeed-slides/slide-{slide_index}.mp4"
+    storage.upload_file(key, video_bytes, "video/mp4")
+    asset = _create_asset(
+        db,
+        context=context,
+        slide=slide,
+        asset_type="wavespeed_slide_video",
+        storage_key=key,
+        filename=f"wavespeed-slide-{slide_index}.mp4",
+        mime_type="video/mp4",
+        size_bytes=len(video_bytes),
+        duration_seconds=video_duration,
+        metadata_json={
+            "slide_position": slide_index,
+            "generation_job_id": str(job.id),
+            "provider": "wavespeed",
+            "model_used": INFINITETALK_FAST_MODEL,
+            "provider_request_type": "image_plus_audio",
+            "prompt": SPANISH_LIPSYNC_PROMPT,
+            "seed": -1,
+            "audio_asset_id": str(audio_asset.id),
+            "audio_storage_key": audio_asset.storage_key,
+            "audio_duration_seconds": audio_duration,
+            "audio_url": _safe_provider_url_for_log(audio_url),
+            "audio_url_source": audio_source,
+            "avatar_image_url": _safe_provider_url_for_log(avatar_image_url),
+            "avatar_image_url_source": avatar_source,
+            "video_url": _safe_provider_url_for_log(video_url),
+            "ffprobe": video_info,
+        },
+    )
+    logger.info(
+        "Generation job %s: WaveSpeed slide %s video asset saved storage_key=%s duration=%.2f",
+        job.id,
+        slide_index,
+        key,
+        video_duration,
+    )
+    _stage_progress(db, job, "generating_avatar", slide_index, total_slides, 25, 60, slide_index)
     return asset
 
 
@@ -1012,8 +1522,8 @@ def compose_segment_for_slide(
     slide_index: int,
     total_slides: int,
     audio_asset: Asset | None,
-    avatar_clip_asset: Asset,
-) -> Asset:
+        avatar_clip_asset: Asset,
+    ) -> Asset:
     existing = _find_valid_asset(
         db,
         storage,
@@ -1063,8 +1573,19 @@ def compose_segment_for_slide(
             stage="composing_slide",
             slide_index=slide_index,
         )
-    composition_used_generated_avatar_clip = True
-    composition_fallback_reason = None
+    avatar_clip_meta = avatar_clip_asset.metadata_json if isinstance(avatar_clip_asset.metadata_json, dict) else {}
+    avatar_generation_mode = (
+        (avatar_clip_meta.get("mode") if isinstance(avatar_clip_meta, dict) else None)
+        or app_settings.AVATAR_GENERATION_MODE
+        or "fast_lipsync"
+    ).strip().lower()
+    avatar_overlay_type = _avatar_overlay_type(avatar_clip_meta, fallback_reason=None)
+    fallback_reason_metadata = avatar_clip_meta.get("fallback_reason") if isinstance(avatar_clip_meta, dict) else None
+    fallback_used_metadata = bool(avatar_clip_meta.get("fallback_used")) if isinstance(avatar_clip_meta, dict) else False
+    provider_lipsync_output_present = bool(avatar_clip_meta.get("provider_lipsync_output_present")) if isinstance(avatar_clip_meta, dict) else False
+    provider_lipsync_output_duration = avatar_clip_meta.get("provider_lipsync_output_duration") if isinstance(avatar_clip_meta, dict) else None
+    final_overlay_source_metadata = avatar_clip_meta.get("final_overlay_source") if isinstance(avatar_clip_meta, dict) else None
+    composition_fallback_reason = fallback_reason_metadata
     avatar_source_asset_id = str(avatar_clip_asset.id)
     avatar_source_storage_key = avatar_clip_asset.storage_key
     avatar_clip_info: dict = {}
@@ -1077,8 +1598,8 @@ def compose_segment_for_slide(
             avatar_clip_asset=avatar_clip_asset,
             duration_seconds=segment_duration_seconds,
         )
+        avatar_clip_motion = _analyze_video_motion(avatar_clip)
         if fallback_reason:
-            composition_used_generated_avatar_clip = False
             composition_fallback_reason = fallback_reason
             avatar_source_asset_id = None
             avatar_source_storage_key = None
@@ -1100,20 +1621,247 @@ def compose_segment_for_slide(
                 slide_index,
                 avatar_clip_asset.storage_key,
             )
+        avatar_overlay_type = _avatar_overlay_type(
+            avatar_clip_meta,
+            fallback_reason=fallback_reason or fallback_reason_metadata,
+        )
+        final_overlay_source = (
+            final_overlay_source_metadata
+            or ("provider_lipsync_output" if provider_lipsync_output_present and not composition_fallback_reason else "static_avatar_fallback")
+        )
+        composition_used_generated_avatar_clip = final_overlay_source == "provider_lipsync_output"
         audio_bytes = storage.download_bytes(audio_asset.storage_key)
         audio_info = _probe_media_info(audio_bytes, ".mp3")
+        audio_duration = float(audio_info.get("duration_seconds") or 0.0)
         audio_storage_key = audio_asset.storage_key
         audio_asset_id = str(audio_asset.id)
+        avatar_base_video_meta = avatar_clip_meta.get("avatar_base_video_metadata") if isinstance(avatar_clip_meta, dict) else None
+        avatar_base_video_source = None
+        avatar_base_video_is_real_motion = None
+        if isinstance(avatar_base_video_meta, dict):
+            avatar_base_video_source = avatar_base_video_meta.get("avatar_base_video_source")
+            avatar_base_video_is_real_motion = avatar_base_video_meta.get("avatar_base_video_is_real_motion")
+        green_background_info = _detect_green_background(avatar_clip)
+        avatar_duration = float(avatar_clip_info.get("duration_seconds") or 0.0)
+        if composition_used_generated_avatar_clip and audio_duration > 0 and avatar_duration > 0:
+            duration_tolerance = float(app_settings.MAX_AUDIO_CHUNK_DURATION_TOLERANCE_SECONDS)
+            if avatar_duration < max(0.0, audio_duration - duration_tolerance):
+                raise PipelineError(
+                    "slide_composition_failed",
+                    "Avatar overlay duration does not match slide audio duration. This would freeze the avatar.",
+                    stage="composing_slide",
+                    slide_index=slide_index,
+                    details={
+                        "avatar_video_storage_key": avatar_source_storage_key,
+                        "avatar_overlay_type": avatar_overlay_type,
+                        "fallback_used": fallback_used_metadata,
+                        "fallback_reason": composition_fallback_reason,
+                        "avatar_base_video_source": avatar_base_video_source,
+                        "avatar_base_video_is_real_motion": avatar_base_video_is_real_motion,
+                        "avatar_duration": avatar_duration,
+                        "audio_duration": audio_duration,
+                        "duration_tolerance": duration_tolerance,
+                        "final_overlay_source": final_overlay_source,
+                        "provider_lipsync_output_present": provider_lipsync_output_present,
+                        "provider_lipsync_output_duration": provider_lipsync_output_duration,
+                    },
+                )
+        provider_requires_chromakey = bool(
+            green_background_info.get("detected") is True
+            and final_overlay_source == "provider_lipsync_output"
+            and avatar_overlay_type in {"provider_lipsync_video", "image_audio_infinitetalk_video"}
+        )
+        explicit_chromakey_requested = bool(
+            app_settings.ENABLE_AVATAR_CHROMAKEY
+            and (
+                green_background_info.get("detected") is True
+                or avatar_clip_meta.get("green_screen_background") is True
+                or avatar_clip_meta.get("provider_background") == "green"
+            )
+        )
+        apply_avatar_chromakey = bool(explicit_chromakey_requested or provider_requires_chromakey)
+        if provider_requires_chromakey and not app_settings.ENABLE_AVATAR_CHROMAKEY:
+            logger.warning(
+                "Generation job %s slide %s: provider output appears green-screened; applying provider-only chromakey cleanup without enabling global chromakey",
+                job.id,
+                slide_index,
+            )
+        elif not apply_avatar_chromakey and green_background_info.get("detected") is True:
+            logger.warning(
+                "Generation job %s slide %s: provider output has green background but no cleanup path is active",
+                job.id,
+                slide_index,
+            )
+        if apply_avatar_chromakey:
+            logger.info(
+                "Generation job %s: applying avatar chromakey for slide %s due to explicit provider/background metadata",
+                job.id,
+                slide_index,
+            )
+        elif app_settings.ENABLE_AVATAR_CHROMAKEY:
+            logger.info(
+                "Generation job %s: avatar chromakey enabled but no explicit green-screen metadata found for slide %s",
+                job.id,
+                slide_index,
+            )
         logger.info(
             "Generation job %s: composing slide %s with slide preview source=%s audio=%s "
-            "audio_duration=%s avatar_duration=%s",
+            "audio_duration=%s avatar_duration=%s avatar_overlay_type=%s avatar_video_storage_key=%s "
+            "avatar_base_video_source=%s avatar_base_video_is_real_motion=%s fallback_used=%s fallback_reason=%s "
+            "apply_avatar_chromakey=%s provider_requires_chromakey=%s allow_base_video_as_final_overlay=%s provider_lipsync_output_present=%s provider_lipsync_output_duration=%s final_overlay_source=%s green_ratio=%s",
             job.id,
             slide_index,
             slide_preview_source.get("storage_key"),
             audio_storage_key,
             audio_info.get("duration_seconds"),
             avatar_clip_info.get("duration_seconds"),
+            avatar_overlay_type,
+            avatar_source_storage_key,
+            avatar_base_video_source,
+            avatar_base_video_is_real_motion,
+            composition_fallback_reason is not None,
+            composition_fallback_reason,
+            apply_avatar_chromakey,
+            provider_requires_chromakey,
+            app_settings.ALLOW_BASE_VIDEO_AS_FINAL_OVERLAY,
+            provider_lipsync_output_present,
+            provider_lipsync_output_duration,
+            final_overlay_source,
+            green_background_info.get("green_ratio"),
         )
+        avatar_clip_motion = avatar_clip_meta.get("motion_analysis")
+        if not isinstance(avatar_clip_motion, dict):
+            avatar_clip_motion = {}
+        fail_on_static = bool(app_settings.FAIL_ON_STATIC_AVATAR_FALLBACK)
+        if avatar_generation_mode == "fast_lipsync":
+            if final_overlay_source == "avatar_base_video" and app_settings.ALLOW_BASE_VIDEO_AS_FINAL_OVERLAY:
+                logger.warning(
+                    "Generation job %s slide %s: allowing avatar_base_video overlay in debug mode avatar_video_storage_key=%s",
+                    job.id,
+                    slide_index,
+                    avatar_source_storage_key,
+                )
+            elif final_overlay_source != "provider_lipsync_output" or not provider_lipsync_output_present:
+                logger.warning(
+                    "Generation job %s slide %s: invalid fast_lipsync overlay source avatar_video_storage_key=%s avatar_overlay_type=%s fallback_used=%s fallback_reason=%s avatar_base_video_source=%s avatar_base_video_is_real_motion=%s avatar_duration=%s audio_duration=%s apply_avatar_chromakey=%s FAIL_ON_STATIC_AVATAR_FALLBACK=%s final_overlay_source=%s provider_lipsync_output_present=%s provider_lipsync_output_duration=%s",
+                    job.id,
+                    slide_index,
+                    avatar_source_storage_key,
+                    avatar_overlay_type,
+                    fallback_used_metadata,
+                    composition_fallback_reason,
+                    avatar_base_video_source,
+                    avatar_base_video_is_real_motion,
+                    avatar_clip_info.get("duration_seconds"),
+                    audio_info.get("duration_seconds"),
+                    apply_avatar_chromakey,
+                    fail_on_static,
+                    final_overlay_source,
+                    provider_lipsync_output_present,
+                    provider_lipsync_output_duration,
+                )
+                if fallback_used_metadata or composition_fallback_reason or avatar_overlay_type in {"static_avatar_fallback", "ffmpeg_static_loop_fallback"}:
+                    if fail_on_static and avatar_overlay_type in {"static_avatar_fallback", "ffmpeg_static_loop_fallback"}:
+                        raise PipelineError(
+                            "slide_composition_failed",
+                            "Avatar animation was not generated; static fallback was used.",
+                            stage="composing_slide",
+                            slide_index=slide_index,
+                            details={
+                                "avatar_video_storage_key": avatar_source_storage_key,
+                                "avatar_overlay_type": avatar_overlay_type,
+                                "fallback_used": fallback_used_metadata,
+                                "fallback_reason": composition_fallback_reason,
+                                "avatar_base_video_source": avatar_base_video_source,
+                                "avatar_base_video_is_real_motion": avatar_base_video_is_real_motion,
+                                "provider_requires_chromakey": provider_requires_chromakey,
+                            },
+                        )
+                    logger.warning(
+                        "Generation job %s slide %s: fast_lipsync accepted explicit static fallback avatar_video_storage_key=%s avatar_overlay_type=%s fallback_used=%s fallback_reason=%s",
+                        job.id,
+                        slide_index,
+                        avatar_source_storage_key,
+                        avatar_overlay_type,
+                        fallback_used_metadata,
+                        composition_fallback_reason,
+                    )
+                else:
+                    raise PipelineError(
+                        "slide_composition_failed",
+                        "Invalid overlay source: avatar_base_video was used instead of per-slide lip-sync output.",
+                        stage="composing_slide",
+                        slide_index=slide_index,
+                        details={
+                            "avatar_video_storage_key": avatar_source_storage_key,
+                            "avatar_overlay_type": avatar_overlay_type,
+                            "fallback_used": fallback_used_metadata,
+                            "fallback_reason": composition_fallback_reason,
+                            "avatar_base_video_source": avatar_base_video_source,
+                            "avatar_base_video_is_real_motion": avatar_base_video_is_real_motion,
+                            "avatar_duration": avatar_clip_info.get("duration_seconds"),
+                            "audio_duration": audio_info.get("duration_seconds"),
+                            "final_overlay_source": final_overlay_source,
+                            "provider_lipsync_output_present": provider_lipsync_output_present,
+                            "provider_lipsync_output_duration": provider_lipsync_output_duration,
+                            "provider_requires_chromakey": provider_requires_chromakey,
+                        },
+                    )
+            if composition_used_generated_avatar_clip and avatar_clip_motion.get("almost_static"):
+                raise PipelineError(
+                    "slide_composition_failed",
+                    "Per-slide lip-sync output appears static; refusing to compose a frozen avatar.",
+                    stage="composing_slide",
+                    slide_index=slide_index,
+                    details={
+                        "avatar_video_storage_key": avatar_source_storage_key,
+                        "avatar_overlay_type": avatar_overlay_type,
+                        "fallback_used": fallback_used_metadata,
+                        "fallback_reason": composition_fallback_reason,
+                        "avatar_base_video_source": avatar_base_video_source,
+                        "avatar_base_video_is_real_motion": avatar_base_video_is_real_motion,
+                        "avatar_duration": avatar_clip_info.get("duration_seconds"),
+                        "audio_duration": audio_info.get("duration_seconds"),
+                        "final_overlay_source": final_overlay_source,
+                        "provider_lipsync_output_present": provider_lipsync_output_present,
+                        "provider_lipsync_output_duration": provider_lipsync_output_duration,
+                        "provider_requires_chromakey": provider_requires_chromakey,
+                        "avatar_motion_analysis": avatar_clip_motion,
+                    },
+                )
+        if fallback_used_metadata or composition_fallback_reason:
+            logger.warning(
+                "Generation job %s slide %s: avatar fallback metadata detected avatar_video_storage_key=%s avatar_overlay_type=%s fallback_used=%s fallback_reason=%s avatar_base_video_source=%s avatar_base_video_is_real_motion=%s avatar_duration=%s audio_duration=%s apply_avatar_chromakey=%s provider_requires_chromakey=%s FAIL_ON_STATIC_AVATAR_FALLBACK=%s",
+                job.id,
+                slide_index,
+                avatar_source_storage_key,
+                avatar_overlay_type,
+                fallback_used_metadata,
+                composition_fallback_reason,
+                avatar_base_video_source,
+                avatar_base_video_is_real_motion,
+                avatar_clip_info.get("duration_seconds"),
+                audio_info.get("duration_seconds"),
+                apply_avatar_chromakey,
+                provider_requires_chromakey,
+                fail_on_static,
+            )
+            if fail_on_static and avatar_overlay_type in {"static_avatar_fallback", "ffmpeg_static_loop_fallback"}:
+                raise PipelineError(
+                    "slide_composition_failed",
+                    "Avatar animation was not generated; static fallback was used.",
+                    stage="composing_slide",
+                    slide_index=slide_index,
+                    details={
+                        "avatar_video_storage_key": avatar_source_storage_key,
+                        "avatar_overlay_type": avatar_overlay_type,
+                        "fallback_used": fallback_used_metadata,
+                        "fallback_reason": composition_fallback_reason,
+                        "avatar_base_video_source": avatar_base_video_source,
+                        "avatar_base_video_is_real_motion": avatar_base_video_is_real_motion,
+                        "provider_requires_chromakey": provider_requires_chromakey,
+                    },
+                )
         segment = composer.compose_slide_video(
             slide_image_bytes=slide_image,
             avatar_clip_bytes=avatar_clip,
@@ -1122,6 +1870,12 @@ def compose_segment_for_slide(
             avatar_overlay=_avatar_overlay_from_metadata(metadata, "1080p"),
             resolution="1080p",
             audio_pad_seconds=float(app_settings.SLIDE_PAUSE_SECONDS),
+            avatar_chromakey=apply_avatar_chromakey,
+            chromakey_color=app_settings.AVATAR_CHROMAKEY_COLOR,
+            chromakey_similarity=float(app_settings.AVATAR_CHROMAKEY_SIMILARITY),
+            chromakey_blend=float(app_settings.AVATAR_CHROMAKEY_BLEND),
+            subtitle_text=str(metadata.get("dialogue") or slide.notes or "").strip() or None,
+            subtitle_duration_seconds=audio_duration if audio_duration > 0 else None,
         )
     except subprocess.CalledProcessError as exc:
         raise PipelineError(
@@ -1131,6 +1885,37 @@ def compose_segment_for_slide(
             slide_index=slide_index,
         ) from exc
     segment_info = _probe_media_info(segment, ".mp4")
+    segment_green_background = _detect_green_background(segment)
+    if segment_green_background.get("detected"):
+        raise PipelineError(
+            "slide_composition_failed",
+            (
+                "Final slide segment contains a green background after avatar overlay cleanup. "
+                "Either switch to image_audio_infinitetalk or enable provider-only chromakey cleanup "
+                "for the selected provider/model."
+            ),
+            stage="composing_slide",
+            slide_index=slide_index,
+            details={
+                "avatar_video_storage_key": avatar_source_storage_key,
+                "avatar_overlay_type": avatar_overlay_type,
+                "avatar_provider_name": avatar_clip_meta.get("avatar_provider_name"),
+                "provider_request_type": avatar_clip_meta.get("provider_request_type"),
+                "fallback_used": fallback_used_metadata,
+                "fallback_reason": composition_fallback_reason,
+                "avatar_base_video_source": avatar_base_video_source,
+                "avatar_base_video_is_real_motion": avatar_base_video_is_real_motion,
+                "avatar_duration": avatar_clip_info.get("duration_seconds"),
+                "audio_duration": audio_info.get("duration_seconds"),
+                "final_overlay_source": final_overlay_source,
+                "provider_lipsync_output_present": provider_lipsync_output_present,
+                "provider_lipsync_output_duration": provider_lipsync_output_duration,
+                "provider_output_has_green_background": green_background_info.get("detected"),
+                "provider_output_green_ratio": green_background_info.get("green_ratio"),
+                "segment_green_background": segment_green_background,
+                "provider_requires_chromakey": provider_requires_chromakey,
+            },
+        )
     segment_motion = _analyze_video_motion(segment)
     avatar_motion = (avatar_clip_asset.metadata_json or {}).get("motion_analysis") or {}
     composition_motion_warning = None
@@ -1166,6 +1951,20 @@ def compose_segment_for_slide(
         )
     key = f"{context.output_prefix}/segments/slide-{slide_index}.mp4"
     storage.upload_file(key, segment, "video/mp4")
+    final_overlay_source = final_overlay_source or (
+        "provider_lipsync_output"
+        if composition_used_generated_avatar_clip and not composition_fallback_reason
+        else "static_avatar_fallback"
+    )
+    logger.info(
+        "Generation job %s: slide %s final segment ready path=%s final_overlay_source=%s fallback_used=%s fallback_reason=%s",
+        job.id,
+        slide_index,
+        key,
+        final_overlay_source,
+        composition_fallback_reason is not None,
+        composition_fallback_reason,
+    )
     asset = _create_asset(
         db,
         context=context,
@@ -1188,6 +1987,7 @@ def compose_segment_for_slide(
                 slide_preview_source.get("includes_text")
             ),
             "composition_preview_warning": slide_preview_source.get("warning"),
+            "avatar_overlay_type": avatar_overlay_type,
             "composition_asset_used": (
                 "generated_avatar_clip"
                 if composition_used_generated_avatar_clip
@@ -1199,12 +1999,21 @@ def compose_segment_for_slide(
             "avatar_clip_storage_key": avatar_source_storage_key,
             "avatar_clip_ffprobe": avatar_clip_info,
             "avatar_clip_duration_seconds": avatar_clip_info.get("duration_seconds"),
+            "avatar_clip_source": final_overlay_source,
+            "avatar_video_storage_key": avatar_source_storage_key,
+            "avatar_video_duration": avatar_clip_info.get("duration_seconds"),
+            "avatar_video_has_motion_checked": bool(avatar_clip_motion),
+            "provider_requires_chromakey": provider_requires_chromakey,
+            "provider_output_has_green_background": green_background_info.get("detected"),
+            "provider_output_green_ratio": green_background_info.get("green_ratio"),
+            "green_background_cleanup_applied": apply_avatar_chromakey,
             "audio_asset_id": audio_asset_id,
             "audio_duration_seconds": audio_info.get("duration_seconds"),
             "audio_storage_key": audio_storage_key,
             "ffprobe": segment_info,
             "segment_motion_analysis": segment_motion,
             "segment_appears_static": segment_motion.get("almost_static"),
+            "segment_green_background": segment_green_background,
             "composition_motion_warning": composition_motion_warning,
         },
     )
@@ -1219,6 +2028,18 @@ def compose_final_video(
     context: GenerationContext,
     segment_assets: list[Asset],
 ) -> Asset:
+    invalid_assets = [asset for asset in segment_assets if asset.asset_type != "slide_segment_video"]
+    if invalid_assets:
+        raise PipelineError(
+            "final_composition_failed",
+            "Final composition requires composed slide segments, not raw avatar clips.",
+            stage="composing_video",
+            details={
+                "invalid_asset_ids": [str(asset.id) for asset in invalid_assets],
+                "invalid_asset_types": [asset.asset_type for asset in invalid_assets],
+                "generation_job_id": str(job.id),
+            },
+        )
     existing = _find_valid_final_asset(db, storage, context)
     if existing:
         logger.info("Generation job %s: reusing existing final video asset", job.id)
@@ -1233,7 +2054,7 @@ def compose_final_video(
         job,
         status="composing_video",
         progress_percentage=90.0,
-        current_step="Creating final MP4",
+        current_step="Concatenating final video",
         total_slides=len(segment_assets),
     )
     composer = ComposerService()
@@ -1408,9 +2229,13 @@ def _stage_progress(
 
 def _step_message(status: str, current_slide: int | None, total: int) -> str:
     stage = {
-        "generating_audio": "Generating audio",
-        "generating_avatar": "Generating avatar clip",
+        "preparing_slide_previews": "Preparing slide previews",
+        "generating_audio": "Generating slide audio",
+        "preparing_avatar_base_video": "Preparing avatar base video",
+        "generating_avatar": "Generating slide lip-sync",
         "composing_slide": "Composing slide segment",
+        "concatenating_final_video": "Concatenating final video",
+        "composing_video": "Concatenating final video",
     }.get(status, status)
     if current_slide is None:
         return stage
@@ -1696,11 +2521,20 @@ def _avatar_lipsync_provider() -> str:
     return (app_settings.AVATAR_LIPSYNC_PROVIDER or "wavespeed_infinitetalk").strip().lower()
 
 
-def _tts_provider_configured(settings_row: VideoGenerationSettings) -> bool:
-    if (app_settings.TTS_PROVIDER or "none").strip().lower() != "elevenlabs":
-        return True
-    elevenlabs_key = decrypt_secret(settings_row.elevenlabs_api_key_encrypted)
-    return bool(elevenlabs_key and settings_row.elevenlabs_voice_id)
+def _avatar_image_audio_provider() -> str:
+    return (
+        app_settings.AVATAR_IMAGE_AUDIO_PROVIDER
+        or app_settings.AVATAR_LIPSYNC_PROVIDER
+        or "wavespeed_infinitetalk_fast"
+    ).strip().lower()
+
+
+def _avatar_image_audio_resolution() -> str:
+    return (app_settings.AVATAR_IMAGE_AUDIO_RESOLUTION or app_settings.AVATAR_LIPSYNC_RESOLUTION or "480p").strip().lower()
+
+
+def _allows_base_video_as_final_overlay() -> bool:
+    return bool(app_settings.ALLOW_BASE_VIDEO_AS_FINAL_OVERLAY)
 
 
 def _load_avatar_source_bytes(
@@ -1757,6 +2591,10 @@ def _ensure_avatar_base_video_asset(
         context=context,
     )
     source_signature = hashlib.sha256(avatar_source_bytes).hexdigest()
+    base_video_provider = (app_settings.AVATAR_BASE_VIDEO_PROVIDER or "wavespeed_infinitetalk_fast").strip().lower()
+    base_video_resolution = (app_settings.AVATAR_LIPSYNC_RESOLUTION or "480p").strip().lower()
+    base_video_duration_seconds = max(5.0, float(app_settings.AVATAR_BASE_VIDEO_DURATION_SECONDS or 8))
+    base_video_model = (app_settings.AVATAR_LIPSYNC_MODEL_PATH or "wavespeed-ai/sync-lipsync-3").strip()
     existing = (
         db.query(Asset)
         .filter(
@@ -1768,35 +2606,352 @@ def _ensure_avatar_base_video_asset(
         .first()
     )
     existing_metadata = existing.metadata_json if existing and isinstance(existing.metadata_json, dict) else {}
+    cached_real: tuple[Asset, bytes, dict] | None = None
+    cached_fallback: tuple[Asset, bytes, dict] | None = None
     if existing and existing_metadata:
-        expected_storage_key = existing_metadata.get("avatar_source_storage_key")
-        expected_signature = existing_metadata.get("avatar_source_signature")
-        if (
-            (context.avatar_source_storage_key and expected_storage_key == context.avatar_source_storage_key)
-            or (not context.avatar_source_storage_key and expected_signature == source_signature)
-        ):
-            try:
-                if storage_object_exists(storage, existing.storage_key):
-                    return existing, storage.download_bytes(existing.storage_key), existing_metadata
-            except Exception:
-                pass
+        matching_assets = [existing] + [
+            asset
+            for asset in (
+                db.query(Asset)
+                .filter(
+                    Asset.project_id == context.project_id,
+                    Asset.organization_id == context.organization_id,
+                    Asset.asset_type == "avatar_base_video",
+                )
+                .order_by(Asset.created_at.desc())
+                .all()
+            )
+            if asset.id != existing.id
+        ]
+        for asset in matching_assets:
+            metadata = asset.metadata_json if isinstance(asset.metadata_json, dict) else {}
+            expected_storage_key = metadata.get("avatar_source_storage_key")
+            expected_signature = metadata.get("avatar_source_signature")
+            expected_provider = (metadata.get("base_video_provider") or "").strip().lower()
+            expected_resolution = (metadata.get("resolution") or "").strip().lower()
+            expected_duration = float(metadata.get("base_video_duration_seconds") or 0.0)
+            expected_model = str(metadata.get("model_used") or "").strip()
+            if (
+                expected_provider != base_video_provider
+                or expected_resolution != base_video_resolution
+                or expected_model != base_video_model
+                or abs(expected_duration - base_video_duration_seconds) > 0.01
+            ):
+                continue
+            if (
+                (context.avatar_source_storage_key and expected_storage_key == context.avatar_source_storage_key)
+                or (not context.avatar_source_storage_key and expected_signature == source_signature)
+            ):
+                if not storage_object_exists(storage, asset.storage_key):
+                    continue
+                try:
+                    asset_bytes = storage.download_bytes(asset.storage_key)
+                except Exception:
+                    continue
+                if metadata.get("generated_from") == "real_avatar_base_video" and not metadata.get("fallback_used"):
+                    cached_real = (asset, asset_bytes, metadata)
+                    break
+                if cached_fallback is None:
+                    cached_fallback = (asset, asset_bytes, metadata)
 
-    base_duration = max(10.0, min(20.0, float(app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK)))
+    if cached_real is not None:
+        logger.info(
+            "Generation job %s: reusing cached real avatar base video asset=%s",
+            context.generation_job_id,
+            cached_real[0].storage_key,
+        )
+        return cached_real
+
     logger.info(
-        "Generation job %s: creating avatar base video from avatar image source_key=%s signature=%s duration=%.2f",
+        "Generation job %s: preparing avatar base video source_key=%s signature=%s provider=%s resolution=%s duration=%.2f",
         context.generation_job_id,
         context.avatar_source_storage_key,
         source_signature[:12],
-        base_duration,
+        base_video_provider,
+        base_video_resolution,
+        base_video_duration_seconds,
     )
-    base_video = _image_to_video_clip(avatar_source_bytes, base_duration)
+    if base_video_provider in {"wavespeed_infinitetalk_fast", "wavespeed_infinitetalk", "image_audio_infinitetalk"}:
+        try:
+            return _generate_real_avatar_base_video(
+                db=db,
+                storage=storage,
+                context=context,
+                avatar_source_bytes=avatar_source_bytes,
+                avatar_source_metadata=avatar_source_metadata,
+                source_signature=source_signature,
+                duration_seconds=base_video_duration_seconds,
+                resolution=base_video_resolution,
+                model_path=base_video_model,
+            )
+        except (AvatarVideoProviderError, WavespeedClientError, TTSProviderError, PipelineError, subprocess.CalledProcessError) as exc:
+            logger.warning(
+                "Generation job %s: real avatar base video generation failed, falling back to static loop: %s",
+                context.generation_job_id,
+                exc,
+            )
+            if cached_fallback is not None:
+                return cached_fallback
+
+    if cached_fallback is not None:
+        logger.info(
+            "Generation job %s: reusing cached static avatar base video fallback asset=%s",
+            context.generation_job_id,
+            cached_fallback[0].storage_key,
+        )
+        return cached_fallback
+
+    return _create_static_avatar_base_video(
+        db=db,
+        storage=storage,
+        context=context,
+        avatar_source_bytes=avatar_source_bytes,
+        avatar_source_metadata=avatar_source_metadata,
+        source_signature=source_signature,
+        duration_seconds=base_video_duration_seconds,
+        base_video_provider=base_video_provider,
+        resolution=base_video_resolution,
+        model_path=base_video_model,
+    )
+
+
+def prepare_avatar_base_video(
+    db: Session,
+    storage,
+    job: GenerationJob,
+    context: GenerationContext,
+) -> tuple[Asset, bytes, dict]:
+    logger.info(
+        "Generation job %s: preparing avatar base video",
+        job.id,
+    )
+    return _ensure_avatar_base_video_asset(db=db, storage=storage, context=context)
+
+
+def _generate_real_avatar_base_video(
+    *,
+    db: Session,
+    storage,
+    context: GenerationContext,
+    avatar_source_bytes: bytes,
+    avatar_source_metadata: dict,
+    source_signature: str,
+    duration_seconds: float,
+    resolution: str,
+    model_path: str,
+) -> tuple[Asset, bytes, dict]:
+    tts_resolution = resolve_saved_tts_credentials(
+        db,
+        context.project_id,
+        context.organization_id,
+        app_settings,
+    )
+    tts_provider_name = tts_resolution.provider
+    if tts_provider_name == "none" and not app_settings.ALLOW_DUMMY_TTS:
+        raise PipelineError(
+            "avatar_generation_failed",
+            "A real TTS provider is required to build the avatar base video.",
+            stage="preparing_avatar_base_video",
+        )
+    if tts_provider_name == "none":
+        raise PipelineError(
+            "avatar_generation_failed",
+            "Dummy TTS cannot be used to build a real avatar base video.",
+            stage="preparing_avatar_base_video",
+        )
+
+    calibration_text = _normalize_tts_text(
+        "Hola, esta es una breve calibración de sincronización para el avatar."
+    )
+    tts_provider = get_tts_provider(tts_provider_name)
+    calibration_audio_raw, _ = tts_provider.generate_audio(
+        text=calibration_text,
+        voice_id=tts_resolution.voice_id,
+        language=app_settings.TTS_LANGUAGE,
+        speed=app_settings.TTS_SPEED,
+        api_key=tts_resolution.api_key,
+    )
+    composer = ComposerService()
+    calibration_audio_mp3 = composer.normalize_audio_to_mp3(calibration_audio_raw)
+    calibration_audio_info = _probe_media_info(calibration_audio_mp3, ".mp3")
+    calibration_audio_duration = float(calibration_audio_info.get("duration_seconds") or 0.0)
+    if calibration_audio_duration <= 0 or not calibration_audio_info.get("has_audio"):
+        raise PipelineError(
+            "avatar_generation_failed",
+            "Calibration audio for avatar base video is invalid",
+            stage="preparing_avatar_base_video",
+        )
+    provider = get_avatar_video_provider("wavespeed")
+    provider_request_context = {
+        "avatar_generation_mode": "fast_lipsync",
+        "avatar_provider_name": "wavespeed",
+        "provider_endpoint": f"{app_settings.WAVESPEED_BASE_URL.rstrip('/')}/wavespeed-ai/infinitetalk",
+        "provider_request_type": "image_plus_audio",
+        "input_image_url_present": True,
+        "input_video_url_present": False,
+        "input_audio_url_present": True,
+        "input_video_duration": None,
+        "input_audio_duration": calibration_audio_duration,
+        "sync_mode": None,
+        "resolution": resolution,
+    }
+    logger.info(
+        "Generation job %s: avatar base video provider debug payload=%s",
+        context.generation_job_id,
+        provider_request_context,
+    )
+    provider_video_url = provider.generate_avatar_video_from_audio(
+        image_url=avatar_source_metadata.get("download_url")
+        or avatar_source_metadata.get("source_url")
+        or context.avatar_source_url
+        or "",
+        audio_url="",
+        duration=max(5, int(math.ceil(calibration_audio_duration))),
+        seed=-1,
+        prompt=None,
+        resolution=resolution,
+        api_key=context.wavespeed_api_key,
+        audio_duration_seconds=calibration_audio_duration,
+        image_bytes=avatar_source_bytes,
+        audio_bytes=calibration_audio_mp3,
+        image_filename=avatar_source_metadata.get("filename") or "avatar.png",
+        image_content_type=avatar_source_metadata.get("mime_type") or "image/png",
+        audio_filename="avatar-base-calibration.mp3",
+        audio_content_type="audio/mpeg",
+        retry_on_mismatch=True,
+        minimum_duration_ratio=0.8,
+    )
+    clip_response = httpx.get(provider_video_url, timeout=app_settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
+    if clip_response.status_code >= 400:
+        raise PipelineError(
+            "avatar_generation_failed",
+            f"WaveSpeed avatar base video download returned HTTP {clip_response.status_code}",
+            stage="preparing_avatar_base_video",
+        )
+    raw_clip = clip_response.content
+    clip_info = _probe_media_info(raw_clip, ".mp4")
+    if not clip_info.get("has_video") or float(clip_info.get("duration_seconds") or 0.0) <= 0:
+        raise PipelineError(
+            "avatar_generation_failed",
+            "WaveSpeed avatar base video is invalid",
+            stage="preparing_avatar_base_video",
+        )
+    clip = composer.strip_audio_from_video(raw_clip) if clip_info.get("has_audio") else raw_clip
+    clip_info = _probe_media_info(clip, ".mp4")
+    if clip_info.get("has_audio"):
+        raise PipelineError(
+            "avatar_generation_failed",
+            "Avatar base video still contains audio after stripping",
+            stage="preparing_avatar_base_video",
+        )
+    base_green_background = _detect_green_background(clip)
+    base_request_context = getattr(provider, "last_request_context", {}) or {}
+    base_key = f"{context.output_prefix}/avatar/base/avatar-base.mp4"
+    storage.upload_file(base_key, clip, "video/mp4")
+    avatar_info = {
+        "provider": "wavespeed",
+        "mode": "fast_lipsync",
+        "selected_provider": "wavespeed_sync_lipsync_3",
+        "provider_request_type": base_request_context.get("provider_request_type") or "image_plus_audio",
+        "provider_endpoint": base_request_context.get("provider_endpoint"),
+        "provider_status_history": getattr(provider, "last_status_history", []) or [],
+        "source_image_url": provider.last_image_url if hasattr(provider, "last_image_url") else None,
+        "source_audio_url": provider.last_audio_url if hasattr(provider, "last_audio_url") else None,
+        "source_audio_urls": [provider.last_audio_url] if getattr(provider, "last_audio_url", None) else [],
+        "wavespeed_request_id": getattr(provider, "last_request_id", None),
+        "wavespeed_request_ids": [getattr(provider, "last_request_id", None)] if getattr(provider, "last_request_id", None) else [],
+        "request_text_length": len(calibration_text),
+        "request_duration": calibration_audio_duration,
+        "audio_duration_seconds": calibration_audio_duration,
+        "chunk_count": 1,
+        "chunks": [
+            {
+                "index": 1,
+                "text": calibration_text,
+                "text_length": len(calibration_text),
+                "word_count": _word_count(calibration_text),
+                "estimated_duration": round(_estimate_spanish_duration(calibration_text), 2),
+                "expected_duration_seconds": round(_estimate_spanish_duration(calibration_text), 2),
+                "measured_tts_duration": calibration_audio_duration,
+                "measured_duration_seconds": calibration_audio_duration,
+                "audio_storage_key": None,
+                "audio_url": provider.last_audio_url if hasattr(provider, "last_audio_url") else None,
+                "audio_asset_id": None,
+                "audio_probe": calibration_audio_info,
+                "fallback_used": False,
+                "fallback_reason": None,
+                "provider_timeout": False,
+                "chunk_retry": False,
+            }
+        ],
+        "resolution": resolution,
+        "provider_audio_present": bool(clip_info.get("has_audio")),
+        "fallback_used": False,
+        "fallback_reason": None,
+        "avatar_base_video_source": "generated_real_avatar_base_video",
+        "avatar_base_video_is_real_motion": True,
+        "avatar_base_video_has_green_background": base_green_background.get("detected"),
+        "base_video_provider": (app_settings.AVATAR_BASE_VIDEO_PROVIDER or "wavespeed_infinitetalk_fast").strip().lower(),
+        "base_video_duration_seconds": duration_seconds,
+        "base_video_model": model_path,
+        "avatar_image_hash": source_signature,
+    }
+    asset = _create_asset(
+        db,
+        context=context,
+        slide=None,
+        asset_type="avatar_base_video",
+        storage_key=base_key,
+        filename="avatar-base.mp4",
+        mime_type="video/mp4",
+        size_bytes=len(clip),
+        duration_seconds=float(clip_info.get("duration_seconds") or duration_seconds),
+        metadata_json={
+            **avatar_info,
+            "avatar_source_storage_key": context.avatar_source_storage_key,
+            "avatar_source_url": context.avatar_source_url,
+            "avatar_source_signature": source_signature,
+            "generated_from": "real_avatar_base_video",
+            "fallback_used": False,
+            "duration_seconds": float(clip_info.get("duration_seconds") or duration_seconds),
+            "source_image": avatar_source_metadata,
+            "ffprobe": clip_info,
+            "green_background_analysis": base_green_background,
+            "avatar_base_video_metadata": avatar_info,
+        },
+    )
+    logger.info(
+        "Generation job %s: prepared real avatar base video asset=%s duration=%.2f provider=%s",
+        context.generation_job_id,
+        base_key,
+        float(clip_info.get("duration_seconds") or duration_seconds),
+        avatar_info["base_video_provider"],
+    )
+    return asset, clip, asset.metadata_json or {}
+
+
+def _create_static_avatar_base_video(
+    *,
+    db: Session,
+    storage,
+    context: GenerationContext,
+    avatar_source_bytes: bytes,
+    avatar_source_metadata: dict,
+    source_signature: str,
+    duration_seconds: float,
+    base_video_provider: str,
+    resolution: str,
+    model_path: str,
+) -> tuple[Asset, bytes, dict]:
+    base_video = _image_to_video_clip(avatar_source_bytes, duration_seconds)
     base_video_info = _probe_media_info(base_video, ".mp4")
     if not base_video_info.get("has_video") or float(base_video_info.get("duration_seconds") or 0.0) <= 0:
         raise PipelineError(
             "avatar_generation_failed",
             "Could not create avatar base video",
-            stage="generating_avatar",
+            stage="preparing_avatar_base_video",
         )
+    base_green_background = _detect_green_background(base_video)
     base_key = f"{context.output_prefix}/avatar/base/avatar-base.mp4"
     storage.upload_file(base_key, base_video, "video/mp4")
     asset = _create_asset(
@@ -1808,17 +2963,32 @@ def _ensure_avatar_base_video_asset(
         filename="avatar-base.mp4",
         mime_type="video/mp4",
         size_bytes=len(base_video),
-        duration_seconds=float(base_video_info.get("duration_seconds") or base_duration),
+        duration_seconds=float(base_video_info.get("duration_seconds") or duration_seconds),
         metadata_json={
             "avatar_source_storage_key": context.avatar_source_storage_key,
             "avatar_source_url": context.avatar_source_url,
             "avatar_source_signature": source_signature,
             "generated_from": "static_avatar",
             "fallback_used": True,
-            "duration_seconds": float(base_video_info.get("duration_seconds") or base_duration),
+            "avatar_base_video_source": "ffmpeg_static_fallback",
+            "avatar_base_video_is_real_motion": False,
+            "avatar_base_video_has_green_background": base_green_background.get("detected"),
+            "base_video_provider": base_video_provider,
+            "base_video_duration_seconds": duration_seconds,
+            "base_video_model": model_path,
+            "resolution": resolution,
+            "duration_seconds": float(base_video_info.get("duration_seconds") or duration_seconds),
             "source_image": avatar_source_metadata,
             "ffprobe": base_video_info,
+            "green_background_analysis": base_green_background,
+            "avatar_image_hash": source_signature,
         },
+    )
+    logger.info(
+        "Generation job %s: created static avatar base video fallback asset=%s duration=%.2f",
+        context.generation_job_id,
+        base_key,
+        float(base_video_info.get("duration_seconds") or duration_seconds),
     )
     return asset, base_video, asset.metadata_json or {}
 
@@ -1875,6 +3045,72 @@ def _asset_public_url(storage, storage_key: str) -> str:
         )
     _validate_external_provider_url(url)
     return url
+
+
+def _prepare_wavespeed_avatar_image_url(
+    *,
+    storage,
+    context: GenerationContext,
+    avatar_source_bytes: bytes,
+    avatar_source_metadata: dict,
+    client: WaveSpeedOfficialClient,
+) -> tuple[str, str]:
+    if context.avatar_source_url and public_url_accessible(context.avatar_source_url):
+        return context.avatar_source_url, "public_url"
+    if context.avatar_source_storage_key:
+        return _prepare_wavespeed_input_url(
+            storage=storage,
+            storage_key=context.avatar_source_storage_key,
+            media_bytes=avatar_source_bytes,
+            filename=avatar_source_metadata.get("filename") or "avatar.png",
+            content_type=avatar_source_metadata.get("mime_type") or "image/png",
+            label="avatar image",
+            client=client,
+        )
+    return client.upload_bytes(
+        avatar_source_bytes,
+        filename=avatar_source_metadata.get("filename") or "avatar.png",
+        content_type=avatar_source_metadata.get("mime_type") or "image/png",
+    ), "wavespeed_upload"
+
+
+def _prepare_wavespeed_input_url(
+    *,
+    storage,
+    storage_key: str,
+    media_bytes: bytes,
+    filename: str,
+    content_type: str,
+    label: str,
+    client: WaveSpeedOfficialClient,
+) -> tuple[str, str]:
+    try:
+        public_url = _asset_public_url(storage, storage_key)
+    except PipelineError as exc:
+        logger.warning(
+            "Could not create public URL for WaveSpeed %s; uploading media to WaveSpeed instead: %s",
+            label,
+            exc.message,
+        )
+    else:
+        if public_url_accessible(public_url):
+            return public_url, "public_url"
+        logger.warning(
+            "Public URL for WaveSpeed %s is not externally accessible; uploading media to WaveSpeed instead host=%s path=%s",
+            label,
+            urlparse(public_url).hostname,
+            urlparse(public_url).path,
+        )
+    return client.upload_bytes(media_bytes, filename=filename, content_type=content_type), "wavespeed_upload"
+
+
+def _safe_provider_url_for_log(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def _validate_external_provider_url(url: str) -> None:
@@ -2548,6 +3784,72 @@ def _analyze_video_motion(media_bytes: bytes) -> dict:
     }
 
 
+def _detect_green_background(media_bytes: bytes) -> dict:
+    info = {"detected": False, "green_ratio": 0.0, "sample_count": 0, "threshold": 0.45}
+    if not media_bytes:
+        return info
+    with tempfile.TemporaryDirectory() as tmp:
+        media_path = Path(tmp) / "avatar.mp4"
+        media_path.write_bytes(media_bytes)
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-ss",
+                    "0.2",
+                    "-i",
+                    str(media_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=64:64,format=rgb24",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return info
+    frame = result.stdout or b""
+    width = 64
+    height = 64
+    bytes_per_pixel = 3
+    expected = width * height * bytes_per_pixel
+    if len(frame) < expected:
+        return info
+    green_pixels = 0
+    total_pixels = 0
+    border_limit = 3
+    for y in range(height):
+        for x in range(width):
+            if x > border_limit and x < width - border_limit - 1 and y > border_limit and y < height - border_limit - 1:
+                continue
+            index = (y * width + x) * bytes_per_pixel
+            red = frame[index]
+            green = frame[index + 1]
+            blue = frame[index + 2]
+            total_pixels += 1
+            if green > 70 and green > red * 1.25 and green > blue * 1.25:
+                green_pixels += 1
+    if total_pixels <= 0:
+        return info
+    green_ratio = green_pixels / total_pixels
+    info.update(
+        {
+            "detected": green_ratio >= info["threshold"],
+            "green_ratio": round(green_ratio, 4),
+            "sample_count": total_pixels,
+            "method": "border_pixel_ratio",
+        }
+    )
+    return info
+
+
 def _mean_abs_frame_diff(left: bytes, right: bytes) -> float:
     length = min(len(left), len(right))
     if length <= 0:
@@ -2596,6 +3898,18 @@ def _avatar_overlay_from_metadata(metadata: dict, resolution: str) -> dict[str, 
         "width": min(width, output_width),
         "height": min(height, output_height),
     }
+
+
+def _avatar_overlay_type(metadata: dict | None, *, fallback_reason: str | None = None) -> str:
+    if isinstance(metadata, dict):
+        overlay_type = metadata.get("avatar_overlay_type")
+        if isinstance(overlay_type, str) and overlay_type:
+            return overlay_type
+        if metadata.get("fallback_used"):
+            return "static_avatar_fallback"
+    if fallback_reason:
+        return "static_avatar_fallback"
+    return "provider_lipsync_video"
 
 
 def _resolution_size_for_generation(resolution: str) -> tuple[int, int]:

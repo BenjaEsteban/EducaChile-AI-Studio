@@ -20,10 +20,10 @@ from app.modules.composer.service import ComposerService
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.pipeline import (
     PipelineError,
-    compose_final_video,
     compose_segment_for_slide,
+    compose_final_video,
     generate_audio_for_slide,
-    generate_avatar_clip_for_slide,
+    generate_wavespeed_slide_video_for_slide,
     mark_generation_failed,
     update_generation_job_progress,
     validate_generation_job,
@@ -663,6 +663,7 @@ class GenerateVideoTask(JobTask):
         )
         storage = get_storage()
         _log_storage_config_for_generation()
+        _log_video_generation_environment()
 
         try:
             with worker_db_session() as db:
@@ -730,20 +731,31 @@ class GenerateVideoTask(JobTask):
                             exc,
                         )
 
-                audio_assets = [
-                    generate_audio_for_slide(
-                        db,
-                        storage,
-                        generation_job,
-                        context,
-                        slide,
+                audio_assets = []
+                for slide_index, slide in enumerate(context.slides, 1):
+                    audio_assets.append(
+                        generate_audio_for_slide(
+                            db,
+                            storage,
+                            generation_job,
+                            context,
+                            slide,
+                            slide_index,
+                            total_slides,
+                        )
+                    )
+
+                slide_video_assets = []
+                for slide_index, slide in enumerate(context.slides, 1):
+                    logger.info(
+                        "Generation job %s: generating WaveSpeed avatar video for slide %s/%s slide_id=%s",
+                        generation_job.id,
                         slide_index,
                         total_slides,
+                        slide.id,
                     )
-                    for slide_index, slide in enumerate(context.slides, 1)
-                ]
-                avatar_clip_assets = [
-                        generate_avatar_clip_for_slide(
+                    slide_video_assets.append(
+                        generate_wavespeed_slide_video_for_slide(
                             db,
                             storage,
                             generation_job,
@@ -752,13 +764,45 @@ class GenerateVideoTask(JobTask):
                             slide_index,
                             total_slides,
                             audio_assets[slide_index - 1],
-                            heartbeat_callback=_heartbeat,
                         )
-                        for slide_index, slide in enumerate(context.slides, 1)
-                    ]
+                    )
 
-                segment_assets = [
-                    compose_segment_for_slide(
+                audio_assets_by_slide_id = {
+                    str(asset.slide_id): asset for asset in audio_assets if asset.slide_id is not None
+                }
+                avatar_assets_by_slide_id = {
+                    str(asset.slide_id): asset for asset in slide_video_assets if asset.slide_id is not None
+                }
+                segment_assets = []
+                for slide_index, slide in enumerate(context.slides, 1):
+                    slide_id = str(slide.id)
+                    avatar_asset = avatar_assets_by_slide_id.get(slide_id)
+                    audio_asset = audio_assets_by_slide_id.get(slide_id)
+                    if avatar_asset is None:
+                        raise PipelineError(
+                            "slide_composition_failed",
+                            f"Missing WaveSpeed avatar video for slide_id={slide.id}",
+                            stage="composing_slide",
+                            slide_index=slide_index,
+                        )
+                    if audio_asset is None:
+                        raise PipelineError(
+                            "slide_composition_failed",
+                            f"Missing slide audio for slide_id={slide.id}",
+                            stage="composing_slide",
+                            slide_index=slide_index,
+                        )
+                    logger.info(
+                        "Generation job %s: composing slide clip %s/%s slide_id=%s background_key=%s avatar_video_key=%s audio_key=%s",
+                        generation_job.id,
+                        slide_index,
+                        total_slides,
+                        slide.id,
+                        slide.thumbnail_key,
+                        avatar_asset.storage_key,
+                        audio_asset.storage_key if audio_asset else None,
+                    )
+                    segment_asset = compose_segment_for_slide(
                         db,
                         storage,
                         generation_job,
@@ -766,11 +810,16 @@ class GenerateVideoTask(JobTask):
                         slide,
                         slide_index,
                         total_slides,
-                        audio_assets[slide_index - 1],
-                        avatar_clip_assets[slide_index - 1],
+                        audio_asset,
+                        avatar_asset,
                     )
-                    for slide_index, slide in enumerate(context.slides, 1)
-                ]
+                    logger.info(
+                        "Generation job %s: composed slide clip ready slide_id=%s output_key=%s",
+                        generation_job.id,
+                        slide.id,
+                        segment_asset.storage_key,
+                    )
+                    segment_assets.append(segment_asset)
 
                 final_asset = compose_final_video(
                     db,
@@ -1191,6 +1240,20 @@ def _log_storage_config_for_generation() -> None:
         _endpoint_host(public),
         _endpoint_host(settings.AZURE_STORAGE_PUBLIC_BASE_URL),
         bool(settings.EXTERNAL_PROVIDER_ASSET_BASE_URL),
+    )
+
+
+def _log_video_generation_environment() -> None:
+    logger.info(
+        "Video generation environment: storage_backend=%s wavespeed_model=%s "
+        "max_lipsync_audio_seconds_per_chunk=%s wavespeed_api_key_configured=%s "
+        "elevenlabs_api_key_configured=%s elevenlabs_voice_id_configured=%s",
+        settings.STORAGE_BACKEND,
+        settings.AVATAR_IMAGE_AUDIO_PROVIDER,
+        settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK,
+        bool((settings.WAVESPEED_API_KEY or "").strip()),
+        bool((settings.ELEVENLABS_API_KEY or "").strip()),
+        bool((settings.ELEVENLABS_VOICE_ID or "").strip()),
     )
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from app.config import settings
+from app.modules.composer.subtitles import build_srt_content
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,12 @@ class ComposerService:
         avatar_overlay: AvatarOverlay,
         resolution: str = "1080p",
         audio_pad_seconds: float = 0.0,
+        avatar_chromakey: bool = False,
+        chromakey_color: str = "0x00FF00",
+        chromakey_similarity: float = 0.15,
+        chromakey_blend: float = 0.05,
+        subtitle_text: str | None = None,
+        subtitle_duration_seconds: float | None = None,
     ) -> bytes:
         _ensure_ffmpeg_available()
         width, height = _resolution_size(resolution)
@@ -88,11 +95,16 @@ class ComposerService:
             output = tmpdir / "slide.mp4"
             slide_image.write_bytes(slide_image_bytes)
             avatar_clip.write_bytes(avatar_clip_bytes)
-            overlay_filter = (
+            avatar_filter = f"scale={avatar_overlay['width']}:{avatar_overlay['height']},setsar=1"
+            if avatar_chromakey:
+                avatar_filter += (
+                    f",format=rgba,chromakey={chromakey_color}:{chromakey_similarity}:{chromakey_blend}"
+                )
+            base_overlay_filter = (
                 f"[0:v]scale={width}:{height},setsar=1[bg];"
-                f"[1:v]scale={avatar_overlay['width']}:{avatar_overlay['height']},setsar=1[avatar];"
+                f"[1:v]{avatar_filter}[avatar];"
                 f"[bg][avatar]overlay={avatar_overlay['x']}:{avatar_overlay['y']}:"
-                "shortest=0:eof_action=repeat[outv]"
+                "shortest=0:eof_action=repeat[basev]"
             )
             command = [
                 "ffmpeg",
@@ -106,14 +118,32 @@ class ComposerService:
             ]
             audio.write_bytes(audio_bytes)
             command.extend(["-i", str(audio)])
-            command.extend(
-                [
-                    "-filter_complex",
-                    overlay_filter,
-                    "-map",
-                    "[outv]",
-                ]
-            )
+            subtitle_filter = ""
+            subtitle_srt = tmpdir / "subtitles.srt"
+            if subtitle_text:
+                try:
+                    subtitle_duration = (
+                        float(subtitle_duration_seconds)
+                        if subtitle_duration_seconds is not None and float(subtitle_duration_seconds) > 0
+                        else float(duration_seconds)
+                    )
+                    subtitle_content = build_srt_content(subtitle_text, subtitle_duration)
+                    if subtitle_content.strip():
+                        subtitle_srt.write_text(subtitle_content, encoding="utf-8")
+                        subtitle_style = (
+                            "FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF,"
+                            "OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=40"
+                        )
+                        subtitle_path = _escape_subtitles_filter_path(subtitle_srt)
+                        subtitle_filter = (
+                            f";[basev]subtitles='{subtitle_path}':force_style='{subtitle_style}'[outv]"
+                        )
+                except Exception as exc:
+                    logger.warning("Subtitle generation skipped: %s", exc)
+
+            filter_complex = f"{base_overlay_filter}{subtitle_filter}"
+            map_output_video = "[outv]" if subtitle_filter else "[basev]"
+            command.extend(["-filter_complex", filter_complex, "-map", map_output_video])
             command.extend(["-map", "2:a:0"])
             if audio_pad_seconds > 0:
                 command.extend(["-af", f"apad=pad_dur={audio_pad_seconds}"])
@@ -144,6 +174,38 @@ class ComposerService:
                 )
             except subprocess.CalledProcessError as exc:
                 stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+                if subtitle_filter:
+                    logger.error(
+                        "FFmpeg subtitle burn-in failed, retrying without subtitles: %s",
+                        stderr[-2000:] if stderr else "unknown error",
+                    )
+                    fallback_command = list(command)
+                    filter_index = fallback_command.index("-filter_complex") + 1
+                    fallback_command[filter_index] = base_overlay_filter
+                    map_index = fallback_command.index("-map") + 1
+                    fallback_command[map_index] = "[basev]"
+                    try:
+                        subprocess.run(
+                            fallback_command,
+                            check=True,
+                            capture_output=True,
+                            timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+                        )
+                        return output.read_bytes()
+                    except subprocess.CalledProcessError as fallback_exc:
+                        fallback_stderr = (
+                            fallback_exc.stderr.decode("utf-8", errors="ignore")
+                            if fallback_exc.stderr
+                            else ""
+                        )
+                        if fallback_stderr:
+                            logger.error(
+                                "FFmpeg slide composition fallback failed stderr: %s",
+                                fallback_stderr[-2000:],
+                            )
+                        raise RuntimeError(
+                            f"FFmpeg slide composition failed after subtitle fallback: {fallback_stderr[-2000:]}"
+                        ) from fallback_exc
                 if stderr:
                     logger.error("FFmpeg slide composition failed stderr: %s", stderr[-2000:])
                 raise RuntimeError(
@@ -271,6 +333,15 @@ class ComposerService:
                 timeout=settings.FFMPEG_TIMEOUT_SECONDS,
             )
             return output.read_bytes()
+
+
+def _escape_subtitles_filter_path(path: Path) -> str:
+    value = path.as_posix()
+    value = value.replace("\\", "\\\\")
+    value = value.replace(":", "\\:")
+    value = value.replace("'", "\\'")
+    value = value.replace(",", "\\,")
+    return value
 
 
 def _resolution_size(resolution: str) -> tuple[int, int]:
