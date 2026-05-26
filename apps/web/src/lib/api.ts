@@ -94,6 +94,7 @@ export interface Project {
   id: string;
   organization_id: string;
   owner_id: string | null;
+  folder_id: string | null;
   name: string;
   description: string | null;
   status: "active" | "archived";
@@ -134,6 +135,34 @@ export interface ProjectAvatarLayoutUpdate {
 export interface CreateProjectInput {
   name: string;
   description?: string | null;
+  folder_id?: string | null;
+}
+
+export interface Folder {
+  id: string;
+  organization_id: string;
+  parent_folder_id: string | null;
+  name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FolderTreeNode {
+  id: string;
+  parent_folder_id: string | null;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  children: FolderTreeNode[];
+}
+
+export interface FolderTree {
+  items: FolderTreeNode[];
+}
+
+export interface CreateFolderInput {
+  name: string;
+  parent_folder_id?: string | null;
 }
 
 export interface InitPresentationUploadInput {
@@ -363,11 +392,40 @@ export interface DebugGenerationAssetsResponse {
 export const api = {
   health: () => apiFetch<HealthResponse>("/health"),
   projects: {
-    list: () => apiFetch<ProjectList>("/api/v1/projects/"),
+    list: (input?: { folderId?: string | null }) => {
+      const params = new URLSearchParams();
+      if (input?.folderId) params.set("folder_id", input.folderId);
+      const query = params.toString();
+      return apiFetch<ProjectList>(`/api/v1/projects/${query ? `?${query}` : ""}`);
+    },
     create: (input: CreateProjectInput) =>
       apiFetch<Project>("/api/v1/projects/", {
         method: "POST",
         body: JSON.stringify(input),
+      }),
+    move: (projectId: string, folder_id: string | null) =>
+      apiFetch<Project>(`/api/v1/projects/${projectId}/move`, {
+        method: "POST",
+        body: JSON.stringify({ folder_id }),
+      }),
+    listFolderTree: () => apiFetch<FolderTree>("/api/v1/projects/folders/tree"),
+    createFolder: (input: CreateFolderInput) =>
+      apiFetch<Folder>("/api/v1/projects/folders", {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    renameFolder: (folderId: string, name: string) =>
+      apiFetch<Folder>(`/api/v1/projects/folders/${folderId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name }),
+      }),
+    deleteFolder: (folderId: string, cascade = false) =>
+      apiFetch<void>(`/api/v1/projects/folders/${folderId}?cascade=${cascade}`, {
+        method: "DELETE",
+      }),
+    delete: (projectId: string) =>
+      apiFetch<void>(`/api/v1/projects/${projectId}`, {
+        method: "DELETE",
       }),
     get: (projectId: string) => apiFetch<Project>(`/api/v1/projects/${projectId}`),
     getGenerationConfig: (projectId: string) =>
