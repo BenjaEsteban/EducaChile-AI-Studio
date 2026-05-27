@@ -7,6 +7,7 @@ from pptx import Presentation as PptxPresentation
 from pptx.dml.color import RGBColor
 from sqlalchemy.orm import configure_mappers
 
+from app.config import settings as app_settings
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.pipeline import (
     _build_narration_chunks,
@@ -21,6 +22,7 @@ from app.modules.generation.pipeline import (
     _slide_audio_chunk_specs,
     _slide_segment_duration_seconds,
     compose_segment_for_slide,
+    validate_generation_job,
     generate_audio_for_slide,
     generate_avatar_clip_for_slide,
 )
@@ -191,7 +193,7 @@ def test_resolve_tts_credentials_uses_env_fallback(monkeypatch):
     assert resolution.credentials_source == "env_fallback"
 
 
-def test_validate_generation_job_logs_safe_tts_resolution(caplog, db_session):
+def test_validate_generation_job_logs_safe_tts_resolution(caplog, db_session, monkeypatch):
     storage = InMemoryStorageProvider()
     avatar_key = f"projects/{uuid.uuid4()}/avatar/avatar.png"
     storage.upload_file(avatar_key, b"avatar-bytes", "image/png")
@@ -800,7 +802,7 @@ def test_generate_avatar_clip_uses_audio_lipsync_flow(monkeypatch, db_session):
     assert asset.metadata_json["provider"] == "wavespeed"
     assert asset.metadata_json["wavespeed_request_id"] == "request-123"
     assert asset.metadata_json["source_audio_url"] == "https://wavespeed.test/uploaded-audio.mp3"
-    assert asset.metadata_json["chunks"][0]["text"] == "Narration text for talking photo"
+    assert asset.metadata_json["chunks"][0]["text"] == "Narration text for talking photo."
     assert asset.metadata_json["chunks"][0]["audio_url"] == "https://wavespeed.test/uploaded-audio.mp3"
     assert asset.metadata_json["chunks"][0]["measured_tts_duration"] == 5.0
     assert asset.metadata_json["ffprobe"]["has_video"] is True
@@ -871,6 +873,24 @@ def test_generate_avatar_clip_uses_fast_lipsync_base_video(monkeypatch, db_sessi
             size_bytes=len(b"avatar-bytes"),
         )
     )
+    base_video_asset = Asset(
+        organization_id=MOCK_ORG_ID,
+        project_id=project.id,
+        slide_id=None,
+        asset_type="avatar_base_video",
+        storage_key=f"projects/{project.id}/avatar/base/avatar-base.mp4",
+        filename="avatar-base.mp4",
+        mime_type="video/mp4",
+        size_bytes=len(b"base-video-bytes"),
+        duration_seconds=6.0,
+        metadata_json={
+            "avatar_base_video_source": "generated_real_avatar_base_video",
+            "avatar_base_video_is_real_motion": True,
+            "fallback_used": False,
+            "base_video_provider": "wavespeed_infinitetalk_fast",
+        },
+    )
+    db_session.add(base_video_asset)
     audio_asset = Asset(
         organization_id=MOCK_ORG_ID,
         project_id=project.id,

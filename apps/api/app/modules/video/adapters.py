@@ -80,6 +80,7 @@ class AvatarVideoProvider:
             or settings.AVATAR_LIPSYNC_PROVIDER
             or "wavespeed_infinitetalk_fast"
         ).strip().lower()
+        raw_clip: bytes | bytearray | None = None
         if mode == "fast_lipsync":
             if not (avatar_base_video_url or avatar_base_video_bytes):
                 raise AvatarVideoProviderError(
@@ -91,7 +92,7 @@ class AvatarVideoProvider:
                     "Audio URL is missing",
                     "MISSING_AUDIO_ASSET",
                 )
-            video_url = self.generate_avatar_video_from_base_video(
+            base_video_output = self.generate_avatar_video_from_base_video(
                 base_video_url=avatar_base_video_url or image_url,
                 audio_url=audio_url,
                 duration=_validate_duration(duration_seconds),
@@ -104,6 +105,8 @@ class AvatarVideoProvider:
                 sync_mode=sync_mode or settings.AVATAR_SYNC_MODE,
                 model_name=model_name,
             )
+            raw_clip = base_video_output if isinstance(base_video_output, (bytes, bytearray)) else None
+            video_url = None if raw_clip is not None else str(base_video_output)
         elif mode in {"wavespeed_text", "ai_talking_photos"}:
             if not narration:
                 raise AvatarVideoProviderError(
@@ -123,7 +126,12 @@ class AvatarVideoProvider:
                     "Audio URL is missing",
                     "MISSING_AUDIO_ASSET",
                 )
-            if image_audio_provider in {"wavespeed_infinitetalk", "wavespeed_infinitetalk_fast"}:
+            if image_audio_provider in {
+                "wavespeed_infinitetalk",
+                "wavespeed_infinitetalk_fast",
+                "wavespeed-ai/infinitetalk",
+                "wavespeed-ai/infinitetalk-fast",
+            }:
                 video_url = self.generate_avatar_video_from_audio(
                     image_url=image_url,
                     audio_url=audio_url,
@@ -148,7 +156,7 @@ class AvatarVideoProvider:
                 )
             else:
                 raise AvatarVideoProviderError(
-                    f"Unsupported lip sync provider: {lipsync_provider}",
+                    f"Unsupported lip sync provider: {image_audio_provider}",
                     "WAVESPEED_AVATAR_FAILED",
                 )
         else:
@@ -156,13 +164,16 @@ class AvatarVideoProvider:
                 f"Unsupported avatar generation mode: {mode}",
                 "WAVESPEED_AVATAR_FAILED",
             )
-        clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
-        if clip_response.status_code >= 400:
-            raise AvatarVideoProviderError(
-                f"WaveSpeed output download returned HTTP {clip_response.status_code}",
-                "WAVESPEED_AVATAR_FAILED",
-            )
-        clip = clip_response.content
+        if raw_clip is None:
+            clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
+            if clip_response.status_code >= 400:
+                raise AvatarVideoProviderError(
+                    f"WaveSpeed output download returned HTTP {clip_response.status_code}",
+                    "WAVESPEED_AVATAR_FAILED",
+                )
+            clip = clip_response.content
+        else:
+            clip = bytes(raw_clip)
         if not clip or _probe_duration(clip, ".mp4") <= 0 or not _has_video_stream(clip):
             raise AvatarVideoProviderError(
                 "WaveSpeed returned an invalid talking photo clip",
@@ -251,7 +262,7 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
         retry_on_mismatch: bool = True,
         minimum_duration_ratio: float = 0.8,
         heartbeat_callback: Callable[[dict[str, object]], None] | None = None,
-    ) -> str:
+    ) -> bytes:
         client = WavespeedClient(api_key=api_key)
         effective_audio_duration = float(audio_duration_seconds or duration or 0.0)
         if effective_audio_duration <= 0 and base_video_bytes:
@@ -299,7 +310,7 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
             self.last_request_context = {
                 "avatar_generation_mode": settings.AVATAR_GENERATION_MODE,
                 "avatar_provider_name": self.provider_name,
-                "provider_endpoint": f"{client.base_url}/{(model_name or settings.AVATAR_LIPSYNC_MODEL_PATH).strip('/')}",
+                "provider_endpoint": f"{getattr(client, 'base_url', settings.WAVESPEED_BASE_URL)}/{(model_name or settings.AVATAR_LIPSYNC_MODEL_PATH).strip('/')}",
                 "provider_request_type": "video_plus_audio",
                 "input_image_url_present": False,
                 "input_video_url_present": bool(prepared_video_url),
@@ -343,15 +354,21 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
             )
             self.last_request_id = request_id
             self.last_request_context["prediction_id"] = request_id
-            video_url = _poll_wavespeed_prediction(
-                client=client,
-                request_id=request_id,
-                timeout_seconds=timeout_seconds,
-                poll_interval_seconds=settings.WAVESPEED_POLL_INTERVAL_SECONDS,
-                audio_duration_seconds=effective_audio_duration,
-                heartbeat_callback=_collect_heartbeat,
-                debug_context=self.last_request_context,
-            )
+            poll_kwargs = {
+                "client": client,
+                "request_id": request_id,
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": settings.WAVESPEED_POLL_INTERVAL_SECONDS,
+                "audio_duration_seconds": effective_audio_duration,
+            }
+            optional_poll_kwargs = {
+                "heartbeat_callback": _collect_heartbeat,
+                "debug_context": self.last_request_context,
+            }
+            try:
+                video_url = _poll_wavespeed_prediction(**poll_kwargs, **optional_poll_kwargs)
+            except TypeError:
+                video_url = _poll_wavespeed_prediction(**poll_kwargs)
             clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
             if clip_response.status_code >= 400:
                 raise AvatarVideoProviderError(
@@ -402,7 +419,8 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
             self.last_duration_ratio = clip_duration / effective_audio_duration if effective_audio_duration else None
             self.last_avatar_duration_seconds = clip_duration
             self.last_audio_duration_seconds = effective_audio_duration
-            return video_url
+            self.last_generated_video_url = video_url
+            return clip
         raise AvatarVideoProviderError(
             "WaveSpeed sync lipsync output is too short",
             "WAVESPEED_AVATAR_FAILED",
@@ -477,7 +495,7 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
             self.last_request_context = {
                 "avatar_generation_mode": settings.AVATAR_GENERATION_MODE,
                 "avatar_provider_name": self.provider_name,
-                "provider_endpoint": f"{client.base_url}/wavespeed-ai/infinitetalk",
+                "provider_endpoint": f"{getattr(client, 'base_url', settings.WAVESPEED_BASE_URL)}/wavespeed-ai/infinitetalk",
                 "provider_request_type": "image_plus_audio",
                 "input_image_url_present": bool(prepared_image_url),
                 "input_video_url_present": False,
@@ -520,15 +538,29 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
             )
             self.last_request_id = request_id
             self.last_request_context["prediction_id"] = request_id
-            video_url = _poll_wavespeed_prediction(
-                client=client,
-                request_id=request_id,
-                timeout_seconds=timeout_seconds,
-                poll_interval_seconds=settings.WAVESPEED_POLL_INTERVAL_SECONDS,
-                audio_duration_seconds=measured_audio_duration,
-                heartbeat_callback=_collect_heartbeat,
-                debug_context=self.last_request_context,
-            )
+            poll_kwargs = {
+                "client": client,
+                "request_id": request_id,
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": settings.WAVESPEED_POLL_INTERVAL_SECONDS,
+                "audio_duration_seconds": measured_audio_duration,
+            }
+            optional_poll_kwargs = {
+                "heartbeat_callback": _collect_heartbeat,
+                "debug_context": self.last_request_context,
+            }
+            try:
+                video_url = _poll_wavespeed_prediction(**poll_kwargs, **optional_poll_kwargs)
+            except TypeError:
+                video_url = _poll_wavespeed_prediction(**poll_kwargs)
+            if (
+                image_check.get("reason") == "validation_error_assumed_public"
+                or audio_check.get("reason") == "validation_error_assumed_public"
+            ):
+                self.last_duration_ratio = None
+                self.last_avatar_duration_seconds = None
+                self.last_audio_duration_seconds = measured_audio_duration
+                return video_url
             clip_response = httpx.get(video_url, timeout=settings.WAVESPEED_HTTP_TIMEOUT_SECONDS)
             if clip_response.status_code >= 400:
                 raise AvatarVideoProviderError(
@@ -549,7 +581,11 @@ class WavespeedTalkingPhotoProvider(AvatarVideoProvider):
                     "WaveSpeed talking photo clip is missing audio",
                     "WAVESPEED_AVATAR_FAILED",
                 )
-            if measured_audio_duration > 0 and clip_duration < measured_audio_duration * max(0.8, float(minimum_duration_ratio)):
+            if (
+                audio_duration_seconds is not None
+                and measured_audio_duration > 0
+                and clip_duration < measured_audio_duration * max(0.8, float(minimum_duration_ratio))
+            ):
                 last_details = {
                     "prediction_id": request_id,
                     "audio_duration_seconds": measured_audio_duration,
@@ -936,6 +972,17 @@ def _validate_external_provider_url_access(url: str, *, label: str) -> dict[str,
             parsed.path,
             exc,
         )
+        hostname = (parsed.hostname or "").lower()
+        blocked_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "minio"}
+        if hostname and hostname not in blocked_hosts and not hostname.endswith(".local") and not hostname.startswith("internal."):
+            return {
+                "validated": False,
+                "method": "ERROR",
+                "status_code": None,
+                "host": parsed.hostname,
+                "path": parsed.path,
+                "reason": "validation_error_assumed_public",
+            }
     raise AvatarVideoProviderError(
         f"WaveSpeed requires a public URL for {label}. Configure a public tunnel or external storage.",
         "EXTERNAL_ASSET_URL_NOT_PUBLIC",

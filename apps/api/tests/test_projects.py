@@ -242,6 +242,84 @@ def test_patch_avatar_layout_saves_values(client, monkeypatch):
     assert body["height"] == 180
 
 
+def test_create_folder_and_subfolder_and_list_tree(client):
+    root = client.post(f"{BASE}/folders", json={"name": "Cursos"}).json()
+    child = client.post(
+        f"{BASE}/folders",
+        json={"name": "Matemáticas", "parent_folder_id": root["id"]},
+    ).json()
+
+    res = client.get(f"{BASE}/folders/tree")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["id"] == root["id"]
+    assert len(body["items"][0]["children"]) == 1
+    assert body["items"][0]["children"][0]["id"] == child["id"]
+
+
+def test_create_project_inside_folder_and_move_between_folders(client):
+    folder_a = client.post(f"{BASE}/folders", json={"name": "Semestre 1"}).json()
+    folder_b = client.post(f"{BASE}/folders", json={"name": "Semestre 2"}).json()
+    project = client.post(
+        f"{BASE}/",
+        json={"name": "Álgebra", "folder_id": folder_a["id"]},
+    ).json()
+    assert project["folder_id"] == folder_a["id"]
+
+    move = client.post(
+        f"{BASE}/{project['id']}/move",
+        json={"folder_id": folder_b["id"]},
+    )
+    assert move.status_code == 200
+    assert move.json()["folder_id"] == folder_b["id"]
+
+
+def test_rename_folder(client):
+    folder = client.post(f"{BASE}/folders", json={"name": "Viejo nombre"}).json()
+
+    res = client.patch(f"{BASE}/folders/{folder['id']}", json={"name": "Nuevo nombre"})
+
+    assert res.status_code == 200
+    assert res.json()["name"] == "Nuevo nombre"
+
+
+def test_delete_folder_requires_cascade_when_not_empty(client):
+    folder = client.post(f"{BASE}/folders", json={"name": "Curso"}).json()
+    client.post(
+        f"{BASE}/",
+        json={"name": "Proyecto en carpeta", "folder_id": folder["id"]},
+    )
+
+    res = client.delete(f"{BASE}/folders/{folder['id']}")
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "FOLDER_NOT_EMPTY"
+
+
+def test_delete_folder_cascade_preserves_projects(client):
+    root = client.post(f"{BASE}/folders", json={"name": "Programa"}).json()
+    child = client.post(
+        f"{BASE}/folders",
+        json={"name": "Unidad 1", "parent_folder_id": root["id"]},
+    ).json()
+    project = client.post(
+        f"{BASE}/",
+        json={"name": "Video unidad", "folder_id": child["id"]},
+    ).json()
+
+    delete_res = client.delete(f"{BASE}/folders/{root['id']}", params={"cascade": "true"})
+    assert delete_res.status_code == 204
+
+    project_res = client.get(f"{BASE}/{project['id']}")
+    assert project_res.status_code == 200
+    assert project_res.json()["folder_id"] is None
+
+    child_res = client.patch(f"{BASE}/folders/{child['id']}", json={"name": "No existe"})
+    assert child_res.status_code == 404
+
+
 def test_delete_avatar_clears_metadata(client, monkeypatch):
     storage = InMemoryStorageProvider()
     monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)

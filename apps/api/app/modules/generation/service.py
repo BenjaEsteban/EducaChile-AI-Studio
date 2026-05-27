@@ -401,14 +401,7 @@ class GenerationService:
                 f"Slides missing rendered preview image: {missing_previews}",
             )
 
-        project_config, settings, tts_resolution, wavespeed_key = self._resolve_validation_inputs(
-            project_id
-        )
-        if not (app_settings.WAVESPEED_API_KEY or "").strip():
-            raise GenerationReadinessError(
-                "MISSING_WAVESPEED_API_KEY",
-                "WAVESPEED_API_KEY is missing in worker environment",
-            )
+        project_config, settings, tts_resolution, wavespeed_key = self._resolve_validation_inputs(project_id)
         avatar_mode = (app_settings.AVATAR_GENERATION_MODE or "fast_lipsync").strip().lower()
         if tts_resolution.provider == "none" and not app_settings.ALLOW_DUMMY_TTS:
             raise GenerationReadinessError(
@@ -447,11 +440,13 @@ class GenerationService:
                 "MISSING_ELEVENLABS_API_KEY",
                 "Please configure ElevenLabs API key and voice ID in project settings before generating video.",
             )
-        if not _has_avatar_source(settings):
+        if not (wavespeed_key or "").strip():
             raise GenerationReadinessError(
-                "MISSING_AVATAR_ASSET",
-                "Please upload an avatar image before generating the video.",
-        )
+                "MISSING_WAVESPEED_API_KEY",
+                "WAVESPEED_API_KEY is missing in worker environment",
+            )
+        # Avatar presence is validated again inside the worker pipeline where
+        # debug/dev fallbacks can be applied with richer context.
 
     def _resolve_validation_inputs(
         self,

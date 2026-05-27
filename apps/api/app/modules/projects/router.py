@@ -6,10 +6,15 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.modules.projects.repository import ProjectRepository
 from app.modules.projects.schemas import (
+    FolderCreate,
+    FolderRead,
+    FolderRename,
+    FolderTreeRead,
     ProjectAvatarLayoutUpdate,
     ProjectAvatarRead,
     ProjectCreate,
     ProjectList,
+    ProjectMoveRequest,
     ProjectRead,
     ProjectUpdate,
 )
@@ -27,9 +32,10 @@ def get_service(db: Session = Depends(get_db)) -> ProjectService:
 def list_projects(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
+    folder_id: uuid.UUID | None = Query(default=None),
     service: ProjectService = Depends(get_service),
 ):
-    return service.list(skip=skip, limit=limit)
+    return service.list(skip=skip, limit=limit, folder_id=folder_id)
 
 
 @router.post("/", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
@@ -38,6 +44,37 @@ def create_project(
     service: ProjectService = Depends(get_service),
 ):
     return service.create(data)
+
+
+@router.get("/folders/tree", response_model=FolderTreeRead)
+def list_folder_tree(service: ProjectService = Depends(get_service)):
+    return service.list_folder_tree()
+
+
+@router.post("/folders", response_model=FolderRead, status_code=status.HTTP_201_CREATED)
+def create_folder(
+    data: FolderCreate,
+    service: ProjectService = Depends(get_service),
+):
+    return service.create_folder(data)
+
+
+@router.patch("/folders/{folder_id}", response_model=FolderRead)
+def rename_folder(
+    folder_id: uuid.UUID,
+    data: FolderRename,
+    service: ProjectService = Depends(get_service),
+):
+    return service.rename_folder(folder_id, data)
+
+
+@router.delete("/folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_folder(
+    folder_id: uuid.UUID,
+    cascade: bool = Query(default=False),
+    service: ProjectService = Depends(get_service),
+):
+    service.delete_folder(folder_id, cascade=cascade)
 
 
 @router.get("/{project_id}", response_model=ProjectRead)
@@ -55,6 +92,15 @@ def update_project(
     service: ProjectService = Depends(get_service),
 ):
     return service.update(project_id, data)
+
+
+@router.post("/{project_id}/move", response_model=ProjectRead)
+def move_project(
+    project_id: uuid.UUID,
+    data: ProjectMoveRequest,
+    service: ProjectService = Depends(get_service),
+):
+    return service.move_project(project_id, data)
 
 
 @router.post("/{project_id}/avatar", response_model=ProjectAvatarRead)

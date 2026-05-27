@@ -11,12 +11,14 @@ from app.modules.projects.models import AssetType, PresentationStatus, ProjectSt
 class ProjectCreate(BaseModel):
     name: str
     description: str | None = None
+    folder_id: uuid.UUID | None = None
 
 
 class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     status: ProjectStatus | None = None
+    folder_id: uuid.UUID | None = None
 
     @field_validator("name")
     @classmethod
@@ -32,6 +34,7 @@ class ProjectRead(BaseModel):
     id: uuid.UUID
     organization_id: uuid.UUID
     owner_id: uuid.UUID | None
+    folder_id: uuid.UUID | None
     name: str
     description: str | None
     status: ProjectStatus
@@ -44,6 +47,57 @@ class ProjectList(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class FolderCreate(BaseModel):
+    name: str
+    parent_folder_id: uuid.UUID | None = None
+
+    @field_validator("name")
+    @classmethod
+    def folder_name_not_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name cannot be empty")
+        return value.strip()
+
+
+class FolderRename(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def renamed_folder_name_not_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name cannot be empty")
+        return value.strip()
+
+
+class FolderRead(BaseModel):
+    model_config = {"from_attributes": True}
+
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    parent_folder_id: uuid.UUID | None
+    name: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class FolderTreeNode(BaseModel):
+    id: uuid.UUID
+    parent_folder_id: uuid.UUID | None
+    name: str
+    created_at: datetime
+    updated_at: datetime
+    children: list["FolderTreeNode"]
+
+
+class FolderTreeRead(BaseModel):
+    items: list[FolderTreeNode]
+
+
+class ProjectMoveRequest(BaseModel):
+    folder_id: uuid.UUID | None = None
 
 
 # ── Presentation ──────────────────────────────────────────────────────────────
@@ -189,3 +243,6 @@ class ProjectAvatarLayoutUpdate(BaseModel):
     y: float = Field(..., ge=0)
     width: float = Field(..., gt=0)
     height: float = Field(..., gt=0)
+
+
+FolderTreeNode.model_rebuild()

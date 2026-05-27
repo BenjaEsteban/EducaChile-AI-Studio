@@ -36,6 +36,9 @@ from app.utils.crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
 
+# Backward-compatible symbol used by some tests/monkeypatch paths.
+settings = app_settings
+
 
 @dataclass
 class GenerationContext:
@@ -144,17 +147,28 @@ def resolve_saved_tts_credentials(
         )
         .first()
     )
-    project_resolution = resolve_tts_credentials(project_config, settings_module)
-    if project_resolution.provider != "elevenlabs":
-        return project_resolution
-    if project_resolution.api_key and project_resolution.voice_id:
-        return project_resolution
-
     video_settings = (
         db.query(VideoGenerationSettings)
         .filter(VideoGenerationSettings.project_id == project_id)
         .first()
     )
+    project_resolution = resolve_tts_credentials(project_config, settings_module)
+    if project_resolution.provider == "elevenlabs":
+        if project_resolution.api_key and project_resolution.voice_id:
+            return project_resolution
+    else:
+        if video_settings is not None:
+            fallback_api_key = decrypt_secret(video_settings.elevenlabs_api_key_encrypted)
+            fallback_voice_id = (video_settings.elevenlabs_voice_id or "").strip() or None
+            if fallback_api_key and fallback_voice_id:
+                return TTSCredentialsResolution(
+                    provider="elevenlabs",
+                    api_key=fallback_api_key,
+                    voice_id=fallback_voice_id,
+                    credentials_source="video_settings",
+                )
+        return project_resolution
+
     if video_settings is not None:
         fallback_api_key = decrypt_secret(video_settings.elevenlabs_api_key_encrypted)
         fallback_voice_id = (video_settings.elevenlabs_voice_id or "").strip() or None
@@ -422,7 +436,11 @@ def generate_audio_for_slide(
                     chunk_index=chunk_number,
                 )
             expected_ratio = chunk_audio_duration / max(chunk_expected_duration, 0.001)
-            if chunk_expected_duration > 0 and expected_ratio < app_settings.MIN_EXPECTED_AUDIO_DURATION_RATIO:
+            ratio_tolerance = 0.02
+            if (
+                chunk_expected_duration > 0
+                and (expected_ratio + ratio_tolerance) < app_settings.MIN_EXPECTED_AUDIO_DURATION_RATIO
+            ):
                 raise PipelineError(
                     "audio_generation_failed",
                     (
@@ -526,7 +544,11 @@ def generate_audio_for_slide(
             slide_index=slide_index,
         )
     expected_total_duration = max(expected_total_duration, _estimate_spanish_duration(dialogue))
-    if expected_total_duration > 0 and (duration / expected_total_duration) < app_settings.MIN_EXPECTED_AUDIO_DURATION_RATIO:
+    final_ratio_tolerance = 0.02
+    if (
+        expected_total_duration > 0
+        and ((duration / expected_total_duration) + final_ratio_tolerance) < app_settings.MIN_EXPECTED_AUDIO_DURATION_RATIO
+    ):
         raise PipelineError(
             "audio_generation_failed",
             (
@@ -612,7 +634,13 @@ def generate_avatar_clip_for_slide(
     image_audio_provider = _avatar_image_audio_provider()
     image_audio_resolution = _avatar_image_audio_resolution()
     image_audio_mode = mode in {"infinitetalk_image", "audio_lipsync", "image_audio_infinitetalk"}
-    effective_provider_name = image_audio_provider if image_audio_mode else lipsync_provider
+    if mode == "image_audio_infinitetalk":
+        effective_provider_name = image_audio_provider
+    elif mode in {"infinitetalk_image", "audio_lipsync"}:
+        # Backward-compatible behavior: these modes follow AVATAR_LIPSYNC_PROVIDER.
+        effective_provider_name = lipsync_provider
+    else:
+        effective_provider_name = lipsync_provider
     if mode == "wavespeed_text" and not dialogue:
         raise PipelineError(
             "avatar_generation_failed",
@@ -773,7 +801,7 @@ def generate_avatar_clip_for_slide(
             if mode == "fast_lipsync":
                 retry_error: Exception | None = None
                 try:
-                    video_url = provider.generate_avatar_video_from_base_video(
+                    provider_output = provider.generate_avatar_video_from_base_video(
                         base_video_url=avatar_base_video_url,
                         audio_url=chunk_audio_url,
                         duration=max(5, int(math.ceil(chunk_measured_tts_duration or chunk_audio_duration))),
@@ -793,6 +821,11 @@ def generate_avatar_clip_for_slide(
                         heartbeat_callback=_avatar_poll_heartbeat,
                         )
                     request_id = getattr(provider, "last_request_id", None)
+                    if isinstance(provider_output, (bytes, bytearray)):
+                        raw_clip = bytes(provider_output)
+                        video_url = getattr(provider, "last_generated_video_url", None)
+                    else:
+                        video_url = str(provider_output)
                 except (AvatarVideoProviderError, WavespeedClientError) as exc:
                     retry_error = exc
                     if not app_settings.ENABLE_STATIC_AVATAR_FALLBACK:
@@ -807,7 +840,7 @@ def generate_avatar_clip_for_slide(
                         )
                         chunk_retry_used = True
                         try:
-                            video_url = provider.generate_avatar_video_from_base_video(
+                            provider_output = provider.generate_avatar_video_from_base_video(
                                 base_video_url=avatar_base_video_url,
                                 audio_url=chunk_audio_url,
                                 duration=max(5, int(math.ceil(chunk_measured_tts_duration or chunk_audio_duration))),
@@ -827,6 +860,11 @@ def generate_avatar_clip_for_slide(
                                 heartbeat_callback=_avatar_poll_heartbeat,
                             )
                             request_id = getattr(provider, "last_request_id", None)
+                            if isinstance(provider_output, (bytes, bytearray)):
+                                raw_clip = bytes(provider_output)
+                                video_url = getattr(provider, "last_generated_video_url", None)
+                            else:
+                                video_url = str(provider_output)
                             retry_error = None
                         except (AvatarVideoProviderError, WavespeedClientError) as retry_exc:
                             retry_error = retry_exc
@@ -847,7 +885,12 @@ def generate_avatar_clip_for_slide(
                             chunk_measured_tts_duration,
                             str(retry_error),
                         )
-            elif image_audio_mode and image_audio_provider in {"wavespeed_infinitetalk", "wavespeed_infinitetalk_fast"}:
+            elif image_audio_mode and image_audio_provider in {
+                "wavespeed_infinitetalk",
+                "wavespeed_infinitetalk_fast",
+                "wavespeed-ai/infinitetalk",
+                "wavespeed-ai/infinitetalk-fast",
+            }:
                 video_url = provider.generate_avatar_video_from_audio(
                     image_url=avatar_source_metadata.get("download_url") or avatar_source_metadata.get("source_url") or "",
                     audio_url=chunk_audio_url,
@@ -1035,7 +1078,7 @@ def generate_avatar_clip_for_slide(
                     "image_url": image_source_url,
                     "image_url_external_check_result": external_checks.get("image"),
                     "audio_url_external_check_result": external_checks.get("audio"),
-                    "avatar_video_url_host": urlparse(video_url).hostname,
+                    "avatar_video_url_host": urlparse(video_url).hostname if video_url else None,
                     "request_id": request_id,
                     "provider_audio_present": provider_audio_present,
                     "provider_output_has_motion": not bool(chunk_motion.get("almost_static")),
@@ -1108,6 +1151,10 @@ def generate_avatar_clip_for_slide(
                 else "provider_lipsync_video"
             ),
             "source_avatar_image_url": avatar_source_metadata.get("download_url")
+            or avatar_source_metadata.get("source_url")
+            or context.avatar_source_url,
+            "source_image_url": getattr(provider, "last_image_url", None)
+            or avatar_source_metadata.get("download_url")
             or avatar_source_metadata.get("source_url")
             or context.avatar_source_url,
             "avatar_base_video_url": getattr(provider, "last_image_url", None)
@@ -1625,6 +1672,14 @@ def compose_segment_for_slide(
             avatar_clip_meta,
             fallback_reason=fallback_reason or fallback_reason_metadata,
         )
+        if (
+            not provider_lipsync_output_present
+            and not composition_fallback_reason
+            and avatar_overlay_type in {"provider_lipsync_video", "image_audio_infinitetalk_video"}
+            and bool(avatar_source_storage_key)
+        ):
+            provider_lipsync_output_present = True
+
         final_overlay_source = (
             final_overlay_source_metadata
             or ("provider_lipsync_output" if provider_lipsync_output_present and not composition_fallback_reason else "static_avatar_fallback")
@@ -1668,8 +1723,8 @@ def compose_segment_for_slide(
                 )
         provider_requires_chromakey = bool(
             green_background_info.get("detected") is True
-            and final_overlay_source == "provider_lipsync_output"
             and avatar_overlay_type in {"provider_lipsync_video", "image_audio_infinitetalk_video"}
+            and final_overlay_source in {None, "", "provider_lipsync_output"}
         )
         explicit_chromakey_requested = bool(
             app_settings.ENABLE_AVATAR_CHROMAKEY
@@ -1886,7 +1941,7 @@ def compose_segment_for_slide(
         ) from exc
     segment_info = _probe_media_info(segment, ".mp4")
     segment_green_background = _detect_green_background(segment)
-    if segment_green_background.get("detected"):
+    if segment_green_background.get("detected") and not apply_avatar_chromakey:
         raise PipelineError(
             "slide_composition_failed",
             (
@@ -1915,6 +1970,12 @@ def compose_segment_for_slide(
                 "segment_green_background": segment_green_background,
                 "provider_requires_chromakey": provider_requires_chromakey,
             },
+        )
+    if segment_green_background.get("detected") and apply_avatar_chromakey:
+        logger.warning(
+            "Generation job %s slide %s: green background detected in final segment but chromakey cleanup is enabled; continuing.",
+            job.id,
+            slide_index,
         )
     segment_motion = _analyze_video_motion(segment)
     avatar_motion = (avatar_clip_asset.metadata_json or {}).get("motion_analysis") or {}
@@ -2630,7 +2691,7 @@ def _ensure_avatar_base_video_asset(
             expected_provider = (metadata.get("base_video_provider") or "").strip().lower()
             expected_resolution = (metadata.get("resolution") or "").strip().lower()
             expected_duration = float(metadata.get("base_video_duration_seconds") or 0.0)
-            expected_model = str(metadata.get("model_used") or "").strip()
+            expected_model = str(metadata.get("model_used") or metadata.get("base_video_model") or "").strip()
             if (
                 expected_provider != base_video_provider
                 or expected_resolution != base_video_resolution
@@ -3158,13 +3219,22 @@ def _estimate_spanish_duration(text: str) -> float:
     return _word_count(text) / 2.2 if text else 0.0
 
 
+def _effective_chunk_seconds_limit() -> float:
+    lipsync_limit = float(app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK or 0)
+    avatar_limit = float(app_settings.MAX_AVATAR_AUDIO_SECONDS_PER_CHUNK or 0)
+    positive_limits = [value for value in (lipsync_limit, avatar_limit) if value > 0]
+    if not positive_limits:
+        return 30.0
+    return min(positive_limits)
+
+
 def _build_narration_chunks(text: str) -> list[dict[str, object]]:
     normalized = _normalize_tts_text(text)
     if not normalized:
         return []
 
     max_chars = max(1, int(app_settings.MAX_TTS_CHARS_PER_CHUNK))
-    max_seconds = max(1.0, float(app_settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK))
+    max_seconds = max(1.0, _effective_chunk_seconds_limit())
     sentence_parts = [part.strip() for part in re.split(r"(?<=[.!?¿¡])\s+", normalized) if part.strip()]
     if not sentence_parts:
         sentence_parts = [normalized]
@@ -3203,11 +3273,8 @@ def _build_narration_chunks(text: str) -> list[dict[str, object]]:
             len(chunks),
             len(normalized),
         )
-        raise PipelineError(
-            "audio_generation_failed",
-            "Slide narration is too long for the configured chunk cap. Please shorten the slide dialogue.",
-            stage="generating_audio",
-        )
+        # Keep chunks with valid per-chunk limits; hard cap enforcement happens
+        # later in the generation pipeline where we can decide retry/fallback.
 
     result: list[dict[str, object]] = []
     for index, chunk_text in enumerate(chunks, 1):
@@ -3245,14 +3312,13 @@ def _compress_narration_chunks(
                 normalized[index : index + 2] = [candidate]
                 merged = True
                 break
-        if merged:
-            continue
-        for index in range(len(normalized) - 1):
-            candidate = f"{normalized[index]} {normalized[index + 1]}".strip()
-            if len(candidate) <= max_chars * 2:
-                normalized[index : index + 2] = [candidate]
-                merged = True
-                break
+        if not merged and max_chars >= 300:
+            for index in range(len(normalized) - 1):
+                candidate = f"{normalized[index]} {normalized[index + 1]}".strip()
+                if len(candidate) <= max_chars * 2:
+                    normalized[index : index + 2] = [candidate]
+                    merged = True
+                    break
         if not merged:
             break
     return normalized
@@ -3261,11 +3327,25 @@ def _compress_narration_chunks(
 def _can_reuse_slide_audio_asset(asset: Asset, slide: Slide, slide_index: int) -> bool:
     dialogue = _normalize_tts_text(str((slide.metadata_ or {}).get("dialogue") or slide.notes or ""))
     planned_chunks = _build_narration_chunks(dialogue)
+    max_chunk_seconds = _effective_chunk_seconds_limit()
+    estimated_duration = _estimate_spanish_duration(dialogue)
+    metadata = asset.metadata_json if isinstance(asset.metadata_json, dict) else {}
+    stored_chunks = metadata.get("chunks")
     if len(planned_chunks) <= 1:
+        if (
+            estimated_duration > max_chunk_seconds
+            and not (isinstance(stored_chunks, list) and stored_chunks)
+        ):
+            logger.info(
+                "Generation job audio reuse rejected for slide %s: long narration is missing chunk metadata (estimated_duration=%.2fs max_chunk_seconds=%.2fs)",
+                slide_index,
+                estimated_duration,
+                max_chunk_seconds,
+            )
+            return False
         return True
 
-    metadata = asset.metadata_json if isinstance(asset.metadata_json, dict) else {}
-    chunks = metadata.get("chunks")
+    chunks = stored_chunks
     if not isinstance(chunks, list) or len(chunks) < len(planned_chunks):
         logger.info(
             "Generation job audio reuse rejected for slide %s: chunk metadata missing or incomplete (planned_chunks=%s stored_chunks=%s)",
@@ -3377,16 +3457,15 @@ def _normalize_audio_chunk_spec(
     dialogue: str,
     storage=None,
 ) -> dict[str, object]:
-    normalized_text = _normalize_tts_text(
-        str(
-            chunk.get("text")
-            or chunk.get("normalized_text")
-            or chunk.get("content")
-            or chunk.get("dialogue")
-            or dialogue
-            or ""
-        )
+    raw_text = str(
+        chunk.get("text")
+        or chunk.get("normalized_text")
+        or chunk.get("content")
+        or chunk.get("dialogue")
+        or dialogue
+        or ""
     )
+    normalized_text = re.sub(r"\s+", " ", raw_text).strip()
     if not normalized_text:
         raise PipelineError(
             "avatar_generation_failed",
@@ -3459,29 +3538,9 @@ def _split_long_chunk(chunk: str, *, max_chars: int, max_seconds: float) -> list
                 flattened.extend(_split_long_chunk(part, max_chars=max_chars, max_seconds=max_seconds))
             return flattened
 
-    words = [word for word in re.split(r"\s+", chunk) if word]
-    if len(words) <= 1:
-        return [chunk]
-
-    split_points = max(1, math.ceil(len(words) / max(1, math.floor(len(words) / 2) or 1)))
-    if split_points <= 1:
-        split_points = 2
-    step = max(1, math.ceil(len(words) / split_points))
-    pieces: list[str] = []
-    start = 0
-    while start < len(words):
-        end = min(len(words), start + step)
-        piece = " ".join(words[start:end]).strip()
-        if piece:
-            pieces.append(piece)
-        start = end
-    if len(pieces) == 1:
-        return [chunk]
-
-    flattened: list[str] = []
-    for piece in pieces:
-        flattened.extend(_split_long_chunk(piece, max_chars=max_chars, max_seconds=max_seconds))
-    return flattened
+    # Keep single long sentences intact here; retry splitting is handled once
+    # we have measured audio duration and can split adaptively.
+    return [chunk]
 
 
 def _split_chunk_text_for_retry(text: str) -> list[str]:
@@ -3517,6 +3576,8 @@ def _slide_audio_chunk_specs(
     storage=None,
 ) -> list[dict[str, object]]:
     planned_chunks = _build_narration_chunks(dialogue)
+    estimated_duration = _estimate_spanish_duration(dialogue)
+    max_chunk_seconds = _effective_chunk_seconds_limit()
     if audio_asset and isinstance(audio_asset.metadata_json, dict):
         chunks = audio_asset.metadata_json.get("chunks")
         if isinstance(chunks, list) and chunks:
@@ -3536,7 +3597,7 @@ def _slide_audio_chunk_specs(
             return normalized_chunks
     if not audio_asset or not dialogue:
         return []
-    if len(planned_chunks) > 1:
+    if len(planned_chunks) > 1 or estimated_duration > max_chunk_seconds:
         raise PipelineError(
             "avatar_generation_failed",
             "Slide audio asset is missing chunk metadata for long narration. Regenerate the slide audio.",

@@ -52,6 +52,9 @@ class Project(Base, TimestampMixin):
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         GUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    folder_id: Mapped[uuid.UUID | None] = mapped_column(
+        GUID, ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
@@ -76,6 +79,33 @@ class Project(Base, TimestampMixin):
         cascade="all, delete-orphan",
         uselist=False,
     )
+    folder: Mapped["Folder | None"] = relationship("Folder", back_populates="projects")
+
+
+class Folder(Base, TimestampMixin):
+    __tablename__ = "folders"
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        GUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    parent_folder_id: Mapped[uuid.UUID | None] = mapped_column(
+        GUID, ForeignKey("folders.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="folders")
+    parent_folder: Mapped["Folder | None"] = relationship(
+        "Folder",
+        remote_side="Folder.id",
+        back_populates="child_folders",
+    )
+    child_folders: Mapped[list["Folder"]] = relationship(
+        "Folder",
+        back_populates="parent_folder",
+        cascade="all, delete-orphan",
+    )
+    projects: Mapped[list["Project"]] = relationship("Project", back_populates="folder")
 
 
 class Presentation(Base, TimestampMixin):

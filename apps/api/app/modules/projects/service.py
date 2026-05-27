@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 import json
 import logging
@@ -8,9 +10,18 @@ from pathlib import Path
 from fastapi import HTTPException, UploadFile, status
 
 from app.modules.generation.models import VideoGenerationSettings
-from app.modules.projects.models import Asset, Project
+from app.modules.projects.models import Asset, Folder, Project
 from app.modules.projects.repository import ProjectRepository
-from app.modules.projects.schemas import ProjectCreate, ProjectList, ProjectUpdate
+from app.modules.projects.schemas import (
+    FolderCreate,
+    FolderRename,
+    FolderTreeNode,
+    FolderTreeRead,
+    ProjectCreate,
+    ProjectList,
+    ProjectMoveRequest,
+    ProjectUpdate,
+)
 from app.providers.storage import get_storage
 
 logger = logging.getLogger(__name__)
@@ -33,9 +44,16 @@ class ProjectService:
     def __init__(self, repo: ProjectRepository) -> None:
         self.repo = repo
 
-    def list(self, skip: int = 0, limit: int = 50) -> ProjectList:
-        items = self.repo.list_by_org(MOCK_ORG_ID, skip=skip, limit=limit)
-        total = self.repo.count_by_org(MOCK_ORG_ID)
+    def list(
+        self,
+        skip: int = 0,
+        limit: int = 50,
+        folder_id: uuid.UUID | None = None,
+    ) -> ProjectList:
+        if folder_id is not None:
+            self._get_folder_or_404(folder_id)
+        items = self.repo.list_by_org(MOCK_ORG_ID, skip=skip, limit=limit, folder_id=folder_id)
+        total = self.repo.count_by_org(MOCK_ORG_ID, folder_id=folder_id)
         return ProjectList(items=items, total=total, skip=skip, limit=limit)
 
     def get_or_404(self, project_id: uuid.UUID) -> Project:
@@ -47,11 +65,14 @@ class ProjectService:
         return project
 
     def create(self, data: ProjectCreate) -> Project:
+        if data.folder_id is not None:
+            self._get_folder_or_404(data.folder_id)
         project = Project(
             organization_id=MOCK_ORG_ID,
             owner_id=MOCK_USER_ID,
             name=data.name,
             description=data.description,
+            folder_id=data.folder_id,
         )
         return self.repo.create(project)
 
@@ -59,12 +80,95 @@ class ProjectService:
         project = self.get_or_404(project_id)
         # Solo actualiza los campos explícitamente enviados (exclude_unset)
         for field, value in data.model_dump(exclude_unset=True).items():
+            if field == "folder_id" and value is not None:
+                self._get_folder_or_404(value)
             setattr(project, field, value)
         return self.repo.save(project)
 
     def delete(self, project_id: uuid.UUID) -> None:
         project = self.get_or_404(project_id)
         self.repo.delete(project)
+
+    def move_project(self, project_id: uuid.UUID, data: ProjectMoveRequest) -> Project:
+        project = self.get_or_404(project_id)
+        if data.folder_id is not None:
+            self._get_folder_or_404(data.folder_id)
+        project.folder_id = data.folder_id
+        return self.repo.save(project)
+
+    def list_folder_tree(self) -> FolderTreeRead:
+        folders = self.repo.list_folders_by_org(MOCK_ORG_ID)
+        nodes: dict[uuid.UUID, FolderTreeNode] = {}
+        for folder in folders:
+            nodes[folder.id] = FolderTreeNode(
+                id=folder.id,
+                parent_folder_id=folder.parent_folder_id,
+                name=folder.name,
+                created_at=folder.created_at,
+                updated_at=folder.updated_at,
+                children=[],
+            )
+        roots: list[FolderTreeNode] = []
+        for folder in folders:
+            node = nodes[folder.id]
+            if folder.parent_folder_id and folder.parent_folder_id in nodes:
+                nodes[folder.parent_folder_id].children.append(node)
+            else:
+                roots.append(node)
+        return FolderTreeRead(items=roots)
+
+    def create_folder(self, data: FolderCreate) -> Folder:
+        parent_id = data.parent_folder_id
+        if parent_id is not None:
+            self._get_folder_or_404(parent_id)
+        self._ensure_unique_folder_name(data.name, parent_id)
+        folder = Folder(
+            organization_id=MOCK_ORG_ID,
+            parent_folder_id=parent_id,
+            name=data.name.strip(),
+        )
+        self.repo.db.add(folder)
+        self.repo.db.commit()
+        self.repo.db.refresh(folder)
+        return folder
+
+    def rename_folder(self, folder_id: uuid.UUID, data: FolderRename) -> Folder:
+        folder = self._get_folder_or_404(folder_id)
+        self._ensure_unique_folder_name(data.name, folder.parent_folder_id, exclude_id=folder.id)
+        folder.name = data.name.strip()
+        self.repo.db.add(folder)
+        self.repo.db.commit()
+        self.repo.db.refresh(folder)
+        return folder
+
+    def delete_folder(self, folder_id: uuid.UUID, cascade: bool = False) -> None:
+        folder = self._get_folder_or_404(folder_id)
+        folder_ids = self._folder_subtree_ids(folder.id)
+        has_subfolders = len(folder_ids) > 1
+        has_projects = (
+            self.repo.db.query(Project)
+            .filter(
+                Project.organization_id == MOCK_ORG_ID,
+                Project.folder_id.in_(folder_ids),
+            )
+            .count()
+            > 0
+        )
+        if not cascade and (has_subfolders or has_projects):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "FOLDER_NOT_EMPTY",
+                    "message": "Folder contains subfolders or projects. Retry with cascade=true to delete safely.",
+                },
+            )
+
+        self.repo.db.query(Project).filter(
+            Project.organization_id == MOCK_ORG_ID,
+            Project.folder_id.in_(folder_ids),
+        ).update({Project.folder_id: None}, synchronize_session=False)
+        self.repo.db.delete(folder)
+        self.repo.db.commit()
 
     async def upload_avatar(self, project_id: uuid.UUID, file: UploadFile) -> Asset:
         project = self.get_or_404(project_id)
@@ -237,6 +341,60 @@ class ProjectService:
             settings.avatar_source_asset_id = None
         self.repo.db.delete(asset)
         self.repo.db.commit()
+
+    def _get_folder_or_404(self, folder_id: uuid.UUID) -> Folder:
+        folder = self.repo.get_folder_by_id(folder_id, MOCK_ORG_ID)
+        if folder is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Folder not found",
+            )
+        return folder
+
+    def _folder_subtree_ids(self, root_folder_id: uuid.UUID) -> list[uuid.UUID]:
+        folders = self.repo.list_folders_by_org(MOCK_ORG_ID)
+        children_map: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for folder in folders:
+            if folder.parent_folder_id is None:
+                continue
+            children_map.setdefault(folder.parent_folder_id, []).append(folder.id)
+
+        collected: list[uuid.UUID] = []
+        stack = [root_folder_id]
+        seen: set[uuid.UUID] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            collected.append(current)
+            stack.extend(children_map.get(current, []))
+        return collected
+
+    def _ensure_unique_folder_name(
+        self,
+        name: str,
+        parent_folder_id: uuid.UUID | None,
+        *,
+        exclude_id: uuid.UUID | None = None,
+    ) -> None:
+        normalized = name.strip().lower()
+        query = self.repo.db.query(Folder).filter(Folder.organization_id == MOCK_ORG_ID)
+        if parent_folder_id is None:
+            query = query.filter(Folder.parent_folder_id.is_(None))
+        else:
+            query = query.filter(Folder.parent_folder_id == parent_folder_id)
+        if exclude_id is not None:
+            query = query.filter(Folder.id != exclude_id)
+        siblings = query.all()
+        if any(folder.name.strip().lower() == normalized for folder in siblings):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "FOLDER_NAME_CONFLICT",
+                    "message": "A folder with this name already exists at this level.",
+                },
+            )
 
 
 def _extension_for_mime_type(mime_type: str) -> str:

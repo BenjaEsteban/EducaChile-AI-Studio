@@ -10,6 +10,7 @@ from app.modules.jobs.models import Job
 from app.modules.organizations.models import Organization, OrganizationMember
 from app.modules.projects.models import (
     Asset,
+    Folder,
     GenerationConfig,
     Presentation,
     Project,
@@ -21,6 +22,7 @@ from app.modules.users.models import User
 
 __all__ = [
     "Asset",
+    "Folder",
     "GenerationConfig",
     "GenerationJob",
     "Job",

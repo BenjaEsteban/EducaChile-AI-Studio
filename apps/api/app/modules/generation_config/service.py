@@ -160,5 +160,12 @@ def _resolve_debug_credentials_source(
     db,
     project_id: uuid.UUID,
 ) -> str:
-    resolution = resolve_saved_tts_credentials(db, project_id, MOCK_ORG_ID, app_settings)
+    # Debug should reflect saved project/video-settings credentials without silently
+    # falling back to process env secrets.
+    class _DebugSettings:
+        TTS_PROVIDER = app_settings.TTS_PROVIDER
+        ELEVENLABS_API_KEY = None
+        ELEVENLABS_VOICE_ID = None
+
+    resolution = resolve_saved_tts_credentials(db, project_id, MOCK_ORG_ID, _DebugSettings)
     return resolution.credentials_source
