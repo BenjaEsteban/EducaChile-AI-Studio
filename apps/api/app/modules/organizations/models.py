@@ -26,6 +26,9 @@ class Organization(Base, TimestampMixin):
     projects: Mapped[list["Project"]] = relationship(  # noqa: F821
         "Project", back_populates="organization", cascade="all, delete-orphan"
     )
+    folders: Mapped[list["Folder"]] = relationship(  # noqa: F821
+        "Folder", back_populates="organization", cascade="all, delete-orphan"
+    )
 
 
 class OrganizationMember(Base, TimestampMixin):

@@ -2,7 +2,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.modules.projects.models import Asset, Presentation, Project
+from app.modules.projects.models import Asset, Folder, Presentation, Project
 
 
 class ProjectRepository:
@@ -17,19 +17,22 @@ class ProjectRepository:
         )
 
     def list_by_org(
-        self, org_id: uuid.UUID, skip: int = 0, limit: int = 50
+        self,
+        org_id: uuid.UUID,
+        skip: int = 0,
+        limit: int = 50,
+        folder_id: uuid.UUID | None = None,
     ) -> list[Project]:
-        return (
-            self.db.query(Project)
-            .filter(Project.organization_id == org_id)
-            .order_by(Project.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-            .all()
-        )
+        query = self.db.query(Project).filter(Project.organization_id == org_id)
+        if folder_id is not None:
+            query = query.filter(Project.folder_id == folder_id)
+        return query.order_by(Project.created_at.desc()).offset(skip).limit(limit).all()
 
-    def count_by_org(self, org_id: uuid.UUID) -> int:
-        return self.db.query(Project).filter(Project.organization_id == org_id).count()
+    def count_by_org(self, org_id: uuid.UUID, folder_id: uuid.UUID | None = None) -> int:
+        query = self.db.query(Project).filter(Project.organization_id == org_id)
+        if folder_id is not None:
+            query = query.filter(Project.folder_id == folder_id)
+        return query.count()
 
     def create(self, project: Project) -> Project:
         self.db.add(project)
@@ -45,6 +48,21 @@ class ProjectRepository:
     def delete(self, project: Project) -> None:
         self.db.delete(project)
         self.db.commit()
+
+    def get_folder_by_id(self, folder_id: uuid.UUID, org_id: uuid.UUID) -> Folder | None:
+        return (
+            self.db.query(Folder)
+            .filter(Folder.id == folder_id, Folder.organization_id == org_id)
+            .first()
+        )
+
+    def list_folders_by_org(self, org_id: uuid.UUID) -> list[Folder]:
+        return (
+            self.db.query(Folder)
+            .filter(Folder.organization_id == org_id)
+            .order_by(Folder.created_at.asc())
+            .all()
+        )
 
 
 class PresentationRepository:

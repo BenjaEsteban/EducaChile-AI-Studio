@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,9 +8,19 @@ from fastapi.middleware.cors import CORSMiddleware
 import app.models  # noqa: F401
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    parsed = urlparse(settings.DATABASE_URL)
+    logger.info(
+        "API startup: encryption_key_present=%s encryption_key_length=%s database_host=%s database_name=%s",
+        bool(settings.ENCRYPTION_KEY),
+        len(settings.ENCRYPTION_KEY or ""),
+        parsed.hostname,
+        (parsed.path or "").lstrip("/") or None,
+    )
     if settings.APP_ENV == "development" and settings.ENABLE_DEV_SEED:
         from app.dev_seed import run_dev_seed
 

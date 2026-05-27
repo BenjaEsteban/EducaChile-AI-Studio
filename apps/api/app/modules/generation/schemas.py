@@ -93,3 +93,4 @@ class GenerationStatusRead(BaseModel):
     error_code: str | None
     error_message: str | None
     final_video_url: str | None
+    updated_at: datetime | None = None

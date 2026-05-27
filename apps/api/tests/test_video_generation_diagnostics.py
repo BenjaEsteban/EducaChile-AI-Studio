@@ -11,6 +11,7 @@ from app.modules.video.adapters import WavespeedAvatarVideoProvider
 from app.modules.generation.pipeline import (
     PipelineError,
     _analyze_video_motion,
+    _probe_media_info,
     _load_slide_preview_image,
 )
 from app.workers.tasks import GenerateVideoTask
@@ -167,6 +168,32 @@ def test_slide_preview_loader_rejects_background_only_source():
         assert "full rendered PPT preview" in exc.message
     else:
         raise AssertionError("background-only slide source should not be used")
+
+
+def test_probe_media_info_counts_audio_streams(monkeypatch):
+    class FakeResult:
+        stdout = """
+        {
+          "format": {"duration": "7.5"},
+          "streams": [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720},
+            {"codec_type": "audio", "codec_name": "aac"},
+            {"codec_type": "audio", "codec_name": "aac"}
+          ]
+        }
+        """
+
+    def fake_run(*_args, **_kwargs):
+        return FakeResult()
+
+    monkeypatch.setattr("app.modules.generation.pipeline.subprocess.run", fake_run)
+
+    info = _probe_media_info(b"video-bytes", ".mp4")
+
+    assert info["has_video"] is True
+    assert info["has_audio"] is True
+    assert info["audio_stream_count"] == 2
+    assert info["video_stream_count"] == 1
 
 
 def test_generate_video_soft_time_limit_marks_generation_failed(monkeypatch):

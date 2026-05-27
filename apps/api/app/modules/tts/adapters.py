@@ -1,9 +1,14 @@
 import math
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
 
 import httpx
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class TTSProviderError(RuntimeError):
@@ -23,10 +28,11 @@ class TTSProvider:
         text: str,
         voice_id: str | None,
         language: str,
+        speed: float = 1.0,
         api_key: str | None = None,
     ) -> tuple[bytes, float]:
         word_count = max(1, len(text.split()))
-        duration = max(1.5, min(20.0, math.ceil(word_count / 2.5)))
+        duration = max(1.5, math.ceil(word_count / 2.2))
         return _silent_wav(duration), duration
 
 
@@ -42,6 +48,7 @@ class ElevenLabsTTSProvider(TTSProvider):
         text: str,
         voice_id: str | None,
         language: str,
+        speed: float = 1.0,
         api_key: str | None = None,
     ) -> tuple[bytes, float]:
         if not api_key:
@@ -55,6 +62,13 @@ class ElevenLabsTTSProvider(TTSProvider):
                 "MISSING_ELEVENLABS_VOICE_ID",
             )
 
+        payload: dict[str, object] = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+        }
+        if speed and abs(speed - 1.0) > 0.001:
+            payload["speed"] = speed
+
         response = httpx.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
             params={"output_format": "mp3_44100_128"},
@@ -63,10 +77,7 @@ class ElevenLabsTTSProvider(TTSProvider):
                 "Content-Type": "application/json",
                 "Accept": "audio/mpeg",
             },
-            json={
-                "text": text,
-                "model_id": "eleven_multilingual_v2",
-            },
+            json=payload,
             timeout=90,
         )
         if response.status_code in {401, 403}:
@@ -91,8 +102,16 @@ class ElevenLabsTTSProvider(TTSProvider):
 
 
 def get_tts_provider(provider_name: str) -> TTSProvider:
-    if provider_name == "elevenlabs":
+    normalized = (provider_name or "none").strip().lower()
+    if normalized == "elevenlabs":
         return ElevenLabsTTSProvider()
+    if normalized == "none":
+        if not settings.ALLOW_DUMMY_TTS:
+            raise TTSProviderError(
+                "TTS_PROVIDER=none is disabled. Configure a real TTS provider or set ALLOW_DUMMY_TTS=true for local development.",
+                "TTS_PROVIDER_NOT_CONFIGURED",
+            )
+        logger.warning("Using dummy TTS provider because ALLOW_DUMMY_TTS=true")
     return GeminiTTSProvider()
 
 

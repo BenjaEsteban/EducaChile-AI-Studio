@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.modules.generation_config.repository import ProjectGenerationConfigRepository
 from app.modules.generation_config.schemas import (
+    ProjectGenerationConfigDebugRead,
     ProjectGenerationConfigRead,
     ProjectGenerationConfigUpdate,
 )
@@ -33,3 +34,11 @@ def upsert_generation_config(
     service: ProjectGenerationConfigService = Depends(get_service),
 ):
     return service.upsert(project_id, data)
+
+
+@router.get("/{project_id}/generation-config/debug", response_model=ProjectGenerationConfigDebugRead)
+def debug_generation_config(
+    project_id: uuid.UUID,
+    service: ProjectGenerationConfigService = Depends(get_service),
+):
+    return service.debug(project_id)

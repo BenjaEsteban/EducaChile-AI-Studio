@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ipaddress
 import logging
 import uuid
@@ -9,6 +11,7 @@ from fastapi import HTTPException, status
 from app.config import settings as app_settings
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.repository import GenerationRepository
+from app.modules.generation.pipeline import resolve_saved_tts_credentials
 from app.modules.generation.schemas import (
     FinalVideoRead,
     GenerationJobRead,
@@ -203,6 +206,7 @@ class GenerationService:
             error_code=generation_job.error_code,
             error_message=generation_job.error_message,
             final_video_url=final_video_url,
+            updated_at=generation_job.updated_at,
         )
 
     def final_video(self, project_id: uuid.UUID) -> FinalVideoRead:
@@ -242,6 +246,7 @@ class GenerationService:
             raise HTTPException(status_code=404, detail="Project not found")
 
         settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
+        created = settings is None
         if settings is None:
             settings = VideoGenerationSettings(
                 organization_id=MOCK_ORG_ID,
@@ -249,14 +254,20 @@ class GenerationService:
                 validation_status="not_configured",
             )
 
+        elevenlabs_received_real, elevenlabs_received_masked = _secret_input_flags(
+            data.elevenlabs_api_key
+        )
         elevenlabs_key = (data.elevenlabs_api_key or "").strip()
-        if elevenlabs_key:
+        if _should_replace_secret(data.elevenlabs_api_key):
             settings.elevenlabs_api_key_encrypted = encrypt_secret(elevenlabs_key)
             settings.elevenlabs_api_key_last_four = elevenlabs_key[-4:]
             settings.elevenlabs_valid = False
 
+        wavespeed_received_real, wavespeed_received_masked = _secret_input_flags(
+            data.wavespeed_api_key
+        )
         wavespeed_key = (data.wavespeed_api_key or "").strip()
-        if wavespeed_key:
+        if _should_replace_secret(data.wavespeed_api_key):
             settings.wavespeed_api_key_encrypted = encrypt_secret(wavespeed_key)
             settings.wavespeed_api_key_last_four = wavespeed_key[-4:]
             settings.wavespeed_valid = False
@@ -280,32 +291,73 @@ class GenerationService:
             )
             else "not_configured"
         )
-        return self._settings_read(self.repo.save_video_settings(settings))
+        saved = self.repo.save_video_settings(settings)
+        logger.info(
+            "Project video settings saved: project_id=%s organization_id=%s "
+            "project_config_created_or_updated=%s elevenlabs_api_key_received_real_value=%s "
+            "elevenlabs_api_key_received_masked_value=%s elevenlabs_api_key_encrypted_present_after_save=%s "
+            "elevenlabs_voice_id_present_after_save=%s wavespeed_api_key_received_real_value=%s "
+            "wavespeed_api_key_received_masked_value=%s wavespeed_api_key_encrypted_present_after_save=%s",
+            project_id,
+            MOCK_ORG_ID,
+            "created" if created else "updated",
+            elevenlabs_received_real,
+            elevenlabs_received_masked,
+            bool(saved.elevenlabs_api_key_encrypted),
+            bool(saved.elevenlabs_voice_id),
+            wavespeed_received_real,
+            wavespeed_received_masked,
+            bool(saved.wavespeed_api_key_encrypted),
+        )
+        return self._settings_read(saved)
 
     def validate_video_settings(self, project_id: uuid.UUID) -> VideoSettingsValidationRead:
-        settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
-        if settings is None:
-            if not app_settings.WAVESPEED_API_KEY:
-                raise GenerationReadinessError(
-                    "VIDEO_SETTINGS_NOT_CONFIGURED",
-                    "Video settings must be saved before validation",
-                )
-            settings = VideoGenerationSettings(
-                organization_id=MOCK_ORG_ID,
-                project_id=project_id,
-                validation_status="valid",
-                wavespeed_valid=True,
-                elevenlabs_valid=True,
-            )
-
-        elevenlabs_key = decrypt_secret(settings.elevenlabs_api_key_encrypted)
-        wavespeed_key = decrypt_secret(settings.wavespeed_api_key_encrypted) or app_settings.WAVESPEED_API_KEY
-        elevenlabs_configured = bool(settings.elevenlabs_api_key_encrypted or settings.elevenlabs_voice_id)
-        settings.elevenlabs_valid = (
-            _is_valid_key(elevenlabs_key) and bool(settings.elevenlabs_voice_id)
-            if elevenlabs_configured
-            else True
+        project_config, settings, tts_resolution, wavespeed_key = self._resolve_validation_inputs(
+            project_id
         )
+        elevenlabs_key = tts_resolution.api_key or decrypt_secret(settings.elevenlabs_api_key_encrypted)
+        tts_provider = tts_resolution.provider or (app_settings.TTS_PROVIDER or "none").strip().lower()
+        avatar_mode = (app_settings.AVATAR_GENERATION_MODE or "fast_lipsync").strip().lower()
+        if tts_provider == "none" and not app_settings.ALLOW_DUMMY_TTS:
+            settings.elevenlabs_valid = False
+            settings.wavespeed_valid = _is_valid_key(wavespeed_key)
+            settings.last_validated_at = datetime.now(UTC)
+            settings.validation_status = "invalid"
+            saved = self.repo.save_video_settings(settings)
+            message = (
+                f"{avatar_mode} requires a real TTS provider. Configure TTS_PROVIDER=elevenlabs "
+                "or set ALLOW_DUMMY_TTS=true for local development."
+            )
+            return VideoSettingsValidationRead(
+                **self._settings_read(saved).model_dump(),
+                message=message,
+            )
+        if tts_provider == "elevenlabs":
+            elevenlabs_configured = bool(tts_resolution.api_key or tts_resolution.voice_id)
+            settings.elevenlabs_valid = _is_valid_key(elevenlabs_key) and bool(
+                tts_resolution.voice_id or settings.elevenlabs_voice_id
+            )
+            if not settings.elevenlabs_valid:
+                logger.info(
+                    "Video settings validation missing ElevenLabs credentials: project_id=%s "
+                    "project_config_found=%s elevenlabs_api_key_encrypted_present=%s "
+                    "elevenlabs_api_key_decrypt_success=%s elevenlabs_voice_id_present=%s "
+                    "credentials_source=%s missing_reason=%s",
+                    project_id,
+                    project_config is not None,
+                    bool(project_config and project_config.elevenlabs_api_key_encrypted),
+                    bool(tts_resolution.api_key),
+                    bool(tts_resolution.voice_id or settings.elevenlabs_voice_id),
+                    tts_resolution.credentials_source,
+                    _elevenlabs_missing_reason(
+                        project_config,
+                        settings,
+                        tts_resolution.api_key,
+                        tts_resolution.voice_id,
+                    ),
+                )
+        else:
+            settings.elevenlabs_valid = True
         settings.wavespeed_valid = _is_valid_key(wavespeed_key)
         settings.last_validated_at = datetime.now(UTC)
         settings.validation_status = "valid" if settings.wavespeed_valid and settings.elevenlabs_valid else "invalid"
@@ -349,30 +401,89 @@ class GenerationService:
                 f"Slides missing rendered preview image: {missing_previews}",
             )
 
+        project_config, settings, tts_resolution, wavespeed_key = self._resolve_validation_inputs(project_id)
+        avatar_mode = (app_settings.AVATAR_GENERATION_MODE or "fast_lipsync").strip().lower()
+        if tts_resolution.provider == "none" and not app_settings.ALLOW_DUMMY_TTS:
+            raise GenerationReadinessError(
+                "MISSING_TTS_PROVIDER",
+                f"{avatar_mode} requires a real TTS provider. Configure TTS_PROVIDER=elevenlabs or set ALLOW_DUMMY_TTS=true for local development.",
+            )
+        elevenlabs_key = tts_resolution.api_key or decrypt_secret(settings.elevenlabs_api_key_encrypted)
+        elevenlabs_voice_id = tts_resolution.voice_id or (settings.elevenlabs_voice_id or "").strip() or None
+        if tts_resolution.provider == "elevenlabs" and not (
+            elevenlabs_key and elevenlabs_voice_id
+        ):
+            missing_reason = _elevenlabs_missing_reason(
+                project_config,
+                settings,
+                elevenlabs_key,
+                elevenlabs_voice_id,
+            )
+            logger.info(
+                "generate-video ElevenLabs credentials missing: project_id=%s organization_id=%s "
+                "project_config_found=%s project_config_id=%s missing_reason=%s "
+                "elevenlabs_api_key_present=%s "
+                "elevenlabs_voice_id_present=%s credentials_source=%s",
+                project_id,
+                MOCK_ORG_ID,
+                project_config is not None,
+                project_config.id if project_config is not None else None,
+                missing_reason,
+                bool(project_config and project_config.elevenlabs_api_key_encrypted),
+                bool(
+                    (project_config and project_config.voice_id)
+                    or settings.elevenlabs_voice_id
+                ),
+                tts_resolution.credentials_source,
+            )
+            raise GenerationReadinessError(
+                "MISSING_ELEVENLABS_API_KEY",
+                "Please configure ElevenLabs API key and voice ID in project settings before generating video.",
+            )
+        if not (wavespeed_key or "").strip():
+            raise GenerationReadinessError(
+                "MISSING_WAVESPEED_API_KEY",
+                "WAVESPEED_API_KEY is missing in worker environment",
+            )
+        # Avatar presence is validated again inside the worker pipeline where
+        # debug/dev fallbacks can be applied with richer context.
+
+    def _resolve_validation_inputs(
+        self,
+        project_id: uuid.UUID,
+    ) -> tuple[
+        ProjectGenerationConfig | None,
+        VideoGenerationSettings,
+        object,
+        str | None,
+    ]:
+        project_config = self.repo.get_generation_config(project_id, MOCK_ORG_ID)
         settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
         if settings is None:
-            if not app_settings.WAVESPEED_API_KEY:
-                raise GenerationReadinessError(
-                    "VIDEO_SETTINGS_NOT_CONFIGURED",
-                    "Video settings must be saved before generation",
-                )
             settings = VideoGenerationSettings(
                 organization_id=MOCK_ORG_ID,
                 project_id=project_id,
                 validation_status="valid",
                 wavespeed_valid=True,
-                elevenlabs_valid=True,
+                elevenlabs_valid=(app_settings.TTS_PROVIDER != "elevenlabs"),
             )
-        if not (settings.wavespeed_api_key_encrypted or app_settings.WAVESPEED_API_KEY):
-            raise GenerationReadinessError(
-                "MISSING_WAVESPEED_API_KEY",
-                "WaveSpeed API key is required",
-            )
-        if not _has_avatar_source(settings):
-            raise GenerationReadinessError(
-                "MISSING_AVATAR_ASSET",
-                "Please upload an avatar image before generating the video.",
-            )
+        tts_resolution = resolve_saved_tts_credentials(
+            self.repo.db,
+            project_id,
+            MOCK_ORG_ID,
+            app_settings,
+        )
+        project_wavespeed_key = (
+            decrypt_secret(project_config.wavespeed_api_key_encrypted)
+            if project_config is not None
+            else None
+        )
+        wavespeed_key = (
+            project_wavespeed_key
+            or decrypt_secret(settings.wavespeed_api_key_encrypted)
+            or app_settings.WAVESPEED_API_KEY
+        )
+        return project_config, settings, tts_resolution, wavespeed_key
 
     def _missing_slide_previews(self, slides) -> list[int]:
         storage = get_storage()
@@ -447,7 +558,7 @@ class GenerationService:
                     if app_settings.WAVESPEED_API_KEY and len(app_settings.WAVESPEED_API_KEY) >= 4
                     else None
                 ),
-                elevenlabs_valid=False,
+                elevenlabs_valid=(app_settings.TTS_PROVIDER != "elevenlabs"),
                 wavespeed_valid=env_wavespeed_valid,
                 avatar_source_url=None,
                 avatar_source_asset_id=None,
@@ -481,7 +592,11 @@ class GenerationService:
                 and bool(app_settings.DEBUG_AVATAR_SOURCE_URL)
                 and not app_settings.is_production
             ),
-            elevenlabs_valid=settings.elevenlabs_valid,
+            elevenlabs_valid=(
+                settings.elevenlabs_valid
+                if (app_settings.TTS_PROVIDER or "none").strip().lower() == "elevenlabs"
+                else True
+            ),
             wavespeed_valid=wavespeed_valid,
             validation_status=validation_status,  # type: ignore[arg-type]
             last_validated_at=settings.last_validated_at,
@@ -493,15 +608,17 @@ class GenerationService:
             return
         now = datetime.now(UTC)
         for generation_job in self.repo.list_running_generation_jobs(project_id, MOCK_ORG_ID):
-            if not _is_stale_generation_job(generation_job, now):
+            threshold_seconds = _stalled_threshold_seconds(generation_job)
+            if not _is_stale_generation_job(generation_job, now, threshold_seconds):
                 continue
             logger.warning(
                 "Marking stale generation job failed: project_id=%s generation_job_id=%s "
-                "status=%s updated_at=%s",
+                "status=%s updated_at=%s threshold_seconds=%s",
                 project_id,
                 generation_job.id,
                 generation_job.status,
                 generation_job.updated_at,
+                threshold_seconds,
             )
             generation_job.status = "failed"
             generation_job.error_code = "GENERATION_JOB_STALLED"
@@ -513,6 +630,50 @@ class GenerationService:
 
 def _mask(last_four: str | None) -> str | None:
     return f"************{last_four}" if last_four else None
+
+
+def _secret_input_flags(value: str | None) -> tuple[bool, bool]:
+    if value is None:
+        return False, False
+    stripped = value.strip()
+    if not stripped:
+        return False, False
+    if stripped.startswith("*"):
+        return False, True
+    return True, False
+
+
+def _should_replace_secret(value: str | None) -> bool:
+    if value is None:
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("*"):
+        return False
+    return True
+
+
+def _elevenlabs_missing_reason(
+    project_config,
+    settings_row: VideoGenerationSettings | None,
+    api_key: str | None,
+    voice_id: str | None,
+) -> str:
+    if project_config is None:
+        if settings_row is None:
+            return "project_config_missing"
+        if not settings_row.elevenlabs_api_key_encrypted:
+            return "encrypted_key_missing"
+    if project_config is not None and not project_config.elevenlabs_api_key_encrypted:
+        return "encrypted_key_missing"
+    if not api_key:
+        return "decrypt_failed"
+    if not (voice_id or "").strip():
+        return "voice_id_missing"
+    if not app_settings.ELEVENLABS_API_KEY and not app_settings.ELEVENLABS_VOICE_ID:
+        return "env_fallback_missing"
+    return "unknown"
 
 
 def _is_valid_key(value: str | None) -> bool:
@@ -579,7 +740,13 @@ def _slide_preview_storage_key(slide) -> str | None:
     return None
 
 
-def _is_stale_generation_job(generation_job: GenerationJob, now: datetime) -> bool:
+def _stalled_threshold_seconds(generation_job: GenerationJob) -> int:
+    if generation_job.status in {"generating_avatar", "composing_slide", "composing_video"}:
+        return max(1, int(app_settings.PROVIDER_OPERATION_STALLED_AFTER_SECONDS))
+    return max(1, int(app_settings.GENERATION_STALLED_AFTER_SECONDS))
+
+
+def _is_stale_generation_job(generation_job: GenerationJob, now: datetime, threshold_seconds: int) -> bool:
     if generation_job.status not in RUNNING_GENERATION_STATUSES:
         return False
     updated_at = generation_job.updated_at
@@ -587,4 +754,4 @@ def _is_stale_generation_job(generation_job: GenerationJob, now: datetime) -> bo
         return False
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=UTC)
-    return now - updated_at > timedelta(minutes=5)
+    return now - updated_at > timedelta(seconds=threshold_seconds)

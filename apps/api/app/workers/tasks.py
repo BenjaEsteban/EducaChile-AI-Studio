@@ -20,11 +20,12 @@ from app.modules.composer.service import ComposerService
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.pipeline import (
     PipelineError,
-    compose_final_video,
     compose_segment_for_slide,
+    compose_final_video,
     generate_audio_for_slide,
-    generate_avatar_clip_for_slide,
+    generate_wavespeed_slide_video_for_slide,
     mark_generation_failed,
+    update_generation_job_progress,
     validate_generation_job,
 )
 from app.modules.presentations.rendering import render_slide_previews
@@ -642,8 +643,8 @@ parse_presentation = celery_app.register_task(ParsePresentationTask())
 
 class GenerateVideoTask(JobTask):
     name = "app.workers.tasks.generate_video"
-    soft_time_limit = 1800
-    time_limit = 2100
+    soft_time_limit = settings.CELERY_TASK_SOFT_TIME_LIMIT
+    time_limit = settings.CELERY_TASK_TIME_LIMIT
 
     def run_job(
         self,
@@ -662,6 +663,7 @@ class GenerateVideoTask(JobTask):
         )
         storage = get_storage()
         _log_storage_config_for_generation()
+        _log_video_generation_environment()
 
         try:
             with worker_db_session() as db:
@@ -677,22 +679,130 @@ class GenerateVideoTask(JobTask):
                 )
 
                 total_slides = len(context.slides)
-                avatar_clip_assets = [
-                    generate_avatar_clip_for_slide(
-                        db,
-                        storage,
-                        generation_job,
-                        context,
-                        slide,
-                        slide_index,
-                        total_slides,
-                        None,
-                    )
-                    for slide_index, slide in enumerate(context.slides, 1)
-                ]
 
-                segment_assets = [
-                    compose_segment_for_slide(
+                def _heartbeat(payload: dict[str, object]) -> None:
+                    current_step = str(payload.get("current_step") or generation_job.current_step or "Processing")
+                    current_slide = payload.get("current_slide")
+                    total_slides_payload = payload.get("total_slides")
+                    progress = float(payload.get("progress_percentage") or generation_job.progress_percentage or 0.0)
+                    status = str(payload.get("status") or generation_job.status or "generating_avatar")
+                    with worker_db_session() as heartbeat_db:
+                        heartbeat_job = heartbeat_db.get(GenerationJob, generation_uuid)
+                        if heartbeat_job:
+                            update_generation_job_progress(
+                                heartbeat_db,
+                                heartbeat_job,
+                                status=status if status in {
+                                    "queued",
+                                    "validating",
+                                    "generating_audio",
+                                    "generating_avatar",
+                                    "rendering_slides",
+                                    "composing_slide",
+                                    "composing_video",
+                                    "completed",
+                                    "failed",
+                                    "cancelled",
+                                } else "generating_avatar",
+                                progress_percentage=progress,
+                                current_step=current_step,
+                                current_slide=int(current_slide) if current_slide is not None else heartbeat_job.current_slide,
+                                total_slides=int(total_slides_payload) if total_slides_payload is not None else heartbeat_job.total_slides,
+                            )
+                    meta = {
+                        "status": status,
+                        "progress": progress,
+                        "current_step": current_step,
+                        "current_slide": current_slide,
+                        "total_slides": total_slides_payload,
+                        "stage": payload.get("stage"),
+                        "chunk_index": payload.get("chunk_index"),
+                        "chunk_count": payload.get("chunk_count"),
+                        "elapsed_seconds": payload.get("elapsed_seconds"),
+                        "timeout_seconds": payload.get("timeout_seconds"),
+                        "outputs_present": payload.get("outputs_present"),
+                    }
+                    try:
+                        self.update_state(state="PROGRESS", meta=meta)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not update Celery heartbeat for generation job %s: %s",
+                            generation_uuid,
+                            exc,
+                        )
+
+                audio_assets = []
+                for slide_index, slide in enumerate(context.slides, 1):
+                    audio_assets.append(
+                        generate_audio_for_slide(
+                            db,
+                            storage,
+                            generation_job,
+                            context,
+                            slide,
+                            slide_index,
+                            total_slides,
+                        )
+                    )
+
+                slide_video_assets = []
+                for slide_index, slide in enumerate(context.slides, 1):
+                    logger.info(
+                        "Generation job %s: generating WaveSpeed avatar video for slide %s/%s slide_id=%s",
+                        generation_job.id,
+                        slide_index,
+                        total_slides,
+                        slide.id,
+                    )
+                    slide_video_assets.append(
+                        generate_wavespeed_slide_video_for_slide(
+                            db,
+                            storage,
+                            generation_job,
+                            context,
+                            slide,
+                            slide_index,
+                            total_slides,
+                            audio_assets[slide_index - 1],
+                        )
+                    )
+
+                audio_assets_by_slide_id = {
+                    str(asset.slide_id): asset for asset in audio_assets if asset.slide_id is not None
+                }
+                avatar_assets_by_slide_id = {
+                    str(asset.slide_id): asset for asset in slide_video_assets if asset.slide_id is not None
+                }
+                segment_assets = []
+                for slide_index, slide in enumerate(context.slides, 1):
+                    slide_id = str(slide.id)
+                    avatar_asset = avatar_assets_by_slide_id.get(slide_id)
+                    audio_asset = audio_assets_by_slide_id.get(slide_id)
+                    if avatar_asset is None:
+                        raise PipelineError(
+                            "slide_composition_failed",
+                            f"Missing WaveSpeed avatar video for slide_id={slide.id}",
+                            stage="composing_slide",
+                            slide_index=slide_index,
+                        )
+                    if audio_asset is None:
+                        raise PipelineError(
+                            "slide_composition_failed",
+                            f"Missing slide audio for slide_id={slide.id}",
+                            stage="composing_slide",
+                            slide_index=slide_index,
+                        )
+                    logger.info(
+                        "Generation job %s: composing slide clip %s/%s slide_id=%s background_key=%s avatar_video_key=%s audio_key=%s",
+                        generation_job.id,
+                        slide_index,
+                        total_slides,
+                        slide.id,
+                        slide.thumbnail_key,
+                        avatar_asset.storage_key,
+                        audio_asset.storage_key if audio_asset else None,
+                    )
+                    segment_asset = compose_segment_for_slide(
                         db,
                         storage,
                         generation_job,
@@ -700,11 +810,16 @@ class GenerateVideoTask(JobTask):
                         slide,
                         slide_index,
                         total_slides,
-                        None,
-                        avatar_clip_assets[slide_index - 1],
+                        audio_asset,
+                        avatar_asset,
                     )
-                    for slide_index, slide in enumerate(context.slides, 1)
-                ]
+                    logger.info(
+                        "Generation job %s: composed slide clip ready slide_id=%s output_key=%s",
+                        generation_job.id,
+                        slide.id,
+                        segment_asset.storage_key,
+                    )
+                    segment_assets.append(segment_asset)
 
                 final_asset = compose_final_video(
                     db,
@@ -743,6 +858,7 @@ class GenerateVideoTask(JobTask):
                         exc.message,
                         current_step=exc.stage,
                         current_slide=exc.slide_index,
+                        details=getattr(exc, "details", None),
                     )
             logger.exception(
                 "Generation job %s: failed at slide %s during stage %s: %s",
@@ -1124,6 +1240,20 @@ def _log_storage_config_for_generation() -> None:
         _endpoint_host(public),
         _endpoint_host(settings.AZURE_STORAGE_PUBLIC_BASE_URL),
         bool(settings.EXTERNAL_PROVIDER_ASSET_BASE_URL),
+    )
+
+
+def _log_video_generation_environment() -> None:
+    logger.info(
+        "Video generation environment: storage_backend=%s wavespeed_model=%s "
+        "max_lipsync_audio_seconds_per_chunk=%s wavespeed_api_key_configured=%s "
+        "elevenlabs_api_key_configured=%s elevenlabs_voice_id_configured=%s",
+        settings.STORAGE_BACKEND,
+        settings.AVATAR_IMAGE_AUDIO_PROVIDER,
+        settings.MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK,
+        bool((settings.WAVESPEED_API_KEY or "").strip()),
+        bool((settings.ELEVENLABS_API_KEY or "").strip()),
+        bool((settings.ELEVENLABS_VOICE_ID or "").strip()),
     )
 
 

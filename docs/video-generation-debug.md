@@ -18,7 +18,7 @@ It logs only safe values: voice ID, output path, size, and duration. It never lo
 
 The endpoint uses the same `ElevenLabsTTSProvider` adapter used by the optional advanced voice path. A successful response confirms the adapter can produce a real MP3, not a local silent placeholder.
 
-## WaveSpeed talking-photo test
+## WaveSpeed audio-driven lip-sync test
 
 Run:
 
@@ -26,28 +26,57 @@ Run:
 curl -X POST "http://localhost:8000/api/v1/projects/{project_id}/debug/wavespeed-test"
 ```
 
-The endpoint loads the configured avatar image from the project settings, uploads that image to WaveSpeed with `POST /api/v3/media/upload/binary`, then calls `POST /api/v3/wavespeed-ai/ai-talking-photos` with:
+The endpoint loads the configured avatar image from the project settings, splits long narration into bounded Spanish chunks, generates controlled audio for each chunk, then calls `POST /api/v3/wavespeed-ai/infinitetalk` with:
 
 ```json
 {
-  "image": "<download_url>",
-  "text": "Hello, this is a test talking photo from Educa Chile.",
-  "duration": 5,
+  "image": "<avatar_image_url>",
+  "audio": "<narration_audio_url>",
+  "resolution": "480p",
   "seed": -1
 }
 ```
 
-It polls `GET /api/v3/predictions/{request_id}/result`, writes `/tmp/educa_test_avatar.mp4`, verifies it with `ffprobe`, uploads a debug copy to storage, and returns a browser download URL.
+It polls `GET /api/v3/predictions/{request_id}/result`, strips any provider audio from the returned MP4, writes `/tmp/educa_test_avatar.mp4`, verifies it with `ffprobe`, uploads a debug copy to storage, and returns a browser download URL.
 
-No ElevenLabs audio is required for this default talking-photo diagnostic. The output should contain both video and audio streams.
+The output should contain a video stream only. The older `ai-talking-photos` mode remains available only as a fallback/dev diagnostic.
 
 Use these settings for local Docker:
 
 ```env
 MINIO_INTERNAL_ENDPOINT=http://minio:9000
 MINIO_PUBLIC_ENDPOINT=http://localhost:9000
+ELEVENLABS_API_KEY=...
+ELEVENLABS_VOICE_ID=...
 WAVESPEED_API_KEY=...
 WAVESPEED_BASE_URL=https://api.wavespeed.ai/api/v3
+TTS_PROVIDER=elevenlabs
+AVATAR_GENERATION_MODE=fast_lipsync
+AVATAR_LIPSYNC_PROVIDER=wavespeed_sync_lipsync_3
+AVATAR_SYNC_MODE=loop
+AVATAR_LIPSYNC_MODEL_PATH=wavespeed-ai/sync-lipsync-3
+AVATAR_LIPSYNC_RESOLUTION=480p
+TTS_LANGUAGE=es
+TTS_SPEED=0.85
+ENABLE_SUBTITLES=false
+FFMPEG_TIMEOUT_SECONDS=900
+WAVESPEED_HTTP_TIMEOUT_SECONDS=300
+WAVESPEED_PREDICTION_TIMEOUT_SECONDS=1800
+WAVESPEED_POLL_INTERVAL_SECONDS=8
+REQUIRE_EXTERNAL_PROVIDER_URL_VALIDATION=true
+MAX_TTS_CHARS_PER_CHUNK=700
+MAX_LIPSYNC_AUDIO_SECONDS_PER_CHUNK=600
+MAX_AVATAR_AUDIO_SECONDS_PER_CHUNK=30
+MAX_CHUNKS_PER_SLIDE=4
+AVATAR_CHUNK_CONCURRENCY=2
+AVATAR_PROVIDER_CHUNK_TIMEOUT_SECONDS=300
+AVATAR_PROVIDER_MAX_RETRIES=1
+ENABLE_STATIC_AVATAR_FALLBACK=true
+MAX_AUDIO_CHUNK_DURATION_TOLERANCE_SECONDS=1.0
+ALLOW_DUMMY_TTS=false
+MIN_EXPECTED_AUDIO_DURATION_RATIO=0.5
+CELERY_TASK_SOFT_TIME_LIMIT=3300
+CELERY_TASK_TIME_LIMIT=3600
 ```
 
 `MINIO_INTERNAL_ENDPOINT` is for API/worker storage reads and writes. `MINIO_PUBLIC_ENDPOINT` is for browser preview/download URLs.
@@ -63,7 +92,7 @@ In the normal editor flow, users should upload the avatar image in the Avatar se
 
 If no avatar source is available, the debug endpoint returns `MISSING_AVATAR_SOURCE`; the real generation start path returns `MISSING_AVATAR_ASSET`.
 
-The endpoint uses the same `WavespeedAvatarVideoProvider` adapter used by the generation worker. A successful response confirms the adapter can produce a real talking-photo MP4, not a local placeholder clip.
+The endpoint uses the same `WavespeedAvatarVideoProvider` adapter used by the generation worker. A successful response confirms the adapter can produce a real audio-driven lip-sync MP4, not a local placeholder clip.
 
 ## FFmpeg composition test
 
@@ -95,7 +124,7 @@ In the editor, development builds also show a `Debug assets` section after a com
 ## Confirming the real pipeline uses real providers
 
 1. Run the ElevenLabs debug test and confirm the returned MP3 is playable.
-2. Run the WaveSpeed talking-photo debug test and confirm the returned MP4 is playable.
+2. Run the WaveSpeed audio-driven lip-sync debug test and confirm the returned MP4 is playable.
 3. Generate a video from the editor.
 4. Open `GET /api/v1/projects/{project_id}/debug/generation-assets`.
 5. Confirm the latest generation contains:
@@ -113,11 +142,11 @@ The output must include both `video` and `audio`.
 
 The generation worker now calls the same real provider adapters:
 
-- `WavespeedClient.upload_image()` calls `https://api.wavespeed.ai/api/v3/media/upload/binary` and returns a temporary image URL.
-- `WavespeedTalkingPhotoProvider.generate_avatar_video()` calls `https://api.wavespeed.ai/api/v3/wavespeed-ai/ai-talking-photos` and polls `/predictions/{request_id}/result` until a video URL is ready.
+- `WavespeedClient.create_infinite_talk()` calls `https://api.wavespeed.ai/api/v3/wavespeed-ai/infinitetalk` with image and audio URLs and polls `/predictions/{request_id}/result` until a video URL is ready.
+- `WavespeedTalkingPhotoProvider.generate_avatar_video()` remains available as the explicit fallback/dev mode and still calls `https://api.wavespeed.ai/api/v3/wavespeed-ai/ai-talking-photos`.
 
-The real pipeline should no longer create placeholder avatar clips for the default Wavespeed talking-photo flow.
+The real pipeline should no longer create placeholder avatar clips for the default Wavespeed audio-driven flow.
 
-If WaveSpeed fails, the job should fail with `WAVESPEED_TALKING_PHOTO_FAILED`, `INVALID_WAVESPEED_CREDENTIALS`, `MISSING_AVATAR_SOURCE`, or `INVALID_AVATAR_DURATION`.
+If WaveSpeed fails, the job should fail with `WAVESPEED_TALKING_PHOTO_FAILED`, `INVALID_WAVESPEED_CREDENTIALS`, `MISSING_AVATAR_SOURCE`, `MISSING_AUDIO_ASSET`, or `INVALID_AVATAR_DURATION`.
 
 If FFmpeg fails, the job should fail with `VIDEO_COMPOSITION_FAILED`.

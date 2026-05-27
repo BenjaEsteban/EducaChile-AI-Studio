@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import urlparse
 
 from celery import Celery
 from celery.signals import task_failure, task_postrun, task_prerun, worker_ready
@@ -29,12 +30,12 @@ celery_app.conf.update(
     # Reintentos y timeouts
     task_acks_late=True,          # ack solo después de completar (evita pérdida si el worker muere)
     task_reject_on_worker_lost=True,
-    task_soft_time_limit=300,     # default for small tasks
-    task_time_limit=360,
+    task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT,
+    task_time_limit=settings.CELERY_TASK_TIME_LIMIT,
     task_annotations={
         "app.workers.tasks.generate_video": {
-            "soft_time_limit": 1800,
-            "time_limit": 2100,
+            "soft_time_limit": settings.CELERY_TASK_SOFT_TIME_LIMIT,
+            "time_limit": settings.CELERY_TASK_TIME_LIMIT,
             "max_retries": 1,
         },
     },
@@ -59,7 +60,16 @@ celery_app.conf.update(
 
 @worker_ready.connect
 def on_worker_ready(sender, **kwargs):
-    logger.info("Celery worker listo. Broker: %s", settings.REDIS_URL)
+    parsed = urlparse(settings.DATABASE_URL)
+    logger.info(
+        "Celery worker listo. Broker: %s encryption_key_present=%s encryption_key_length=%s "
+        "database_host=%s database_name=%s",
+        settings.REDIS_URL,
+        bool(settings.ENCRYPTION_KEY),
+        len(settings.ENCRYPTION_KEY or ""),
+        parsed.hostname,
+        (parsed.path or "").lstrip("/") or None,
+    )
 
 
 @task_prerun.connect

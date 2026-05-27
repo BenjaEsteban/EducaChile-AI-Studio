@@ -20,6 +20,10 @@ class WavespeedClientError(RuntimeError):
             self.code = code
 
 
+def _request_timeout_seconds() -> int:
+    return max(30, int(settings.WAVESPEED_HTTP_TIMEOUT_SECONDS))
+
+
 @dataclass(slots=True)
 class WavespeedClient:
     api_key: str | None = None
@@ -39,13 +43,13 @@ class WavespeedClient:
             self.base_url,
         )
 
-    def upload_image(self, file_bytes: bytes, filename: str, content_type: str) -> str:
+    def upload_binary(self, file_bytes: bytes, filename: str, content_type: str) -> str:
         if not file_bytes:
-            raise WavespeedClientError("Image payload is empty", "MISSING_AVATAR_SOURCE")
+            raise WavespeedClientError("Binary payload is empty", "MISSING_AVATAR_SOURCE")
 
         url = f"{self.base_url}/media/upload/binary"
         headers = self._json_headers(content_type=content_type, filename=filename)
-        response = httpx.post(url, content=file_bytes, headers=headers, timeout=120)
+        response = httpx.post(url, content=file_bytes, headers=headers, timeout=_request_timeout_seconds())
         payload: dict[str, Any] | None = None
         if response.status_code < 400:
             try:
@@ -57,7 +61,7 @@ class WavespeedClient:
                 url,
                 files={"file": (filename or "avatar.png", file_bytes, content_type)},
                 headers=self._auth_headers(),
-                timeout=120,
+                timeout=_request_timeout_seconds(),
             )
             if response.status_code in {401, 403}:
                 raise WavespeedClientError(
@@ -77,12 +81,18 @@ class WavespeedClient:
                 "WAVESPEED_TALKING_PHOTO_FAILED",
             )
         logger.info(
-            "WaveSpeed image upload succeeded: filename=%s content_type=%s host=%s",
+            "WaveSpeed binary upload succeeded: filename=%s content_type=%s host=%s",
             filename,
             content_type,
             _url_host(download_url),
         )
         return download_url
+
+    def upload_image(self, file_bytes: bytes, filename: str, content_type: str) -> str:
+        return self.upload_binary(file_bytes=file_bytes, filename=filename, content_type=content_type)
+
+    def upload_audio(self, file_bytes: bytes, filename: str, content_type: str) -> str:
+        return self.upload_binary(file_bytes=file_bytes, filename=filename, content_type=content_type)
 
     def create_talking_photo(self, image_url: str, text: str, duration: int = 5, seed: int = -1) -> str:
         duration = _validate_duration(duration)
@@ -98,17 +108,20 @@ class WavespeedClient:
             "duration": duration,
             "seed": seed,
         }
+        request_shape = _safe_payload_shape(payload)
         logger.info(
-            "Submitting WaveSpeed talking photo request: image_host=%s duration=%s text_present=%s",
+            "Submitting WaveSpeed talking photo request: endpoint=%s image_host=%s duration=%s text_present=%s payload_shape=%s",
+            url,
             _url_host(image_url),
             duration,
             bool(text.strip()),
+            request_shape,
         )
         response = httpx.post(
             url,
             headers=self._json_headers(),
             json=payload,
-            timeout=120,
+            timeout=_request_timeout_seconds(),
         )
         if response.status_code in {401, 403}:
             raise WavespeedClientError(
@@ -129,13 +142,131 @@ class WavespeedClient:
             )
         return request_id
 
+    def create_infinite_talk(
+        self,
+        image_url: str,
+        audio_url: str,
+        *,
+        prompt: str | None = None,
+        resolution: str = "480p",
+        seed: int = -1,
+    ) -> str:
+        if not image_url:
+            raise WavespeedClientError("Avatar image URL is missing", "MISSING_AVATAR_SOURCE")
+        if not audio_url:
+            raise WavespeedClientError("Audio URL is missing", "MISSING_AUDIO_ASSET")
+
+        url = f"{self.base_url}/wavespeed-ai/infinitetalk"
+        payload: dict[str, Any] = {
+            "image": image_url,
+            "audio": audio_url,
+            "resolution": resolution,
+            "seed": seed,
+        }
+        if prompt:
+            payload["prompt"] = prompt.strip()
+        request_shape = _safe_payload_shape(payload)
+        logger.info(
+            "Submitting WaveSpeed InfiniteTalk request: endpoint=%s image_host=%s audio_host=%s resolution=%s prompt_present=%s payload_shape=%s",
+            url,
+            _url_host(image_url),
+            _url_host(audio_url),
+            resolution,
+            bool(prompt and prompt.strip()),
+            request_shape,
+        )
+        response = httpx.post(
+            url,
+            headers=self._json_headers(),
+            json=payload,
+            timeout=_request_timeout_seconds(),
+        )
+        if response.status_code in {401, 403}:
+            raise WavespeedClientError(
+                "WaveSpeed credentials were rejected",
+                "INVALID_WAVESPEED_CREDENTIALS",
+            )
+        if response.status_code >= 400:
+            raise WavespeedClientError(
+                f"WaveSpeed InfiniteTalk returned HTTP {response.status_code}",
+                "WAVESPEED_TALKING_PHOTO_FAILED",
+            )
+        payload = self._json(response)
+        request_id = _extract_request_id(payload)
+        if not request_id:
+            raise WavespeedClientError(
+                "WaveSpeed response missing request id",
+                "WAVESPEED_TALKING_PHOTO_FAILED",
+        )
+        return request_id
+
+    def create_sync_lipsync(
+        self,
+        video_url: str,
+        audio_url: str,
+        *,
+        sync_mode: str = "loop",
+        seed: int = -1,
+        resolution: str | None = None,
+        model_path: str | None = None,
+    ) -> str:
+        if not video_url:
+            raise WavespeedClientError("Avatar video URL is missing", "MISSING_AVATAR_SOURCE")
+        if not audio_url:
+            raise WavespeedClientError("Audio URL is missing", "MISSING_AUDIO_ASSET")
+
+        endpoint = (model_path or settings.AVATAR_LIPSYNC_MODEL_PATH or "wavespeed-ai/sync-lipsync-3").strip("/")
+        url = f"{self.base_url}/{endpoint}"
+        payload: dict[str, Any] = {
+            "video": video_url,
+            "audio": audio_url,
+            "sync_mode": sync_mode,
+            "seed": seed,
+        }
+        if resolution:
+            payload["resolution"] = resolution
+        request_shape = _safe_payload_shape(payload)
+        logger.info(
+            "Submitting WaveSpeed sync lipsync request: endpoint=%s video_host=%s audio_host=%s sync_mode=%s resolution=%s payload_shape=%s",
+            url,
+            _url_host(video_url),
+            _url_host(audio_url),
+            sync_mode,
+            resolution,
+            request_shape,
+        )
+        response = httpx.post(
+            url,
+            headers=self._json_headers(),
+            json=payload,
+            timeout=_request_timeout_seconds(),
+        )
+        if response.status_code in {401, 403}:
+            raise WavespeedClientError(
+                "WaveSpeed credentials were rejected",
+                "INVALID_WAVESPEED_CREDENTIALS",
+            )
+        if response.status_code >= 400:
+            raise WavespeedClientError(
+                f"WaveSpeed sync lipsync returned HTTP {response.status_code}",
+                "WAVESPEED_TALKING_PHOTO_FAILED",
+            )
+        payload = self._json(response)
+        request_id = _extract_request_id(payload)
+        if not request_id:
+            raise WavespeedClientError(
+                "WaveSpeed response missing request id",
+                "WAVESPEED_TALKING_PHOTO_FAILED",
+            )
+        return request_id
+
     def get_prediction_result(self, request_id: str) -> dict[str, Any]:
         if not request_id:
             raise WavespeedClientError("Prediction request id is missing", "WAVESPEED_TALKING_PHOTO_FAILED")
         response = httpx.get(
             f"{self.base_url}/predictions/{request_id}/result",
             headers=self._auth_headers(),
-            timeout=120,
+            timeout=_request_timeout_seconds(),
         )
         if response.status_code in {401, 403}:
             raise WavespeedClientError(
@@ -202,6 +333,32 @@ def _extract_request_id(payload: dict[str, Any]) -> str | None:
         if isinstance(get_url, str) and get_url:
             return get_url.rsplit("/", 2)[-2] if "/predictions/" in get_url else None
     return None
+
+
+def _safe_payload_shape(payload: dict[str, Any]) -> dict[str, Any]:
+    def _host(value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return httpx.URL(value).host
+        except Exception:
+            return None
+
+    return {
+        "keys": sorted(payload.keys()),
+        "image_present": bool(payload.get("image")),
+        "video_present": bool(payload.get("video")),
+        "audio_present": bool(payload.get("audio")),
+        "text_present": bool(payload.get("text")),
+        "prompt_present": bool(payload.get("prompt")),
+        "seed_present": payload.get("seed") is not None,
+        "duration_present": payload.get("duration") is not None,
+        "resolution": payload.get("resolution"),
+        "sync_mode": payload.get("sync_mode"),
+        "image_host": _host(payload.get("image")),
+        "video_host": _host(payload.get("video")),
+        "audio_host": _host(payload.get("audio")),
+    }
 
 
 def _validate_duration(duration: int) -> int:

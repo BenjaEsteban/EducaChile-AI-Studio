@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.modules.generation.debug import (
+    avatar_pipeline_debug,
     list_generation_debug_assets,
     run_elevenlabs_debug,
     run_ffmpeg_debug,
@@ -122,3 +123,13 @@ def debug_generation_assets(
     db: Session = Depends(get_db),
 ):
     return list_generation_debug_assets(project_id, db)
+
+
+@router.get("/{project_id}/generation-jobs/{job_id}/avatar-debug")
+def debug_avatar_pipeline(
+    project_id: uuid.UUID,
+    job_id: uuid.UUID,
+    slide_number: int | None = None,
+    db: Session = Depends(get_db),
+):
+    return avatar_pipeline_debug(project_id, job_id, db, slide_number=slide_number)

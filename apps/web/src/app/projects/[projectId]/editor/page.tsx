@@ -53,6 +53,13 @@ function initialDialogue(slide: Slide): string {
   return slide.dialogue || slide.notes || "";
 }
 
+function isFreshHeartbeat(updatedAt: string | null | undefined) {
+  if (!updatedAt) return false;
+  const timestamp = new Date(updatedAt).getTime();
+  if (Number.isNaN(timestamp)) return false;
+  return Date.now() - timestamp < 2 * 60 * 1000;
+}
+
 export default function ProjectEditorPage() {
   const params = useParams<{ projectId: string }>();
   const searchParams = useSearchParams();
@@ -92,6 +99,7 @@ export default function ProjectEditorPage() {
     error_code: null,
     error_message: null,
     final_video_url: null,
+    updated_at: null,
   });
   const [debugAssets, setDebugAssets] = useState<DebugGenerationAsset[]>([]);
 
@@ -136,6 +144,7 @@ export default function ProjectEditorPage() {
     Boolean(projectAvatar) ||
     Boolean(videoSettings?.avatar_source_asset_id) ||
     Boolean(videoSettings?.using_debug_avatar_source);
+  const generationHeartbeatFresh = isFreshHeartbeat(generationStatus.updated_at);
   const generationDisabledMessage = !videoSettings
     ? "Wavespeed settings are not configured yet."
     : !wavespeedSettingsConfigured
@@ -159,6 +168,10 @@ export default function ProjectEditorPage() {
       !isGenerationRunning,
   );
   const generationFailureMessage = generationErrorMessage(generationStatus);
+  const generationStatusText =
+    isGenerationRunning && generationStatus.status === "generating_avatar" && generationHeartbeatFresh
+      ? generationStatus.message || "Generating avatar... still processing"
+      : generationStatus.message || "Idle";
 
   useEffect(() => {
     async function loadSlides() {
@@ -705,7 +718,7 @@ export default function ProjectEditorPage() {
 
               <div className="space-y-2 rounded-md border border-gray-200 bg-gray-50 p-3">
                 <div className="flex items-center justify-between text-xs text-gray-600">
-                  <span>{generationStatus.message || "Idle"}</span>
+                  <span>{generationStatusText}</span>
                   <span>{Math.round(generationStatus.progress)}%</span>
                 </div>
                 <div className="h-2 overflow-hidden rounded-full bg-gray-200">

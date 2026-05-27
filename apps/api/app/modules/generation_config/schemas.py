@@ -81,6 +81,37 @@ class ProjectGenerationConfigRead(BaseModel):
         )
 
 
+class ProjectGenerationConfigDebugRead(BaseModel):
+    project_id: uuid.UUID
+    organization_id: uuid.UUID
+    project_config_found: bool
+    project_config_id: uuid.UUID | None
+    elevenlabs_api_key_encrypted_present: bool
+    elevenlabs_api_key_decrypt_success: bool
+    elevenlabs_api_key_masked: str | None
+    elevenlabs_voice_id_present: bool
+    elevenlabs_voice_id_value: str | None
+    wavespeed_api_key_encrypted_present: bool
+    wavespeed_api_key_decrypt_success: bool
+    wavespeed_api_key_masked: str | None
+    credentials_source_for_validate_endpoint: Literal[
+        "project_config",
+        "video_settings",
+        "env_fallback",
+        "missing",
+    ]
+    credentials_source_for_generate_video_endpoint: Literal[
+        "project_config",
+        "video_settings",
+        "env_fallback",
+        "missing",
+    ]
+    database_url_host: str | None
+    database_name: str | None
+    encryption_key_present: bool
+    encryption_key_length: int
+
+
 class ProjectGenerationConfigUpdate(BaseModel):
     ai_provider: Literal["gemini"] = "gemini"
     tts_provider: Literal["gemini", "elevenlabs"] = "gemini"
