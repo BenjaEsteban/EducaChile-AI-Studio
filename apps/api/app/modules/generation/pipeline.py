@@ -3826,7 +3826,7 @@ def _analyze_video_motion(media_bytes: bytes) -> dict:
                     capture_output=True,
                     timeout=30,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
                 continue
             if result.stdout:
                 frames.append(result.stdout)
@@ -3874,7 +3874,7 @@ def _detect_green_background(media_bytes: bytes) -> dict:
                 capture_output=True,
                 timeout=30,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return info
     frame = result.stdout or b""
     width = 64
