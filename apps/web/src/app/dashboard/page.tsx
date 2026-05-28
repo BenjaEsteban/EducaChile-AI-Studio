@@ -15,6 +15,9 @@ const stats = [
 const ALL_SCOPE = "__all__";
 
 type FolderOption = { id: string; name: string; depth: number };
+type SortMode = "name" | "created" | "updated";
+type ViewMode = "grid" | "list";
+type DeleteTarget = { kind: "folder" | "project"; id: string; name: string };
 
 function flattenFolderTree(nodes: FolderTreeNode[], depth = 0): FolderOption[] {
   const rows: FolderOption[] = [];
@@ -25,27 +28,54 @@ function flattenFolderTree(nodes: FolderTreeNode[], depth = 0): FolderOption[] {
   return rows;
 }
 
-function folderDescendants(nodes: FolderTreeNode[], targetId: string): string[] {
-  function walk(node: FolderTreeNode): string[] | null {
-    if (node.id === targetId) {
-      return [node.id, ...node.children.flatMap((child) => walkAll(child))];
-    }
-    for (const child of node.children) {
-      const found = walk(child);
-      if (found) return found;
-    }
-    return null;
+function flattenFolderNodes(nodes: FolderTreeNode[]): FolderTreeNode[] {
+  const output: FolderTreeNode[] = [];
+  for (const node of nodes) {
+    output.push(node);
+    output.push(...flattenFolderNodes(node.children));
   }
+  return output;
+}
 
-  function walkAll(node: FolderTreeNode): string[] {
-    return [node.id, ...node.children.flatMap((child) => walkAll(child))];
-  }
+function filterTree(nodes: FolderTreeNode[], query: string): FolderTreeNode[] {
+  if (!query.trim()) return nodes;
+  const normalized = query.trim().toLowerCase();
+  const walk = (node: FolderTreeNode): FolderTreeNode | null => {
+    const children = node.children
+      .map((child) => walk(child))
+      .filter((child): child is FolderTreeNode => Boolean(child));
+    const matches = node.name.toLowerCase().includes(normalized);
+    if (!matches && children.length === 0) return null;
+    return { ...node, children };
+  };
+  return nodes
+    .map((node) => walk(node))
+    .filter((node): node is FolderTreeNode => Boolean(node));
+}
 
-  for (const root of nodes) {
-    const result = walk(root);
-    if (result) return result;
-  }
-  return [];
+function formatDate(iso: string) {
+  const date = new Date(iso);
+  return new Intl.DateTimeFormat("es-CL", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date);
+}
+
+function sortFolders(items: FolderTreeNode[], mode: SortMode): FolderTreeNode[] {
+  return [...items].sort((a, b) => {
+    if (mode === "created") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    if (mode === "updated") return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    return a.name.localeCompare(b.name, "es", { sensitivity: "base" });
+  });
+}
+
+function sortProjects(items: Project[], mode: SortMode): Project[] {
+  return [...items].sort((a, b) => {
+    if (mode === "created") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    if (mode === "updated") return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    return a.name.localeCompare(b.name, "es", { sensitivity: "base" });
+  });
 }
 
 export default function DashboardPage() {
@@ -62,20 +92,61 @@ export default function DashboardPage() {
   const [projectFolderId, setProjectFolderId] = useState<string | null>(null);
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [movingProjectId, setMovingProjectId] = useState<string | null>(null);
-  const [projectPendingDelete, setProjectPendingDelete] = useState<Project | null>(null);
-  const [isDeletingProject, setIsDeletingProject] = useState(false);
+  const [showAllProjectsPreview, setShowAllProjectsPreview] = useState(false);
 
   const [isFolderFormOpen, setIsFolderFormOpen] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [folderParentId, setFolderParentId] = useState<string | null>(null);
   const [isSavingFolder, setIsSavingFolder] = useState(false);
   const [openFolderMenuId, setOpenFolderMenuId] = useState<string | null>(null);
+  const [isNewMenuOpen, setIsNewMenuOpen] = useState(false);
+  const [folderRenameTarget, setFolderRenameTarget] = useState<{ id: string; currentName: string } | null>(null);
+  const [renameFolderValue, setRenameFolderValue] = useState("");
+  const [isRenamingFolder, setIsRenamingFolder] = useState(false);
+  const [renameFolderError, setRenameFolderError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const [deleteConfirmStep, setDeleteConfirmStep] = useState<1 | 2>(1);
+  const [deleteConfirmValue, setDeleteConfirmValue] = useState("");
+  const [deleteNeedsCascade, setDeleteNeedsCascade] = useState(false);
+  const [isDeletingTarget, setIsDeletingTarget] = useState(false);
+  const [deleteDialogError, setDeleteDialogError] = useState<string | null>(null);
+
+  const [folderQuery, setFolderQuery] = useState("");
+  const [projectQuery, setProjectQuery] = useState("");
+  const [sortMode, setSortMode] = useState<SortMode>("name");
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
 
   const folderOptions = useMemo(() => flattenFolderTree(folders), [folders]);
-  const folderNameById = useMemo(() => {
-    const pairs = folderOptions.map((folder) => [folder.id, folder.name] as const);
-    return new Map<string, string>(pairs);
-  }, [folderOptions]);
+  const folderNameById = useMemo(
+    () => new Map<string, string>(folderOptions.map((folder) => [folder.id, folder.name] as const)),
+    [folderOptions],
+  );
+
+  const { folderMap, parentMap } = useMemo(() => {
+    const nodes = flattenFolderNodes(folders);
+    const map = new Map<string, FolderTreeNode>();
+    const parents = new Map<string, string | null>();
+    for (const node of nodes) {
+      map.set(node.id, node);
+      parents.set(node.id, node.parent_folder_id);
+    }
+    return { folderMap: map, parentMap: parents };
+  }, [folders]);
+
+  const selectedFolder = selectedScope !== ALL_SCOPE ? folderMap.get(selectedScope) ?? null : null;
+
+  const breadcrumb = useMemo(() => {
+    if (!selectedFolder) return [];
+    const chain: FolderTreeNode[] = [];
+    let cursor: FolderTreeNode | null = selectedFolder;
+    while (cursor) {
+      chain.unshift(cursor);
+      const parentId = parentMap.get(cursor.id);
+      cursor = parentId ? folderMap.get(parentId) ?? null : null;
+    }
+    return chain;
+  }, [folderMap, parentMap, selectedFolder]);
+
   const projectsByFolder = useMemo(() => {
     const map = new Map<string, Project[]>();
     for (const project of projects) {
@@ -86,25 +157,61 @@ export default function DashboardPage() {
     return map;
   }, [projects]);
 
-  const filteredProjects = useMemo(() => {
-    if (selectedScope === ALL_SCOPE) return projects;
-    const validFolderIds = new Set(folderDescendants(folders, selectedScope));
-    return projects.filter((project) => project.folder_id && validFolderIds.has(project.folder_id));
-  }, [folders, projects, selectedScope]);
+  const sidebarTree = useMemo(() => filterTree(folders, folderQuery), [folders, folderQuery]);
+  const folderCandidates = useMemo(() => {
+    if (selectedScope === ALL_SCOPE) return folders;
+    return selectedFolder?.children ?? [];
+  }, [folders, selectedScope, selectedFolder]);
+
+  const visibleFolders = useMemo(() => {
+    const query = folderQuery.trim().toLowerCase();
+    const filtered = query
+      ? folderCandidates.filter((folder) => folder.name.toLowerCase().includes(query))
+      : folderCandidates;
+    return sortFolders(filtered, sortMode);
+  }, [folderCandidates, folderQuery, sortMode]);
 
   const selectedScopeLabel = useMemo(() => {
     if (selectedScope === ALL_SCOPE) return "Todos los proyectos";
-    const found = folderOptions.find((option) => option.id === selectedScope);
-    return found ? `Carpeta: ${found.name}` : "Carpeta seleccionada";
-  }, [folderOptions, selectedScope]);
+    return selectedFolder ? selectedFolder.name : "Carpeta";
+  }, [selectedScope, selectedFolder]);
+  const isFolderScope = selectedScope !== ALL_SCOPE;
+
+  const filteredProjects = useMemo(() => {
+    const byScope =
+      selectedScope === ALL_SCOPE
+        ? projects
+        : projects.filter((project) => project.folder_id === selectedScope);
+    const query = projectQuery.trim().toLowerCase();
+    const queried = query
+      ? byScope.filter(
+          (project) =>
+            project.name.toLowerCase().includes(query) ||
+            (project.description ?? "").toLowerCase().includes(query),
+        )
+      : byScope;
+    return sortProjects(queried, sortMode);
+  }, [projects, selectedScope, projectQuery, sortMode]);
+
+  const recentProjects = useMemo(() => {
+    const recencySorted = [...filteredProjects].sort((a, b) => {
+      const updatedDiff = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+      if (updatedDiff !== 0) return updatedDiff;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+    return recencySorted;
+  }, [filteredProjects]);
+
+  const projectsToRender = useMemo(() => {
+    if (isFolderScope) return recentProjects;
+    if (showAllProjectsPreview || recentProjects.length <= 2) return recentProjects;
+    return recentProjects.slice(0, 2);
+  }, [isFolderScope, recentProjects, showAllProjectsPreview]);
 
   async function loadDashboard() {
     try {
       setError(null);
-      const [projectsData, foldersData] = await Promise.all([
-        api.projects.list(),
-        api.projects.listFolderTree(),
-      ]);
+      const [projectsData, foldersData] = await Promise.all([api.projects.list(), api.projects.listFolderTree()]);
       setProjects(projectsData.items);
       setFolders(foldersData.items);
     } catch (err) {
@@ -119,15 +226,24 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    if (!openFolderMenuId) return;
-    function handleClickOutside(event: MouseEvent) {
+    setShowAllProjectsPreview(false);
+  }, [selectedScope, projectQuery, sortMode]);
+
+  useEffect(() => {
+    if (selectedScope === ALL_SCOPE) return;
+    if (!folderMap.has(selectedScope)) setSelectedScope(ALL_SCOPE);
+  }, [folderMap, selectedScope]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target?.closest("[data-folder-menu-root='true']")) return;
+      if (target?.closest("[data-folder-menu-root='true']") || target?.closest("[data-new-menu-root='true']")) return;
       setOpenFolderMenuId(null);
-    }
+      setIsNewMenuOpen(false);
+    };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [openFolderMenuId]);
+  }, []);
 
   async function handleCreateProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -137,11 +253,7 @@ export default function DashboardPage() {
     setError(null);
     setNotice(null);
     try {
-      await api.projects.create({
-        name: trimmedName,
-        description: projectDescription.trim() || null,
-        folder_id: projectFolderId,
-      });
+      await api.projects.create({ name: trimmedName, description: projectDescription.trim() || null, folder_id: projectFolderId });
       setProjectName("");
       setProjectDescription("");
       setIsProjectFormOpen(false);
@@ -167,10 +279,7 @@ export default function DashboardPage() {
     setError(null);
     setNotice(null);
     try {
-      await api.projects.createFolder({
-        name: trimmedName,
-        parent_folder_id: folderParentId,
-      });
+      await api.projects.createFolder({ name: trimmedName, parent_folder_id: folderParentId });
       setFolderName("");
       setFolderParentId(null);
       setIsFolderFormOpen(false);
@@ -189,50 +298,99 @@ export default function DashboardPage() {
     setIsFolderFormOpen(true);
   }
 
-  async function handleRenameFolder(folderId: string, currentName: string) {
-    const nextName = window.prompt("Nuevo nombre de la carpeta", currentName)?.trim();
-    if (!nextName || nextName === currentName) return;
+  async function handleRenameFolder() {
+    if (!folderRenameTarget) return;
+    const nextName = renameFolderValue.trim();
+    if (!nextName) {
+      setRenameFolderError("El nombre no puede estar vacío.");
+      return;
+    }
+    if (nextName === folderRenameTarget.currentName.trim()) {
+      setFolderRenameTarget(null);
+      setRenameFolderValue("");
+      setRenameFolderError(null);
+      return;
+    }
+    setIsRenamingFolder(true);
+    setRenameFolderError(null);
     setError(null);
     try {
-      await api.projects.renameFolder(folderId, nextName);
+      await api.projects.renameFolder(folderRenameTarget.id, nextName);
       setNotice("Carpeta renombrada.");
+      setFolderRenameTarget(null);
+      setRenameFolderValue("");
+      setRenameFolderError(null);
       await loadDashboard();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo renombrar la carpeta.");
+      setRenameFolderError(err instanceof Error ? err.message : "No se pudo renombrar la carpeta.");
+    } finally {
+      setIsRenamingFolder(false);
     }
   }
 
-  async function handleDeleteFolder(folderId: string) {
-    const confirmed = window.confirm("¿Eliminar esta carpeta?");
-    if (!confirmed) return;
+  function openRenameFolderModal(folderId: string, currentName: string) {
+    setFolderRenameTarget({ id: folderId, currentName });
+    setRenameFolderValue(currentName);
+    setRenameFolderError(null);
+  }
+
+  function openDeleteModal(target: DeleteTarget) {
+    setDeleteTarget(target);
+    setDeleteConfirmStep(1);
+    setDeleteConfirmValue("");
+    setDeleteNeedsCascade(false);
+    setDeleteDialogError(null);
+  }
+
+  async function handleDeleteTarget() {
+    if (!deleteTarget) return;
+    if (deleteConfirmStep === 1) {
+      setDeleteConfirmStep(2);
+      setDeleteDialogError(null);
+      return;
+    }
+    if (deleteConfirmValue.trim() !== deleteTarget.name.trim()) {
+      setDeleteDialogError("Escribe el nombre exactamente para confirmar.");
+      return;
+    }
+
+    setIsDeletingTarget(true);
     setError(null);
     setNotice(null);
-    try {
-      await api.projects.deleteFolder(folderId, false);
-      setNotice("Carpeta eliminada.");
-      await loadDashboard();
+    setDeleteDialogError(null);
+
+    if (deleteTarget.kind === "project") {
+      try {
+        await api.projects.delete(deleteTarget.id);
+        setNotice(`Proyecto "${deleteTarget.name}" eliminado.`);
+        setDeleteTarget(null);
+        await loadDashboard();
+      } catch (err) {
+        setDeleteDialogError(err instanceof Error ? err.message : "No se pudo eliminar el proyecto.");
+      } finally {
+        setIsDeletingTarget(false);
+      }
       return;
+    }
+
+    try {
+      await api.projects.deleteFolder(deleteTarget.id, deleteNeedsCascade);
+      setNotice(deleteNeedsCascade ? "Carpeta y contenido eliminados." : "Carpeta eliminada.");
+      setDeleteTarget(null);
+      await loadDashboard();
     } catch (err) {
       const isNotEmpty =
         err instanceof ApiError &&
         err.status === 409 &&
         (err.errorCode === "FOLDER_NOT_EMPTY" || err.message.includes("contains subfolders"));
-      if (!isNotEmpty) {
-        setError(err instanceof Error ? err.message : "No se pudo eliminar la carpeta.");
-        return;
+      if (isNotEmpty && !deleteNeedsCascade) {
+        setDeleteNeedsCascade(true);
+        setDeleteDialogError("La carpeta contiene subcarpetas o proyectos. Confirma nuevamente para eliminar todo su contenido.");
+      } else {
+        setDeleteDialogError(err instanceof Error ? err.message : "No se pudo eliminar la carpeta.");
       }
-    }
-
-    const cascadeConfirmed = window.confirm(
-      "La carpeta contiene subcarpetas o proyectos. ¿Eliminar todo su contenido?",
-    );
-    if (!cascadeConfirmed) return;
-    try {
-      await api.projects.deleteFolder(folderId, true);
-      setNotice("Carpeta y contenido eliminados.");
-      await loadDashboard();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo eliminar la carpeta.");
+    } finally {
+      setIsDeletingTarget(false);
     }
   }
 
@@ -251,121 +409,25 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleDeleteProject() {
-    if (!projectPendingDelete) return;
-    setIsDeletingProject(true);
-    setError(null);
-    setNotice(null);
-    try {
-      await api.projects.delete(projectPendingDelete.id);
-      setNotice(`Proyecto "${projectPendingDelete.name}" eliminado.`);
-      setProjectPendingDelete(null);
-      await loadDashboard();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo eliminar el proyecto.");
-    } finally {
-      setIsDeletingProject(false);
-    }
-  }
-
-  function formatDate(iso: string) {
-    const date = new Date(iso);
-    return new Intl.DateTimeFormat("es-CL", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    }).format(date);
-  }
-
-  function renderFolderNodes(nodes: FolderTreeNode[], depth = 0): JSX.Element[] {
+  function renderSidebarTree(nodes: FolderTreeNode[], depth = 0): JSX.Element[] {
     return nodes.flatMap((node) => {
-      const folderProjects = projectsByFolder.get(node.id) ?? [];
       const isSelected = selectedScope === node.id;
-      const item = (
+      const row = (
         <li key={node.id}>
-          <div
-            className={`rounded-md border px-3 py-2 ${
-              isSelected
-                ? "border-brand-300 bg-brand-50 ring-1 ring-brand-200"
-                : "border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50"
+          <button
+            type="button"
+            onClick={() => setSelectedScope(node.id)}
+            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm ${
+              isSelected ? "bg-brand-50 font-medium text-brand-800" : "text-gray-700 hover:bg-gray-50"
             }`}
-            style={{ marginLeft: `${depth * 12}px` }}
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
           >
-            <div className="flex items-center justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => setSelectedScope(node.id)}
-                className="min-w-0 text-left"
-              >
-                <p className="truncate text-sm font-medium text-gray-900">{node.name}</p>
-                <p className="mt-0.5 text-xs text-gray-500">
-                  {(folderProjects.length || 0).toString()} proyecto
-                  {folderProjects.length === 1 ? "" : "s"}
-                </p>
-              </button>
-              <div className="relative shrink-0" data-folder-menu-root="true">
-                <button
-                  type="button"
-                  onClick={() => setOpenFolderMenuId((prev) => (prev === node.id ? null : node.id))}
-                  className="rounded-md border border-gray-200 px-2 py-1 text-sm text-gray-600 hover:bg-gray-100 hover:text-gray-800"
-                  aria-label={`Acciones para carpeta ${node.name}`}
-                >
-                  &#8942;
-                </button>
-                {openFolderMenuId === node.id ? (
-                  <div className="absolute right-0 z-20 mt-1 w-44 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setOpenFolderMenuId(null);
-                        openSubfolderForm(node.id);
-                      }}
-                      className="block w-full px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
-                    >
-                      Crear subcarpeta
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setOpenFolderMenuId(null);
-                        void handleRenameFolder(node.id, node.name);
-                      }}
-                      className="block w-full px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
-                    >
-                      Renombrar carpeta
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setOpenFolderMenuId(null);
-                        void handleDeleteFolder(node.id);
-                      }}
-                      className="block w-full px-3 py-2 text-left text-xs font-medium text-red-700 hover:bg-red-50"
-                    >
-                      Eliminar carpeta
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-            {folderProjects.length > 0 ? (
-              <ul className="mt-2 space-y-1 border-t border-gray-100 pt-2">
-                {folderProjects.map((project) => (
-                  <li key={project.id}>
-                    <Link
-                      href={`/projects/${project.id}`}
-                      className="block truncate text-xs text-gray-600 hover:text-brand-700"
-                    >
-                      {project.name}
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
+            <span aria-hidden className="text-base leading-none">📁</span>
+            <span className="truncate">{node.name}</span>
+          </button>
         </li>
       );
-      return [item, ...renderFolderNodes(node.children, depth + 1)];
+      return [row, ...renderSidebarTree(node.children, depth + 1)];
     });
   }
 
@@ -374,33 +436,54 @@ export default function DashboardPage() {
       <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-xl font-semibold text-gray-900">Proyectos</h2>
-          <p className="mt-1 text-sm text-gray-500">
-            Organiza proyectos en carpetas y genera videos desde presentaciones.
-          </p>
+          <p className="mt-1 text-sm text-gray-500">Organiza carpetas y proyectos con una vista escalable tipo Drive.</p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="relative" data-new-menu-root="true">
           <button
             type="button"
-            onClick={() => {
-              setFolderParentId(null);
-              setFolderName("");
-              setIsFolderFormOpen((value) => !value);
-            }}
-            className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+            onClick={() => setIsNewMenuOpen((value) => !value)}
+            className="inline-flex items-center gap-2 rounded-md bg-brand-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
           >
-            {isFolderFormOpen ? "Cancelar carpeta" : "Crear carpeta"}
+            <span className="text-base leading-none">＋</span>
+            Nuevo
           </button>
-          <button
-            type="button"
-            onClick={() =>
-              openProjectForm(
-                selectedScope !== ALL_SCOPE ? selectedScope : null,
-              )
-            }
-            className="rounded-md bg-brand-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700"
-          >
-            {isProjectFormOpen ? "Editando formulario" : "Crear proyecto"}
-          </button>
+          {isNewMenuOpen ? (
+            <div className="absolute right-0 z-30 mt-2 w-52 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsNewMenuOpen(false);
+                  setFolderParentId(null);
+                  setFolderName("");
+                  setIsFolderFormOpen(true);
+                }}
+                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+              >
+                Crear carpeta
+              </button>
+              <button
+                type="button"
+                disabled={selectedScope === ALL_SCOPE}
+                onClick={() => {
+                  setIsNewMenuOpen(false);
+                  if (selectedScope !== ALL_SCOPE) openSubfolderForm(selectedScope);
+                }}
+                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
+              >
+                Crear subcarpeta
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsNewMenuOpen(false);
+                  openProjectForm(selectedScope === ALL_SCOPE ? null : selectedScope);
+                }}
+                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+              >
+                Crear proyecto
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
 
@@ -414,10 +497,7 @@ export default function DashboardPage() {
       </div>
 
       {isFolderFormOpen ? (
-        <form
-          onSubmit={handleCreateFolder}
-          className="mb-4 rounded-lg border border-gray-200 bg-white p-5 shadow-sm"
-        >
+        <form onSubmit={handleCreateFolder} className="mb-4 rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
           <div className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
             <label className="block">
               <span className="text-sm font-medium text-gray-700">Nombre de carpeta</span>
@@ -449,7 +529,7 @@ export default function DashboardPage() {
             <button
               type="submit"
               disabled={isSavingFolder}
-              className="rounded-md bg-gray-900 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
+              className="rounded-md bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
             >
               {isSavingFolder ? "Guardando..." : "Guardar carpeta"}
             </button>
@@ -458,10 +538,7 @@ export default function DashboardPage() {
       ) : null}
 
       {isProjectFormOpen ? (
-        <form
-          onSubmit={handleCreateProject}
-          className="mb-6 rounded-lg border border-gray-200 bg-white p-5 shadow-sm"
-        >
+        <form onSubmit={handleCreateProject} className="mb-6 rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
           <div className="grid gap-4 md:grid-cols-2">
             <label className="block">
               <span className="text-sm font-medium text-gray-700">Nombre</span>
@@ -481,7 +558,7 @@ export default function DashboardPage() {
                 onChange={(event) => setProjectFolderId(event.target.value || null)}
                 className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
               >
-                <option value="">Sin carpeta</option>
+                <option value="">Todos los proyectos (sin carpeta)</option>
                 {folderOptions.map((folder) => (
                   <option key={folder.id} value={folder.id}>
                     {"\u00A0".repeat(folder.depth * 2)}
@@ -511,7 +588,7 @@ export default function DashboardPage() {
             <button
               type="submit"
               disabled={isCreatingProject}
-              className="rounded-md bg-gray-900 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
+              className="rounded-md bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
             >
               {isCreatingProject ? "Creando..." : "Crear proyecto"}
             </button>
@@ -519,161 +596,488 @@ export default function DashboardPage() {
         </form>
       ) : null}
 
-      {error ? (
-        <div className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {error}
-        </div>
-      ) : null}
-      {notice ? (
-        <div className="mb-6 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-          {notice}
-        </div>
-      ) : null}
+      {error ? <div className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
+      {notice ? <div className="mb-6 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{notice}</div> : null}
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[340px_1fr]">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[280px_1fr]">
         <section className="rounded-lg border border-gray-200 bg-white shadow-sm">
-          <div className="border-b border-gray-200 px-5 py-4">
-            <h3 className="text-sm font-semibold text-gray-900">Carpetas</h3>
+          <div className="border-b border-gray-200 px-4 py-3">
+            <h3 className="text-sm font-semibold text-gray-900">Navegación</h3>
           </div>
-          <div className="space-y-2 px-4 py-4">
+          <div className="space-y-3 p-4">
+            <input
+              value={folderQuery}
+              onChange={(event) => setFolderQuery(event.target.value)}
+              placeholder="Buscar carpetas"
+              className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+            />
             <button
               type="button"
               onClick={() => setSelectedScope(ALL_SCOPE)}
               className={`w-full rounded-md px-3 py-2 text-left text-sm ${
-                selectedScope === ALL_SCOPE
-                  ? "bg-brand-50 font-medium text-brand-800 ring-1 ring-brand-200"
-                  : "text-gray-700 hover:bg-gray-50"
+                selectedScope === ALL_SCOPE ? "bg-brand-50 font-medium text-brand-800" : "text-gray-700 hover:bg-gray-50"
               }`}
             >
               Todos los proyectos
             </button>
             {isLoading ? (
-              <div className="space-y-2 pt-1">
-                <div className="h-10 animate-pulse rounded-md bg-gray-100" />
-                <div className="h-10 animate-pulse rounded-md bg-gray-100" />
-                <div className="h-10 animate-pulse rounded-md bg-gray-100" />
+              <div className="space-y-2">
+                <div className="h-9 animate-pulse rounded-md bg-gray-100" />
+                <div className="h-9 animate-pulse rounded-md bg-gray-100" />
               </div>
-            ) : folders.length === 0 ? (
+            ) : sidebarTree.length === 0 ? (
               <p className="rounded-md border border-dashed border-gray-200 px-3 py-4 text-xs text-gray-500">
-                No hay carpetas creadas.
+                {folderQuery.trim() ? "No hay carpetas que coincidan con la búsqueda." : "No hay carpetas creadas."}
               </p>
             ) : (
-              <ul className="space-y-2">{renderFolderNodes(folders)}</ul>
+              <ul className="max-h-[420px] space-y-0.5 overflow-auto pr-1">{renderSidebarTree(sidebarTree)}</ul>
             )}
           </div>
         </section>
 
         <section className="rounded-lg border border-gray-200 bg-white shadow-sm">
-          <div className="flex items-center justify-between border-b border-gray-200 px-5 py-4">
-            <h3 className="text-sm font-semibold text-gray-900">{selectedScopeLabel}</h3>
-            <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">
-              {filteredProjects.length}
-            </span>
+          <div className="border-b border-gray-200 px-5 py-4">
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-base font-semibold text-gray-900">{selectedScopeLabel}</h3>
+                <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">{filteredProjects.length} proyectos</span>
+              </div>
+              <nav className="flex flex-wrap items-center gap-1 text-xs text-gray-600">
+                <button type="button" onClick={() => setSelectedScope(ALL_SCOPE)} className="rounded px-1.5 py-0.5 hover:bg-gray-100">
+                  Todos los proyectos
+                </button>
+                {breadcrumb.map((node, index) => (
+                  <span key={node.id} className="inline-flex items-center gap-1">
+                    <span>/</span>
+                    {index === breadcrumb.length - 1 ? (
+                      <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand-800">{node.name}</span>
+                    ) : (
+                      <button type="button" onClick={() => setSelectedScope(node.id)} className="rounded px-1.5 py-0.5 hover:bg-gray-100">
+                        {node.name}
+                      </button>
+                    )}
+                  </span>
+                ))}
+              </nav>
+              <div className="grid grid-cols-1 gap-3 lg:grid-cols-[1fr_1fr_auto_auto]">
+                <input
+                  value={projectQuery}
+                  onChange={(event) => setProjectQuery(event.target.value)}
+                  placeholder="Buscar proyectos"
+                  className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                />
+                <select
+                  value={sortMode}
+                  onChange={(event) => setSortMode(event.target.value as SortMode)}
+                  className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                >
+                  <option value="name">Ordenar por nombre</option>
+                  <option value="created">Recientemente creado</option>
+                  <option value="updated">Recientemente actualizado</option>
+                </select>
+                <div className="inline-flex rounded-md border border-gray-300 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("grid")}
+                    className={`rounded px-3 py-1.5 text-xs font-medium ${viewMode === "grid" ? "bg-gray-900 text-white" : "text-gray-700 hover:bg-gray-100"}`}
+                  >
+                    Cuadrícula
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("list")}
+                    className={`rounded px-3 py-1.5 text-xs font-medium ${viewMode === "list" ? "bg-gray-900 text-white" : "text-gray-700 hover:bg-gray-100"}`}
+                  >
+                    Lista
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => openProjectForm(selectedScope === ALL_SCOPE ? null : selectedScope)}
+                  className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                >
+                  Crear proyecto aquí
+                </button>
+              </div>
+            </div>
           </div>
 
-          {isLoading ? (
-            <div className="px-5 py-10 text-sm text-gray-500">Cargando dashboard...</div>
-          ) : filteredProjects.length === 0 ? (
-            <div className="px-5 py-10">
-              <p className="text-sm font-medium text-gray-900">No hay proyectos en esta vista.</p>
-              <p className="mt-1 text-sm text-gray-500">
-                Crea un proyecto o mueve uno existente a esta carpeta.
-              </p>
+          <div className="space-y-6 p-4">
+            <div>
+              <div className="mb-3 flex items-center justify-between">
+                <h4 className="text-sm font-semibold text-gray-900">Carpetas</h4>
+                <span className="text-xs text-gray-500">{visibleFolders.length}</span>
+              </div>
+              {isLoading ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                  <div className="h-24 animate-pulse rounded-lg bg-gray-100" />
+                  <div className="h-24 animate-pulse rounded-lg bg-gray-100" />
+                </div>
+              ) : visibleFolders.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-gray-200 px-4 py-5 text-sm text-gray-500">
+                  {folderQuery.trim() ? "No hay resultados de carpetas en esta ubicación." : "No hay subcarpetas en esta ubicación."}
+                </div>
+              ) : viewMode === "grid" ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                  {visibleFolders.map((folder) => {
+                    const folderProjects = projectsByFolder.get(folder.id) ?? [];
+                    return (
+                      <article
+                        key={folder.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setSelectedScope(folder.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            setSelectedScope(folder.id);
+                          }
+                        }}
+                        className={`rounded-lg border p-4 transition ${
+                          selectedScope === folder.id
+                            ? "border-brand-300 bg-brand-50 ring-1 ring-brand-200"
+                            : "cursor-pointer border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm"
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0 text-left">
+                            <p className="truncate text-sm font-semibold text-gray-900">📁 {folder.name}</p>
+                            <p className="mt-1 text-xs text-gray-500">{folderProjects.length} proyectos</p>
+                          </div>
+                          <div className="relative shrink-0" data-folder-menu-root="true">
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setOpenFolderMenuId((prev) => (prev === folder.id ? null : folder.id));
+                              }}
+                              className="rounded-md border border-gray-200 px-2 py-1 text-sm text-gray-600 hover:bg-gray-100"
+                              aria-label={`Acciones para carpeta ${folder.name}`}
+                            >
+                              &#8942;
+                            </button>
+                            {openFolderMenuId === folder.id ? (
+                              <div className="absolute right-0 z-20 mt-1 w-44 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenFolderMenuId(null);
+                                    openSubfolderForm(folder.id);
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                  Crear subcarpeta
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenFolderMenuId(null);
+                                    openRenameFolderModal(folder.id, folder.name);
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                  Renombrar carpeta
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenFolderMenuId(null);
+                                    openDeleteModal({ kind: "folder", id: folder.id, name: folder.name });
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs font-medium text-red-700 hover:bg-red-50"
+                                >
+                                  Eliminar carpeta
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="overflow-hidden rounded-lg border border-gray-200">
+                  <ul className="divide-y divide-gray-200">
+                    {visibleFolders.map((folder) => {
+                      const folderProjects = projectsByFolder.get(folder.id) ?? [];
+                      return (
+                        <li
+                          key={folder.id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => setSelectedScope(folder.id)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              setSelectedScope(folder.id);
+                            }
+                          }}
+                          className="flex cursor-pointer items-center justify-between gap-3 bg-white px-4 py-3 hover:bg-gray-50"
+                        >
+                          <div className="min-w-0 text-left">
+                            <p className="truncate text-sm font-medium text-gray-900">📁 {folder.name}</p>
+                            <p className="mt-0.5 text-xs text-gray-500">{folderProjects.length} proyectos</p>
+                          </div>
+                          <div className="relative shrink-0" data-folder-menu-root="true">
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setOpenFolderMenuId((prev) => (prev === folder.id ? null : folder.id));
+                              }}
+                              className="rounded-md border border-gray-200 px-2 py-1 text-sm text-gray-600 hover:bg-gray-100"
+                            >
+                              &#8942;
+                            </button>
+                            {openFolderMenuId === folder.id ? (
+                              <div className="absolute right-0 z-20 mt-1 w-44 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenFolderMenuId(null);
+                                    openSubfolderForm(folder.id);
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                  Crear subcarpeta
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenFolderMenuId(null);
+                                    openRenameFolderModal(folder.id, folder.name);
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                  Renombrar carpeta
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenFolderMenuId(null);
+                                    openDeleteModal({ kind: "folder", id: folder.id, name: folder.name });
+                                  }}
+                                  className="block w-full px-3 py-2 text-left text-xs font-medium text-red-700 hover:bg-red-50"
+                                >
+                                  Eliminar carpeta
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
             </div>
-          ) : (
-            <div className="grid grid-cols-1 gap-3 p-4 xl:grid-cols-2">
-              {filteredProjects.map((project) => (
-                <article
-                  key={project.id}
-                  className="rounded-lg border border-gray-200 bg-white p-4 transition hover:border-brand-200 hover:shadow-sm"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <Link href={`/projects/${project.id}`} className="block">
-                        <p className="truncate text-sm font-semibold text-gray-900 hover:text-brand-700">
-                          {project.name}
-                        </p>
-                      </Link>
-                      <p className="mt-1 truncate text-sm text-gray-500">
-                        {project.description || "Sin descripción"}
-                      </p>
-                      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
-                        <span className="rounded-full bg-gray-100 px-2 py-1">
-                          {project.folder_id ? folderNameById.get(project.folder_id) ?? "Carpeta" : "Sin carpeta"}
-                        </span>
-                        <span>Actualizado: {formatDate(project.updated_at)}</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">
-                        {project.status}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-gray-100 pt-3">
-                    <label className="text-xs text-gray-500">Mover a</label>
-                    <select
-                      value={project.folder_id ?? ""}
-                      onChange={(event) => void handleMoveProject(project.id, event.target.value || null)}
-                      disabled={movingProjectId === project.id}
-                      className="max-w-[220px] rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:cursor-not-allowed disabled:bg-gray-100"
-                    >
-                      <option value="">Sin carpeta</option>
-                      {folderOptions.map((folder) => (
-                        <option key={folder.id} value={folder.id}>
-                          {"\u00A0".repeat(folder.depth * 2)}
-                          {folder.name}
-                        </option>
-                      ))}
-                    </select>
-                    <Link
-                      href={`/projects/${project.id}`}
-                      className="rounded-md border border-gray-300 px-2.5 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
-                    >
-                      Abrir
-                    </Link>
+
+            <div>
+              <div className="mb-3 flex items-center justify-between">
+                <h4 className="text-sm font-semibold text-gray-900">
+                  {isFolderScope ? "Proyectos en esta carpeta" : "Proyectos recientes"}
+                </h4>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-500">
+                    {showAllProjectsPreview || filteredProjects.length <= 2
+                      ? `${projectsToRender.length}`
+                      : `${projectsToRender.length} de ${filteredProjects.length}`}
+                  </span>
+                  {!isFolderScope && filteredProjects.length > 2 ? (
                     <button
                       type="button"
-                      onClick={() => setProjectPendingDelete(project)}
-                      className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
+                      onClick={() => setShowAllProjectsPreview((value) => !value)}
+                      className="rounded-md border border-gray-300 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50"
                     >
-                      Eliminar
+                      {showAllProjectsPreview ? "Mostrar recientes" : "Ver todos los proyectos"}
                     </button>
-                  </div>
-                </article>
-              ))}
+                  ) : null}
+                </div>
+              </div>
+              {isLoading ? (
+                <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                  <div className="h-28 animate-pulse rounded-lg bg-gray-100" />
+                  <div className="h-28 animate-pulse rounded-lg bg-gray-100" />
+                </div>
+              ) : projectsToRender.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-gray-200 px-4 py-6 text-sm text-gray-500">
+                  {projectQuery.trim()
+                    ? "No se encontraron proyectos para esa búsqueda."
+                    : isFolderScope
+                    ? "No hay proyectos en esta carpeta. Crea uno aquí o mueve uno existente."
+                    : "No hay proyectos en esta vista. Crea uno o mueve un proyecto aquí."}
+                </div>
+              ) : (
+                <div className={viewMode === "grid" ? "grid grid-cols-1 gap-3 xl:grid-cols-2" : "space-y-2"}>
+                  {projectsToRender.map((project) => (
+                    <article
+                      key={project.id}
+                      className={`rounded-lg border border-gray-200 bg-white p-4 transition hover:border-brand-200 hover:shadow-sm ${
+                        viewMode === "list" ? "flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" : ""
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <Link href={`/projects/${project.id}`} className="block">
+                          <p className="truncate text-sm font-semibold text-gray-900 hover:text-brand-700">{project.name}</p>
+                        </Link>
+                        <p className="mt-1 truncate text-sm text-gray-500">{project.description || "Sin descripción"}</p>
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                          <span className="rounded-full bg-gray-100 px-2 py-1">
+                            {project.folder_id ? folderNameById.get(project.folder_id) ?? "Carpeta" : "Todos los proyectos"}
+                          </span>
+                          <span>Actualizado: {formatDate(project.updated_at)}</span>
+                          <span className="rounded-full bg-gray-100 px-2.5 py-1 font-medium text-gray-700">{project.status}</span>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 border-t border-gray-100 pt-3 sm:border-0 sm:pt-0">
+                        <label className="text-xs text-gray-500">Mover a</label>
+                        <select
+                          value={project.folder_id ?? ""}
+                          onChange={(event) => void handleMoveProject(project.id, event.target.value || null)}
+                          disabled={movingProjectId === project.id}
+                          className="max-w-[220px] rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:cursor-not-allowed disabled:bg-gray-100"
+                        >
+                          <option value="">Todos los proyectos (sin carpeta)</option>
+                          {folderOptions.map((folder) => (
+                            <option key={folder.id} value={folder.id}>
+                              {"\u00A0".repeat(folder.depth * 2)}
+                              {folder.name}
+                            </option>
+                          ))}
+                        </select>
+                        <Link href={`/projects/${project.id}`} className="rounded-md border border-gray-300 px-2.5 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50">
+                          Abrir
+                        </Link>
+                        <button
+                          type="button"
+                          onClick={() => openDeleteModal({ kind: "project", id: project.id, name: project.name })}
+                          className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
+                        >
+                          Eliminar
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
             </div>
-          )}
+          </div>
         </section>
       </div>
 
-      {projectPendingDelete ? (
+      {folderRenameTarget ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900/40 p-4">
           <div className="w-full max-w-md rounded-lg border border-gray-200 bg-white p-5 shadow-xl">
-            <h4 className="text-base font-semibold text-gray-900">Eliminar proyecto</h4>
+            <h4 className="text-base font-semibold text-gray-900">Renombrar carpeta</h4>
             <p className="mt-2 text-sm text-gray-600">
-              Vas a eliminar <span className="font-medium text-gray-900">{projectPendingDelete.name}</span>. Esta
-              acción no se puede deshacer.
+              Ingresa un nuevo nombre para <span className="font-medium text-gray-900">{folderRenameTarget.currentName}</span>.
             </p>
-            <p className="mt-1 text-sm text-red-700">
-              También se eliminarán presentaciones, assets y configuraciones asociadas al proyecto.
-            </p>
+            <label className="mt-4 block">
+              <span className="text-xs font-medium text-gray-700">Nuevo nombre</span>
+              <input
+                value={renameFolderValue}
+                onChange={(event) => {
+                  setRenameFolderValue(event.target.value);
+                  setRenameFolderError(null);
+                }}
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                maxLength={255}
+                autoFocus
+              />
+            </label>
+            {renameFolderError ? (
+              <p className="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{renameFolderError}</p>
+            ) : null}
             <div className="mt-5 flex items-center justify-end gap-2">
               <button
                 type="button"
-                disabled={isDeletingProject}
-                onClick={() => setProjectPendingDelete(null)}
+                disabled={isRenamingFolder}
+                onClick={() => {
+                  setFolderRenameTarget(null);
+                  setRenameFolderError(null);
+                }}
                 className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-gray-100"
               >
                 Cancelar
               </button>
               <button
                 type="button"
-                disabled={isDeletingProject}
-                onClick={() => void handleDeleteProject()}
+                disabled={isRenamingFolder}
+                onClick={() => void handleRenameFolder()}
+                className="rounded-md bg-gray-900 px-3 py-2 text-sm font-semibold text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
+              >
+                {isRenamingFolder ? "Guardando..." : "Guardar"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {deleteTarget ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900/50 p-4">
+          <div className="w-full max-w-md rounded-lg border border-red-200 bg-white p-5 shadow-xl">
+            <h4 className="text-base font-semibold text-gray-900">
+              {deleteTarget.kind === "folder" ? "Eliminar carpeta" : "Eliminar proyecto"}
+            </h4>
+            <p className="mt-2 text-sm text-gray-600">
+              Vas a eliminar <span className="font-medium text-gray-900">{deleteTarget.name}</span>. Esta acción no se puede deshacer.
+            </p>
+            <p className="mt-1 text-sm text-red-700">
+              {deleteTarget.kind === "folder"
+                ? "Si contiene subcarpetas o proyectos, será necesario confirmar la eliminación total."
+                : "También se eliminarán presentaciones, assets y configuraciones asociadas al proyecto."}
+            </p>
+            <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              {deleteConfirmStep === 1
+                ? "Paso 1 de 2: confirma que quieres continuar."
+                : "Paso 2 de 2: escribe el nombre exacto para confirmar."}
+            </div>
+            {deleteConfirmStep === 2 ? (
+              <label className="mt-3 block">
+                <span className="text-xs font-medium text-gray-700">Escribe: {deleteTarget.name}</span>
+                <input
+                  value={deleteConfirmValue}
+                  onChange={(event) => {
+                    setDeleteConfirmValue(event.target.value);
+                    setDeleteDialogError(null);
+                  }}
+                  className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-red-500 focus:ring-2 focus:ring-red-100"
+                  autoFocus
+                />
+              </label>
+            ) : null}
+            {deleteDialogError ? (
+              <p className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{deleteDialogError}</p>
+            ) : null}
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingTarget}
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:bg-gray-100"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingTarget}
+                onClick={() => void handleDeleteTarget()}
                 className="rounded-md bg-red-600 px-3 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:bg-red-300"
               >
-                {isDeletingProject ? "Eliminando..." : "Eliminar proyecto"}
+                {isDeletingTarget
+                  ? "Eliminando..."
+                  : deleteConfirmStep === 1
+                  ? "Eliminar"
+                  : deleteNeedsCascade
+                  ? "Sí, eliminar permanentemente todo"
+                  : "Sí, eliminar permanentemente"}
               </button>
             </div>
           </div>
