@@ -6,12 +6,6 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/layout/AppShell";
 import { ApiError, FolderTreeNode, Project, api } from "@/lib/api";
 
-const stats = [
-  { label: "Videos generados", value: "0" },
-  { label: "Presentaciones subidas", value: "0" },
-  { label: "Tareas en cola", value: "0" },
-];
-
 const ALL_SCOPE = "__all__";
 
 type FolderOption = { id: string; name: string; depth: number };
@@ -92,13 +86,13 @@ export default function DashboardPage() {
   const [projectFolderId, setProjectFolderId] = useState<string | null>(null);
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [movingProjectId, setMovingProjectId] = useState<string | null>(null);
-  const [showAllProjectsPreview, setShowAllProjectsPreview] = useState(false);
 
   const [isFolderFormOpen, setIsFolderFormOpen] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [folderParentId, setFolderParentId] = useState<string | null>(null);
   const [isSavingFolder, setIsSavingFolder] = useState(false);
   const [openFolderMenuId, setOpenFolderMenuId] = useState<string | null>(null);
+  const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null);
   const [isNewMenuOpen, setIsNewMenuOpen] = useState(false);
   const [folderRenameTarget, setFolderRenameTarget] = useState<{ id: string; currentName: string } | null>(null);
   const [renameFolderValue, setRenameFolderValue] = useState("");
@@ -110,6 +104,9 @@ export default function DashboardPage() {
   const [deleteNeedsCascade, setDeleteNeedsCascade] = useState(false);
   const [isDeletingTarget, setIsDeletingTarget] = useState(false);
   const [deleteDialogError, setDeleteDialogError] = useState<string | null>(null);
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(null);
+  const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
+  const [expandedFolderIds, setExpandedFolderIds] = useState<Set<string>>(new Set());
 
   const [folderQuery, setFolderQuery] = useState("");
   const [projectQuery, setProjectQuery] = useState("");
@@ -172,7 +169,7 @@ export default function DashboardPage() {
   }, [folderCandidates, folderQuery, sortMode]);
 
   const selectedScopeLabel = useMemo(() => {
-    if (selectedScope === ALL_SCOPE) return "Todos los proyectos";
+    if (selectedScope === ALL_SCOPE) return "Todas las carpetas";
     return selectedFolder ? selectedFolder.name : "Carpeta";
   }, [selectedScope, selectedFolder]);
   const isFolderScope = selectedScope !== ALL_SCOPE;
@@ -193,21 +190,6 @@ export default function DashboardPage() {
     return sortProjects(queried, sortMode);
   }, [projects, selectedScope, projectQuery, sortMode]);
 
-  const recentProjects = useMemo(() => {
-    const recencySorted = [...filteredProjects].sort((a, b) => {
-      const updatedDiff = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
-      if (updatedDiff !== 0) return updatedDiff;
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
-    return recencySorted;
-  }, [filteredProjects]);
-
-  const projectsToRender = useMemo(() => {
-    if (isFolderScope) return recentProjects;
-    if (showAllProjectsPreview || recentProjects.length <= 2) return recentProjects;
-    return recentProjects.slice(0, 2);
-  }, [isFolderScope, recentProjects, showAllProjectsPreview]);
-
   async function loadDashboard() {
     try {
       setError(null);
@@ -226,19 +208,32 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    setShowAllProjectsPreview(false);
-  }, [selectedScope, projectQuery, sortMode]);
-
-  useEffect(() => {
     if (selectedScope === ALL_SCOPE) return;
     if (!folderMap.has(selectedScope)) setSelectedScope(ALL_SCOPE);
   }, [folderMap, selectedScope]);
 
   useEffect(() => {
+    if (selectedScope === ALL_SCOPE) return;
+    if (breadcrumb.length <= 1) return;
+    setExpandedFolderIds((prev) => {
+      const next = new Set(prev);
+      breadcrumb.slice(0, -1).forEach((node) => next.add(node.id));
+      return next;
+    });
+  }, [breadcrumb, selectedScope]);
+
+  useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target?.closest("[data-folder-menu-root='true']") || target?.closest("[data-new-menu-root='true']")) return;
+      if (
+        target?.closest("[data-folder-menu-root='true']") ||
+        target?.closest("[data-project-menu-root='true']") ||
+        target?.closest("[data-new-menu-root='true']")
+      ) {
+        return;
+      }
       setOpenFolderMenuId(null);
+      setOpenProjectMenuId(null);
       setIsNewMenuOpen(false);
     };
     document.addEventListener("mousedown", handleClickOutside);
@@ -409,34 +404,107 @@ export default function DashboardPage() {
     }
   }
 
+  function handleProjectDragStart(projectId: string) {
+    setDraggingProjectId(projectId);
+  }
+
+  function handleProjectDragEnd() {
+    setDraggingProjectId(null);
+    setDragOverFolderId(null);
+  }
+
+  async function handleDropProjectIntoFolder(targetFolderId: string) {
+    if (!draggingProjectId || !targetFolderId) return;
+    const project = projects.find((item) => item.id === draggingProjectId);
+    if (project?.folder_id === targetFolderId) {
+      setDraggingProjectId(null);
+      setDragOverFolderId(null);
+      return;
+    }
+    await handleMoveProject(draggingProjectId, targetFolderId);
+    setDraggingProjectId(null);
+    setDragOverFolderId(null);
+  }
+
+  function toggleFolderExpanded(folderId: string) {
+    setExpandedFolderIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderId)) next.delete(folderId);
+      else next.add(folderId);
+      return next;
+    });
+  }
+
   function renderSidebarTree(nodes: FolderTreeNode[], depth = 0): JSX.Element[] {
     return nodes.flatMap((node) => {
       const isSelected = selectedScope === node.id;
+      const hasChildren = node.children.length > 0;
+      const isExpanded = folderQuery.trim().length > 0 || expandedFolderIds.has(node.id);
+      const isDropTarget = draggingProjectId !== null && dragOverFolderId === node.id;
       const row = (
         <li key={node.id}>
-          <button
-            type="button"
-            onClick={() => setSelectedScope(node.id)}
-            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm ${
-              isSelected ? "bg-brand-50 font-medium text-brand-800" : "text-gray-700 hover:bg-gray-50"
-            }`}
+          <div
+            onDragOver={(event) => {
+              if (!draggingProjectId) return;
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "move";
+              if (dragOverFolderId !== node.id) setDragOverFolderId(node.id);
+            }}
+            onDragLeave={() => {
+              if (dragOverFolderId === node.id) setDragOverFolderId(null);
+            }}
+            onDrop={(event) => {
+              if (!draggingProjectId) return;
+              event.preventDefault();
+              event.stopPropagation();
+              void handleDropProjectIntoFolder(node.id);
+            }}
+            className={`flex items-center gap-1 rounded-md pr-1 ${
+              isSelected ? "bg-brand-50 text-brand-800" : "text-gray-700 hover:bg-gray-50"
+            } ${isDropTarget ? "ring-2 ring-brand-300 bg-brand-50/70" : ""}`}
             style={{ paddingLeft: `${8 + depth * 14}px` }}
           >
-            <span aria-hidden className="text-base leading-none">📁</span>
-            <span className="truncate">{node.name}</span>
-          </button>
+            {hasChildren ? (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggleFolderExpanded(node.id);
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded text-sm text-gray-500 hover:bg-gray-200 hover:text-gray-700"
+                aria-label={isExpanded ? `Contraer ${node.name}` : `Expandir ${node.name}`}
+                aria-expanded={isExpanded}
+              >
+                {isExpanded ? "▾" : "▸"}
+              </button>
+            ) : (
+              <span className="inline-block w-4" />
+            )}
+            <button
+              type="button"
+              onClick={() => setSelectedScope(node.id)}
+              className={`flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm ${
+                isSelected ? "font-medium text-brand-800" : "text-gray-700"
+              }`}
+            >
+              <span aria-hidden className="text-base leading-none">📁</span>
+              <span className="truncate">{node.name}</span>
+            </button>
+          </div>
         </li>
       );
-      return [row, ...renderSidebarTree(node.children, depth + 1)];
+      return [row, ...(hasChildren && isExpanded ? renderSidebarTree(node.children, depth + 1) : [])];
     });
   }
 
   return (
-    <AppShell title="Dashboard">
-      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+    <AppShell title="">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="text-xl font-semibold text-gray-900">Proyectos</h2>
-          <p className="mt-1 text-sm text-gray-500">Organiza carpetas y proyectos con una vista escalable tipo Drive.</p>
+          <h2 className="text-xl font-semibold text-gray-900">Videos</h2>
+          <p className="mt-1 text-sm text-gray-500">
+            Organiza en carpetas tus videos y administra tus proyectos en un espacio escalable estilo Drive.
+          </p>
         </div>
         <div className="relative" data-new-menu-root="true">
           <button
@@ -487,15 +555,6 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        {stats.map(({ label, value }) => (
-          <div key={label} className="rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
-            <p className="text-sm text-gray-500">{label}</p>
-            <p className="mt-1 text-3xl font-bold text-gray-900">{value}</p>
-          </div>
-        ))}
-      </div>
-
       {isFolderFormOpen ? (
         <form onSubmit={handleCreateFolder} className="mb-4 rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
           <div className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
@@ -539,6 +598,10 @@ export default function DashboardPage() {
 
       {isProjectFormOpen ? (
         <form onSubmit={handleCreateProject} className="mb-6 rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
+          <div className="mb-4 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">
+            <span className="font-medium">Ubicación:</span>{" "}
+            {projectFolderId ? folderNameById.get(projectFolderId) ?? "Carpeta seleccionada" : "Todas las carpetas"}
+          </div>
           <div className="grid gap-4 md:grid-cols-2">
             <label className="block">
               <span className="text-sm font-medium text-gray-700">Nombre</span>
@@ -599,12 +662,12 @@ export default function DashboardPage() {
       {error ? <div className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
       {notice ? <div className="mb-6 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{notice}</div> : null}
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[280px_1fr]">
-        <section className="rounded-lg border border-gray-200 bg-white shadow-sm">
+      <div className="grid min-h-[calc(100vh-220px)] grid-cols-1 gap-6 xl:grid-cols-[280px_1fr]">
+        <section className="flex h-full min-h-0 flex-col rounded-lg border border-gray-200 bg-white shadow-sm">
           <div className="border-b border-gray-200 px-4 py-3">
             <h3 className="text-sm font-semibold text-gray-900">Navegación</h3>
           </div>
-          <div className="space-y-3 p-4">
+          <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
             <input
               value={folderQuery}
               onChange={(event) => setFolderQuery(event.target.value)}
@@ -618,7 +681,7 @@ export default function DashboardPage() {
                 selectedScope === ALL_SCOPE ? "bg-brand-50 font-medium text-brand-800" : "text-gray-700 hover:bg-gray-50"
               }`}
             >
-              Todos los proyectos
+              Todas las carpetas
             </button>
             {isLoading ? (
               <div className="space-y-2">
@@ -630,7 +693,9 @@ export default function DashboardPage() {
                 {folderQuery.trim() ? "No hay carpetas que coincidan con la búsqueda." : "No hay carpetas creadas."}
               </p>
             ) : (
-              <ul className="max-h-[420px] space-y-0.5 overflow-auto pr-1">{renderSidebarTree(sidebarTree)}</ul>
+              <div className="min-h-0 flex-1 overflow-auto pr-1">
+                <ul className="space-y-0.5">{renderSidebarTree(sidebarTree)}</ul>
+              </div>
             )}
           </div>
         </section>
@@ -644,7 +709,7 @@ export default function DashboardPage() {
               </div>
               <nav className="flex flex-wrap items-center gap-1 text-xs text-gray-600">
                 <button type="button" onClick={() => setSelectedScope(ALL_SCOPE)} className="rounded px-1.5 py-0.5 hover:bg-gray-100">
-                  Todos los proyectos
+                  Todas las carpetas
                 </button>
                 {breadcrumb.map((node, index) => (
                   <span key={node.id} className="inline-flex items-center gap-1">
@@ -696,7 +761,7 @@ export default function DashboardPage() {
                   onClick={() => openProjectForm(selectedScope === ALL_SCOPE ? null : selectedScope)}
                   className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
                 >
-                  Crear proyecto aquí
+                  {isFolderScope ? "Crear video en esta carpeta" : "Crear video"}
                 </button>
               </div>
             </div>
@@ -721,11 +786,27 @@ export default function DashboardPage() {
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
                   {visibleFolders.map((folder) => {
                     const folderProjects = projectsByFolder.get(folder.id) ?? [];
+                    const isDropTarget = draggingProjectId !== null && dragOverFolderId === folder.id;
                     return (
                       <article
                         key={folder.id}
                         role="button"
                         tabIndex={0}
+                        onDragOver={(event) => {
+                          if (!draggingProjectId) return;
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = "move";
+                          if (dragOverFolderId !== folder.id) setDragOverFolderId(folder.id);
+                        }}
+                        onDragLeave={() => {
+                          if (dragOverFolderId === folder.id) setDragOverFolderId(null);
+                        }}
+                        onDrop={(event) => {
+                          if (!draggingProjectId) return;
+                          event.preventDefault();
+                          event.stopPropagation();
+                          void handleDropProjectIntoFolder(folder.id);
+                        }}
                         onClick={() => setSelectedScope(folder.id)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
@@ -737,7 +818,7 @@ export default function DashboardPage() {
                           selectedScope === folder.id
                             ? "border-brand-300 bg-brand-50 ring-1 ring-brand-200"
                             : "cursor-pointer border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm"
-                        }`}
+                        } ${isDropTarget ? "ring-2 ring-brand-300 bg-brand-50/70" : ""}`}
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0 text-left">
@@ -804,11 +885,27 @@ export default function DashboardPage() {
                   <ul className="divide-y divide-gray-200">
                     {visibleFolders.map((folder) => {
                       const folderProjects = projectsByFolder.get(folder.id) ?? [];
+                      const isDropTarget = draggingProjectId !== null && dragOverFolderId === folder.id;
                       return (
                         <li
                           key={folder.id}
                           role="button"
                           tabIndex={0}
+                          onDragOver={(event) => {
+                            if (!draggingProjectId) return;
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = "move";
+                            if (dragOverFolderId !== folder.id) setDragOverFolderId(folder.id);
+                          }}
+                          onDragLeave={() => {
+                            if (dragOverFolderId === folder.id) setDragOverFolderId(null);
+                          }}
+                          onDrop={(event) => {
+                            if (!draggingProjectId) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void handleDropProjectIntoFolder(folder.id);
+                          }}
                           onClick={() => setSelectedScope(folder.id)}
                           onKeyDown={(event) => {
                             if (event.key === "Enter" || event.key === " ") {
@@ -816,7 +913,9 @@ export default function DashboardPage() {
                               setSelectedScope(folder.id);
                             }
                           }}
-                          className="flex cursor-pointer items-center justify-between gap-3 bg-white px-4 py-3 hover:bg-gray-50"
+                          className={`flex cursor-pointer items-center justify-between gap-3 bg-white px-4 py-3 hover:bg-gray-50 ${
+                            isDropTarget ? "ring-2 ring-inset ring-brand-300 bg-brand-50/70" : ""
+                          }`}
                         >
                           <div className="min-w-0 text-left">
                             <p className="truncate text-sm font-medium text-gray-900">📁 {folder.name}</p>
@@ -879,95 +978,109 @@ export default function DashboardPage() {
               )}
             </div>
 
-            <div>
+            {isFolderScope ? (
+              <div>
               <div className="mb-3 flex items-center justify-between">
-                <h4 className="text-sm font-semibold text-gray-900">
-                  {isFolderScope ? "Proyectos en esta carpeta" : "Proyectos recientes"}
-                </h4>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-gray-500">
-                    {showAllProjectsPreview || filteredProjects.length <= 2
-                      ? `${projectsToRender.length}`
-                      : `${projectsToRender.length} de ${filteredProjects.length}`}
-                  </span>
-                  {!isFolderScope && filteredProjects.length > 2 ? (
-                    <button
-                      type="button"
-                      onClick={() => setShowAllProjectsPreview((value) => !value)}
-                      className="rounded-md border border-gray-300 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50"
-                    >
-                      {showAllProjectsPreview ? "Mostrar recientes" : "Ver todos los proyectos"}
-                    </button>
-                  ) : null}
-                </div>
+                <h4 className="text-sm font-semibold text-gray-900">Proyectos en esta carpeta</h4>
+                <span className="text-xs text-gray-500">{filteredProjects.length}</span>
               </div>
               {isLoading ? (
                 <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                   <div className="h-28 animate-pulse rounded-lg bg-gray-100" />
                   <div className="h-28 animate-pulse rounded-lg bg-gray-100" />
                 </div>
-              ) : projectsToRender.length === 0 ? (
+              ) : filteredProjects.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-gray-200 px-4 py-6 text-sm text-gray-500">
                   {projectQuery.trim()
                     ? "No se encontraron proyectos para esa búsqueda."
-                    : isFolderScope
-                    ? "No hay proyectos en esta carpeta. Crea uno aquí o mueve uno existente."
-                    : "No hay proyectos en esta vista. Crea uno o mueve un proyecto aquí."}
+                    : "No hay proyectos en esta carpeta. Crea uno aquí o mueve uno existente."}
                 </div>
               ) : (
                 <div className={viewMode === "grid" ? "grid grid-cols-1 gap-3 xl:grid-cols-2" : "space-y-2"}>
-                  {projectsToRender.map((project) => (
+                  {filteredProjects.map((project) => (
                     <article
                       key={project.id}
+                      draggable
+                      onDragStart={() => handleProjectDragStart(project.id)}
+                      onDragEnd={handleProjectDragEnd}
                       className={`rounded-lg border border-gray-200 bg-white p-4 transition hover:border-brand-200 hover:shadow-sm ${
                         viewMode === "list" ? "flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" : ""
-                      }`}
+                      } ${draggingProjectId === project.id ? "opacity-70 ring-2 ring-brand-200" : ""}`}
                     >
-                      <div className="min-w-0">
-                        <Link href={`/projects/${project.id}`} className="block">
-                          <p className="truncate text-sm font-semibold text-gray-900 hover:text-brand-700">{project.name}</p>
-                        </Link>
-                        <p className="mt-1 truncate text-sm text-gray-500">{project.description || "Sin descripción"}</p>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
-                          <span className="rounded-full bg-gray-100 px-2 py-1">
-                            {project.folder_id ? folderNameById.get(project.folder_id) ?? "Carpeta" : "Todos los proyectos"}
-                          </span>
-                          <span>Actualizado: {formatDate(project.updated_at)}</span>
-                          <span className="rounded-full bg-gray-100 px-2.5 py-1 font-medium text-gray-700">{project.status}</span>
+                      <div className="flex min-w-0 items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <Link href={`/projects/${project.id}`} className="block">
+                            <p className="truncate text-sm font-semibold text-gray-900 hover:text-brand-700">{project.name}</p>
+                          </Link>
+                          <p className="mt-1 truncate text-sm text-gray-500">{project.description || "Sin descripción"}</p>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                            <span className="rounded-full bg-gray-100 px-2 py-1">
+                              {project.folder_id ? folderNameById.get(project.folder_id) ?? "Carpeta" : "Todas las carpetas"}
+                            </span>
+                            <span>Actualizado: {formatDate(project.updated_at)}</span>
+                            <span className="rounded-full bg-gray-100 px-2.5 py-1 font-medium text-gray-700">{project.status}</span>
+                          </div>
                         </div>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2 border-t border-gray-100 pt-3 sm:border-0 sm:pt-0">
-                        <label className="text-xs text-gray-500">Mover a</label>
-                        <select
-                          value={project.folder_id ?? ""}
-                          onChange={(event) => void handleMoveProject(project.id, event.target.value || null)}
-                          disabled={movingProjectId === project.id}
-                          className="max-w-[220px] rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:cursor-not-allowed disabled:bg-gray-100"
-                        >
-                          <option value="">Todos los proyectos (sin carpeta)</option>
-                          {folderOptions.map((folder) => (
-                            <option key={folder.id} value={folder.id}>
-                              {"\u00A0".repeat(folder.depth * 2)}
-                              {folder.name}
-                            </option>
-                          ))}
-                        </select>
-                        <Link href={`/projects/${project.id}`} className="rounded-md border border-gray-300 px-2.5 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50">
-                          Abrir
-                        </Link>
-                        <button
-                          type="button"
-                          onClick={() => openDeleteModal({ kind: "project", id: project.id, name: project.name })}
-                          className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50"
-                        >
-                          Eliminar
-                        </button>
+                        <div className="relative shrink-0 self-start" data-project-menu-root="true">
+                          <button
+                            type="button"
+                            onClick={() => setOpenProjectMenuId((prev) => (prev === project.id ? null : project.id))}
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-300 text-sm text-gray-600 hover:bg-gray-100"
+                            aria-label={`Acciones para proyecto ${project.name}`}
+                          >
+                            &#8942;
+                          </button>
+                          {openProjectMenuId === project.id ? (
+                            <div className="absolute right-0 z-20 mt-1 w-64 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
+                              <Link
+                                href={`/projects/${project.id}`}
+                                onClick={() => setOpenProjectMenuId(null)}
+                                className="block px-3 py-2 text-left text-xs font-medium text-gray-700 hover:bg-gray-50"
+                              >
+                                Abrir proyecto
+                              </Link>
+                              <div className="my-1 border-t border-gray-100" />
+                              <div className="px-3 py-2">
+                                <p className="mb-1 text-xs font-medium text-gray-500">Mover a carpeta</p>
+                                <select
+                                  value={project.folder_id ?? ""}
+                                  onChange={(event) => {
+                                    setOpenProjectMenuId(null);
+                                    void handleMoveProject(project.id, event.target.value || null);
+                                  }}
+                                  disabled={movingProjectId === project.id}
+                                  className="w-full rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:cursor-not-allowed disabled:bg-gray-100"
+                                >
+                                  <option value="">Todas las carpetas</option>
+                                  {folderOptions.map((folder) => (
+                                    <option key={folder.id} value={folder.id}>
+                                      {"\u00A0".repeat(folder.depth * 2)}
+                                      {folder.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="my-1 border-t border-gray-100" />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setOpenProjectMenuId(null);
+                                  openDeleteModal({ kind: "project", id: project.id, name: project.name });
+                                }}
+                                className="block w-full px-3 py-2 text-left text-xs font-medium text-red-700 hover:bg-red-50"
+                              >
+                                Eliminar proyecto
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
                       </div>
                     </article>
                   ))}
                 </div>
               )}
             </div>
+            ) : null}
           </div>
         </section>
       </div>
