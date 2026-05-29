@@ -7,11 +7,12 @@ interface AppShellProps {
 }
 
 export function AppShell({ title, children }: AppShellProps) {
+  const showHeader = title.trim().length > 0;
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-auto">
-        <Header title={title} />
+        {showHeader ? <Header title={title} /> : null}
         <main className="flex-1 p-6">{children}</main>
       </div>
     </div>
