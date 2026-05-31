@@ -2,6 +2,8 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+from app.modules.projects.models import Folder
+from app.modules.projects.service import MOCK_ORG_ID
 from tests.fakes import InMemoryStorageProvider
 
 BASE = "/api/v1/projects"
@@ -276,6 +278,82 @@ def test_create_project_inside_folder_and_move_between_folders(client):
     assert move.json()["folder_id"] == folder_b["id"]
 
 
+def test_create_project_without_folder_assigns_default_sin_nombre_folder(client):
+    project_res = client.post(f"{BASE}/", json={"name": "Video sin carpeta"})
+    assert project_res.status_code == 201
+    project = project_res.json()
+    assert project["folder_id"] is not None
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    root_names = {item["name"] for item in tree_res.json()["items"]}
+    assert "Sin Nombre" in root_names
+
+
+def test_move_project_to_null_assigns_default_sin_nombre_folder(client):
+    folder = client.post(f"{BASE}/folders", json={"name": "Temporal"}).json()
+    project = client.post(
+        f"{BASE}/",
+        json={"name": "Video para mover", "folder_id": folder["id"]},
+    ).json()
+
+    move = client.post(f"{BASE}/{project['id']}/move", json={"folder_id": None})
+    assert move.status_code == 200
+    moved = move.json()
+    assert moved["folder_id"] is not None
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    default_folder = next(
+        item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"
+    )
+    assert moved["folder_id"] == default_folder["id"]
+
+
+def test_default_sin_nombre_folder_is_reused_without_duplicates(client):
+    first = client.post(f"{BASE}/", json={"name": "Video 1"}).json()
+    second = client.post(f"{BASE}/", json={"name": "Video 2"}).json()
+    assert first["folder_id"] == second["folder_id"]
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    sin_nombre = [item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"]
+    assert len(sin_nombre) == 1
+
+
+def test_default_sin_nombre_folder_consolidates_existing_duplicates(client, db_session):
+    duplicate_a = Folder(
+        organization_id=MOCK_ORG_ID,
+        parent_folder_id=None,
+        name="Sin Nombre",
+    )
+    duplicate_b = Folder(
+        organization_id=MOCK_ORG_ID,
+        parent_folder_id=None,
+        name="sin nombre",
+    )
+    db_session.add_all([duplicate_a, duplicate_b])
+    db_session.commit()
+    db_session.refresh(duplicate_a)
+    db_session.refresh(duplicate_b)
+
+    project = client.post(
+        f"{BASE}/",
+        json={"name": "Video en duplicado", "folder_id": str(duplicate_b.id)},
+    ).json()
+    assert project["folder_id"] == str(duplicate_b.id)
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    default_folders = [item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"]
+    assert len(default_folders) == 1
+    canonical_id = default_folders[0]["id"]
+
+    moved = client.get(f"{BASE}/{project['id']}")
+    assert moved.status_code == 200
+    assert moved.json()["folder_id"] == canonical_id
+
+
 def test_rename_folder(client):
     folder = client.post(f"{BASE}/folders", json={"name": "Viejo nombre"}).json()
 
@@ -314,7 +392,15 @@ def test_delete_folder_cascade_preserves_projects(client):
 
     project_res = client.get(f"{BASE}/{project['id']}")
     assert project_res.status_code == 200
-    assert project_res.json()["folder_id"] is None
+    reassigned_folder_id = project_res.json()["folder_id"]
+    assert reassigned_folder_id is not None
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    default_folder = next(
+        item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"
+    )
+    assert reassigned_folder_id == default_folder["id"]
 
     child_res = client.patch(f"{BASE}/folders/{child['id']}", json={"name": "No existe"})
     assert child_res.status_code == 404

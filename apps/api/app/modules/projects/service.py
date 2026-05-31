@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Mock identities — reemplazar con JWT cuando se implemente auth
 MOCK_ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 MOCK_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
+DEFAULT_UNASSIGNED_FOLDER_NAME = "Sin Nombre"
 
 ALLOWED_AVATAR_MIME_TYPES = {
     "image/jpeg",
@@ -50,6 +51,7 @@ class ProjectService:
         limit: int = 50,
         folder_id: uuid.UUID | None = None,
     ) -> ProjectList:
+        self._ensure_default_folder_and_assign_unscoped_projects()
         if folder_id is not None:
             self._get_folder_or_404(folder_id)
         items = self.repo.list_by_org(MOCK_ORG_ID, skip=skip, limit=limit, folder_id=folder_id)
@@ -65,14 +67,13 @@ class ProjectService:
         return project
 
     def create(self, data: ProjectCreate) -> Project:
-        if data.folder_id is not None:
-            self._get_folder_or_404(data.folder_id)
+        folder_id = self._resolve_target_folder_id(data.folder_id)
         project = Project(
             organization_id=MOCK_ORG_ID,
             owner_id=MOCK_USER_ID,
             name=data.name,
             description=data.description,
-            folder_id=data.folder_id,
+            folder_id=folder_id,
         )
         return self.repo.create(project)
 
@@ -80,8 +81,8 @@ class ProjectService:
         project = self.get_or_404(project_id)
         # Solo actualiza los campos explícitamente enviados (exclude_unset)
         for field, value in data.model_dump(exclude_unset=True).items():
-            if field == "folder_id" and value is not None:
-                self._get_folder_or_404(value)
+            if field == "folder_id":
+                value = self._resolve_target_folder_id(value)
             setattr(project, field, value)
         return self.repo.save(project)
 
@@ -91,12 +92,11 @@ class ProjectService:
 
     def move_project(self, project_id: uuid.UUID, data: ProjectMoveRequest) -> Project:
         project = self.get_or_404(project_id)
-        if data.folder_id is not None:
-            self._get_folder_or_404(data.folder_id)
-        project.folder_id = data.folder_id
+        project.folder_id = self._resolve_target_folder_id(data.folder_id)
         return self.repo.save(project)
 
     def list_folder_tree(self) -> FolderTreeRead:
+        self._ensure_default_folder_and_assign_unscoped_projects()
         folders = self.repo.list_folders_by_org(MOCK_ORG_ID)
         nodes: dict[uuid.UUID, FolderTreeNode] = {}
         for folder in folders:
@@ -143,6 +143,12 @@ class ProjectService:
 
     def delete_folder(self, folder_id: uuid.UUID, cascade: bool = False) -> None:
         folder = self._get_folder_or_404(folder_id)
+        fallback_folder = self._get_or_create_default_folder()
+        fallback_folder_id = (
+            fallback_folder.id
+            if folder.id != fallback_folder.id
+            else None
+        )
         folder_ids = self._folder_subtree_ids(folder.id)
         has_subfolders = len(folder_ids) > 1
         has_projects = (
@@ -166,7 +172,7 @@ class ProjectService:
         self.repo.db.query(Project).filter(
             Project.organization_id == MOCK_ORG_ID,
             Project.folder_id.in_(folder_ids),
-        ).update({Project.folder_id: None}, synchronize_session=False)
+        ).update({Project.folder_id: fallback_folder_id}, synchronize_session=False)
         self.repo.db.delete(folder)
         self.repo.db.commit()
 
@@ -395,6 +401,80 @@ class ProjectService:
                     "message": "A folder with this name already exists at this level.",
                 },
             )
+
+    def _resolve_target_folder_id(self, folder_id: uuid.UUID | None) -> uuid.UUID:
+        if folder_id is not None:
+            self._get_folder_or_404(folder_id)
+            return folder_id
+        default_folder = self._ensure_default_folder_and_assign_unscoped_projects()
+        return default_folder.id
+
+    def _ensure_default_folder_and_assign_unscoped_projects(self) -> Folder:
+        default_folder = self._get_or_create_default_folder()
+        updated_rows = (
+            self.repo.db.query(Project)
+            .filter(
+                Project.organization_id == MOCK_ORG_ID,
+                Project.folder_id.is_(None),
+            )
+            .update({Project.folder_id: default_folder.id}, synchronize_session=False)
+        )
+        if updated_rows:
+            self.repo.db.commit()
+        return default_folder
+
+    def _get_or_create_default_folder(self) -> Folder:
+        folders = self.repo.list_folders_by_org(MOCK_ORG_ID)
+        normalized_default_name = DEFAULT_UNASSIGNED_FOLDER_NAME.strip().lower()
+
+        default_roots = [
+            folder
+            for folder in folders
+            if folder.parent_folder_id is None
+            and folder.name.strip().lower() == normalized_default_name
+        ]
+        if default_roots:
+            canonical = min(default_roots, key=lambda folder: folder.created_at)
+            renamed = False
+            if canonical.name != DEFAULT_UNASSIGNED_FOLDER_NAME:
+                canonical.name = DEFAULT_UNASSIGNED_FOLDER_NAME
+                self.repo.db.add(canonical)
+                renamed = True
+            duplicates = [folder for folder in default_roots if folder.id != canonical.id]
+            changed = False
+            for duplicate in duplicates:
+                (
+                    self.repo.db.query(Project)
+                    .filter(
+                        Project.organization_id == MOCK_ORG_ID,
+                        Project.folder_id == duplicate.id,
+                    )
+                    .update({Project.folder_id: canonical.id}, synchronize_session=False)
+                )
+                (
+                    self.repo.db.query(Folder)
+                    .filter(
+                        Folder.organization_id == MOCK_ORG_ID,
+                        Folder.parent_folder_id == duplicate.id,
+                    )
+                    .update({Folder.parent_folder_id: canonical.id}, synchronize_session=False)
+                )
+                self.repo.db.delete(duplicate)
+                changed = True
+            if changed or renamed:
+                self.repo.db.commit()
+                self.repo.db.refresh(canonical)
+            return canonical
+
+        folder = Folder(
+            organization_id=MOCK_ORG_ID,
+            parent_folder_id=None,
+            name=DEFAULT_UNASSIGNED_FOLDER_NAME,
+        )
+        self.repo.db.add(folder)
+        self.repo.db.commit()
+        self.repo.db.refresh(folder)
+        return folder
 
 
 def _extension_for_mime_type(mime_type: str) -> str:
