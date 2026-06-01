@@ -9,6 +9,10 @@ const navItems = [
   { id: "como-funciona", label: "Cómo funciona" },
   { id: "beneficios", label: "Beneficios" },
 ] as const;
+type NavSectionId = (typeof navItems)[number]["id"];
+
+const isNavSectionId = (value: string): value is NavSectionId =>
+  navItems.some((item) => item.id === value);
 
 const featureCards = [
   {
@@ -69,12 +73,14 @@ const benefits = [
 ];
 
 export default function HomePage() {
-  const [activeSection, setActiveSection] =
-    useState<(typeof navItems)[number]["id"]>("inicio");
+  const [activeSection, setActiveSection] = useState<NavSectionId>("inicio");
   const [isScrolled, setIsScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const navById = useMemo(() => new Set(navItems.map((item) => item.id)), []);
+  const navById = useMemo<Set<NavSectionId>>(
+    () => new Set(navItems.map((item) => item.id)),
+    [],
+  );
 
   useEffect(() => {
     const sections = navItems
@@ -89,9 +95,9 @@ export default function HomePage() {
           .filter((entry) => entry.isIntersecting)
           .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
         if (!visible.length) return;
-        const next = visible[0].target.id;
-        if (navById.has(next)) {
-          setActiveSection(next as (typeof navItems)[number]["id"]);
+        const next = visible[0]?.target.id;
+        if (next && isNavSectionId(next) && navById.has(next)) {
+          setActiveSection(next);
         }
       },
       {
@@ -134,7 +140,7 @@ export default function HomePage() {
     return () => revealObserver.disconnect();
   }, []);
 
-  const scrollToSection = (sectionId: (typeof navItems)[number]["id"]) => {
+  const scrollToSection = (sectionId: NavSectionId) => {
     const section = document.getElementById(sectionId);
     const navbar = document.getElementById("landing-navbar");
     if (!section) return;
