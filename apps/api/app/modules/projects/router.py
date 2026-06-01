@@ -15,6 +15,7 @@ from app.modules.projects.schemas import (
     ProjectCreate,
     ProjectList,
     ProjectMoveRequest,
+    ProjectOpenStateRead,
     ProjectRead,
     ProjectUpdate,
 )
@@ -83,6 +84,14 @@ def get_project(
     service: ProjectService = Depends(get_service),
 ):
     return service.get_or_404(project_id)
+
+
+@router.get("/{project_id}/open-state", response_model=ProjectOpenStateRead)
+def get_project_open_state(
+    project_id: uuid.UUID,
+    service: ProjectService = Depends(get_service),
+):
+    return service.get_open_state(project_id)
 
 
 @router.patch("/{project_id}", response_model=ProjectRead)

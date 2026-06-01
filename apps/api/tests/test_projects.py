@@ -2,7 +2,8 @@ import uuid
 
 from fastapi.testclient import TestClient
 
-from app.modules.projects.models import Folder
+from app.modules.generation.models import GenerationJob
+from app.modules.projects.models import Asset, Folder, Presentation, PresentationStatus, Project, Slide
 from app.modules.projects.service import MOCK_ORG_ID
 from tests.fakes import InMemoryStorageProvider
 
@@ -90,6 +91,100 @@ def test_get_project_not_found_returns_404(client):
     res = client.get(f"{BASE}/{uuid.uuid4()}")
     assert res.status_code == 404
     assert res.json()["detail"] == "Project not found"
+
+
+def test_get_project_open_state_without_presentation(client):
+    project_id = _create(client, "Video sin deck").json()["id"]
+
+    res = client.get(f"{BASE}/{project_id}/open-state")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["project_id"] == project_id
+    assert body["has_presentation"] is False
+    assert body["presentation_id"] is None
+    assert body["slide_count"] == 0
+    assert body["has_slides"] is False
+    assert body["has_generated_video"] is False
+    assert body["generated_video_url"] is None
+
+
+def test_get_project_open_state_with_presentation_and_final_video(client, db_session):
+    project_payload = _create(client, "Video con estado").json()
+    project = db_session.get(Project, uuid.UUID(project_payload["id"]))
+    assert project is not None
+
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=project.organization_id,
+        title="Deck existente",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=2,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    db_session.add_all(
+        [
+            Slide(
+                presentation_id=presentation.id,
+                position=1,
+                title="Slide 1",
+                notes=None,
+                thumbnail_key=None,
+                duration_seconds=None,
+                metadata_=None,
+            ),
+            Slide(
+                presentation_id=presentation.id,
+                position=2,
+                title="Slide 2",
+                notes=None,
+                thumbnail_key=None,
+                duration_seconds=None,
+                metadata_=None,
+            ),
+        ]
+    )
+
+    final_asset = Asset(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        slide_id=None,
+        asset_type="final_video",
+        storage_key=f"projects/{project.id}/final.mp4",
+        filename="final.mp4",
+        mime_type="video/mp4",
+        size_bytes=1024,
+    )
+    db_session.add(final_asset)
+    db_session.flush()
+
+    generation_job = GenerationJob(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        status="completed",
+        progress_percentage=100.0,
+        final_asset_id=final_asset.id,
+    )
+    db_session.add(generation_job)
+    db_session.commit()
+
+    res = client.get(f"{BASE}/{project.id}/open-state")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["has_presentation"] is True
+    assert body["presentation_id"] == str(presentation.id)
+    assert body["presentation_status"] == "parsed"
+    assert body["slide_count"] == 2
+    assert body["has_slides"] is True
+    assert body["has_generated_video"] is True
+    assert body["generated_video_asset_id"] == str(final_asset.id)
+    assert body["generated_video_url"] is not None
+    assert body["latest_generation_job_id"] == str(generation_job.id)
+    assert body["latest_generation_status"] == "completed"
 
 
 # ── PATCH /projects/{id} ──────────────────────────────────────────────────────

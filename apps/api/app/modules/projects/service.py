@@ -15,6 +15,7 @@ from app.modules.projects.repository import ProjectRepository
 from app.modules.projects.schemas import (
     FolderCreate,
     FolderRename,
+    ProjectOpenStateRead,
     FolderTreeNode,
     FolderTreeRead,
     ProjectCreate,
@@ -65,6 +66,54 @@ class ProjectService:
                 status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
             )
         return project
+
+    def get_open_state(self, project_id: uuid.UUID) -> ProjectOpenStateRead:
+        project = self.get_or_404(project_id)
+        latest_presentation = self.repo.get_latest_presentation(project.id, project.organization_id)
+        has_presentation = latest_presentation is not None
+        presentation_id = latest_presentation.id if latest_presentation else None
+        presentation_status = latest_presentation.status if latest_presentation else None
+        slide_count = (
+            self.repo.count_slides(latest_presentation.id)
+            if latest_presentation is not None
+            else 0
+        )
+        has_slides = slide_count > 0
+
+        final_video_asset = self.repo.get_latest_asset_by_type(
+            project.id,
+            project.organization_id,
+            "final_video",
+        )
+        has_generated_video = final_video_asset is not None
+        generated_video_url = (
+            get_storage().generate_read_url(final_video_asset.storage_key)
+            if final_video_asset is not None
+            else None
+        )
+
+        latest_generation_job = self.repo.get_latest_generation_job(
+            project.id,
+            project.organization_id,
+        )
+
+        return ProjectOpenStateRead(
+            project_id=project.id,
+            has_presentation=has_presentation,
+            presentation_id=presentation_id,
+            presentation_status=presentation_status,
+            slide_count=slide_count,
+            has_slides=has_slides,
+            has_generated_video=has_generated_video,
+            generated_video_asset_id=final_video_asset.id if final_video_asset else None,
+            generated_video_url=generated_video_url,
+            latest_generation_job_id=(
+                latest_generation_job.id if latest_generation_job else None
+            ),
+            latest_generation_status=(
+                latest_generation_job.status if latest_generation_job else None
+            ),
+        )
 
     def create(self, data: ProjectCreate) -> Project:
         folder_id = self._resolve_target_folder_id(data.folder_id)
