@@ -109,7 +109,9 @@ def test_get_project_open_state_without_presentation(client):
     assert body["generated_video_url"] is None
 
 
-def test_get_project_open_state_with_presentation_and_final_video(client, db_session):
+def test_get_project_open_state_with_presentation_and_final_video(client, db_session, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)
     project_payload = _create(client, "Video con estado").json()
     project = db_session.get(Project, uuid.UUID(project_payload["id"]))
     assert project is not None
@@ -160,6 +162,7 @@ def test_get_project_open_state_with_presentation_and_final_video(client, db_ses
     )
     db_session.add(final_asset)
     db_session.flush()
+    storage.upload_file(final_asset.storage_key, b"fake-final-video", "video/mp4")
 
     generation_job = GenerationJob(
         organization_id=project.organization_id,
@@ -350,10 +353,13 @@ def test_create_folder_and_subfolder_and_list_tree(client):
 
     assert res.status_code == 200
     body = res.json()
-    assert len(body["items"]) == 1
-    assert body["items"][0]["id"] == root["id"]
-    assert len(body["items"][0]["children"]) == 1
-    assert body["items"][0]["children"][0]["id"] == child["id"]
+    roots = body["items"]
+    default_roots = [item for item in roots if item["name"] == "Sin Nombre"]
+    assert len(default_roots) == 1
+    cursos_root = next((item for item in roots if item["id"] == root["id"]), None)
+    assert cursos_root is not None
+    assert len(cursos_root["children"]) == 1
+    assert cursos_root["children"][0]["id"] == child["id"]
 
 
 def test_create_project_inside_folder_and_move_between_folders(client):
