@@ -102,6 +102,39 @@ export interface Project {
   updated_at: string;
 }
 
+export interface ProjectOpenState {
+  project_id: string;
+  has_presentation: boolean;
+  presentation_id: string | null;
+  presentation_status:
+    | "upload_pending"
+    | "uploaded"
+    | "processing"
+    | "parsed"
+    | "ready"
+    | "failed"
+    | null;
+  slide_count: number;
+  has_slides: boolean;
+  has_generated_video: boolean;
+  generated_video_asset_id: string | null;
+  generated_video_url: string | null;
+  latest_generation_job_id: string | null;
+  latest_generation_status:
+    | "pending"
+    | "validating"
+    | "queued"
+    | "generating_audio"
+    | "generating_avatar"
+    | "rendering_slides"
+    | "composing_slide"
+    | "composing_video"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | null;
+}
+
 export interface ProjectList {
   items: Project[];
   total: number;
@@ -428,6 +461,8 @@ export const api = {
         method: "DELETE",
       }),
     get: (projectId: string) => apiFetch<Project>(`/api/v1/projects/${projectId}`),
+    getOpenState: (projectId: string) =>
+      apiFetch<ProjectOpenState>(`/api/v1/projects/${projectId}/open-state`),
     getGenerationConfig: (projectId: string) =>
       apiFetch<ProjectGenerationConfig>(`/api/v1/projects/${projectId}/generation-config`),
     updateGenerationConfig: (

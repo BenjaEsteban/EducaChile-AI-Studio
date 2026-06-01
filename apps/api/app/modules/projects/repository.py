@@ -2,7 +2,8 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.modules.projects.models import Asset, Folder, Presentation, Project
+from app.modules.generation.models import GenerationJob
+from app.modules.projects.models import Asset, Folder, Presentation, Project, Slide
 
 
 class ProjectRepository:
@@ -62,6 +63,60 @@ class ProjectRepository:
             .filter(Folder.organization_id == org_id)
             .order_by(Folder.created_at.asc())
             .all()
+        )
+
+    def get_latest_presentation(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> Presentation | None:
+        return (
+            self.db.query(Presentation)
+            .filter(
+                Presentation.project_id == project_id,
+                Presentation.organization_id == org_id,
+            )
+            .order_by(Presentation.created_at.desc())
+            .first()
+        )
+
+    def count_slides(self, presentation_id: uuid.UUID) -> int:
+        return (
+            self.db.query(Slide)
+            .filter(Slide.presentation_id == presentation_id)
+            .count()
+        )
+
+    def get_latest_asset_by_type(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+        asset_type: str,
+    ) -> Asset | None:
+        return (
+            self.db.query(Asset)
+            .filter(
+                Asset.project_id == project_id,
+                Asset.organization_id == org_id,
+                Asset.asset_type == asset_type,
+            )
+            .order_by(Asset.created_at.desc())
+            .first()
+        )
+
+    def get_latest_generation_job(
+        self,
+        project_id: uuid.UUID,
+        org_id: uuid.UUID,
+    ) -> GenerationJob | None:
+        return (
+            self.db.query(GenerationJob)
+            .filter(
+                GenerationJob.project_id == project_id,
+                GenerationJob.organization_id == org_id,
+            )
+            .order_by(GenerationJob.created_at.desc())
+            .first()
         )
 
 

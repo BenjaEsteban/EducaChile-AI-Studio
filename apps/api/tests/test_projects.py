@@ -2,6 +2,9 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+from app.modules.generation.models import GenerationJob
+from app.modules.projects.models import Asset, Folder, Presentation, PresentationStatus, Project, Slide
+from app.modules.projects.service import MOCK_ORG_ID
 from tests.fakes import InMemoryStorageProvider
 
 BASE = "/api/v1/projects"
@@ -88,6 +91,103 @@ def test_get_project_not_found_returns_404(client):
     res = client.get(f"{BASE}/{uuid.uuid4()}")
     assert res.status_code == 404
     assert res.json()["detail"] == "Project not found"
+
+
+def test_get_project_open_state_without_presentation(client):
+    project_id = _create(client, "Video sin deck").json()["id"]
+
+    res = client.get(f"{BASE}/{project_id}/open-state")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["project_id"] == project_id
+    assert body["has_presentation"] is False
+    assert body["presentation_id"] is None
+    assert body["slide_count"] == 0
+    assert body["has_slides"] is False
+    assert body["has_generated_video"] is False
+    assert body["generated_video_url"] is None
+
+
+def test_get_project_open_state_with_presentation_and_final_video(client, db_session, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.projects.service.get_storage", lambda: storage)
+    project_payload = _create(client, "Video con estado").json()
+    project = db_session.get(Project, uuid.UUID(project_payload["id"]))
+    assert project is not None
+
+    presentation = Presentation(
+        project_id=project.id,
+        organization_id=project.organization_id,
+        title="Deck existente",
+        original_filename="deck.pptx",
+        storage_key="projects/deck.pptx",
+        status=PresentationStatus.parsed,
+        slide_count=2,
+    )
+    db_session.add(presentation)
+    db_session.flush()
+    db_session.add_all(
+        [
+            Slide(
+                presentation_id=presentation.id,
+                position=1,
+                title="Slide 1",
+                notes=None,
+                thumbnail_key=None,
+                duration_seconds=None,
+                metadata_=None,
+            ),
+            Slide(
+                presentation_id=presentation.id,
+                position=2,
+                title="Slide 2",
+                notes=None,
+                thumbnail_key=None,
+                duration_seconds=None,
+                metadata_=None,
+            ),
+        ]
+    )
+
+    final_asset = Asset(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        slide_id=None,
+        asset_type="final_video",
+        storage_key=f"projects/{project.id}/final.mp4",
+        filename="final.mp4",
+        mime_type="video/mp4",
+        size_bytes=1024,
+    )
+    db_session.add(final_asset)
+    db_session.flush()
+    storage.upload_file(final_asset.storage_key, b"fake-final-video", "video/mp4")
+
+    generation_job = GenerationJob(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        status="completed",
+        progress_percentage=100.0,
+        final_asset_id=final_asset.id,
+    )
+    db_session.add(generation_job)
+    db_session.commit()
+
+    res = client.get(f"{BASE}/{project.id}/open-state")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["has_presentation"] is True
+    assert body["presentation_id"] == str(presentation.id)
+    assert body["presentation_status"] == "parsed"
+    assert body["slide_count"] == 2
+    assert body["has_slides"] is True
+    assert body["has_generated_video"] is True
+    assert body["generated_video_asset_id"] == str(final_asset.id)
+    assert body["generated_video_url"] is not None
+    assert body["latest_generation_job_id"] == str(generation_job.id)
+    assert body["latest_generation_status"] == "completed"
 
 
 # ── PATCH /projects/{id} ──────────────────────────────────────────────────────
@@ -253,10 +353,13 @@ def test_create_folder_and_subfolder_and_list_tree(client):
 
     assert res.status_code == 200
     body = res.json()
-    assert len(body["items"]) == 1
-    assert body["items"][0]["id"] == root["id"]
-    assert len(body["items"][0]["children"]) == 1
-    assert body["items"][0]["children"][0]["id"] == child["id"]
+    roots = body["items"]
+    default_roots = [item for item in roots if item["name"] == "Sin Nombre"]
+    assert len(default_roots) == 1
+    cursos_root = next((item for item in roots if item["id"] == root["id"]), None)
+    assert cursos_root is not None
+    assert len(cursos_root["children"]) == 1
+    assert cursos_root["children"][0]["id"] == child["id"]
 
 
 def test_create_project_inside_folder_and_move_between_folders(client):
@@ -274,6 +377,82 @@ def test_create_project_inside_folder_and_move_between_folders(client):
     )
     assert move.status_code == 200
     assert move.json()["folder_id"] == folder_b["id"]
+
+
+def test_create_project_without_folder_assigns_default_sin_nombre_folder(client):
+    project_res = client.post(f"{BASE}/", json={"name": "Video sin carpeta"})
+    assert project_res.status_code == 201
+    project = project_res.json()
+    assert project["folder_id"] is not None
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    root_names = {item["name"] for item in tree_res.json()["items"]}
+    assert "Sin Nombre" in root_names
+
+
+def test_move_project_to_null_assigns_default_sin_nombre_folder(client):
+    folder = client.post(f"{BASE}/folders", json={"name": "Temporal"}).json()
+    project = client.post(
+        f"{BASE}/",
+        json={"name": "Video para mover", "folder_id": folder["id"]},
+    ).json()
+
+    move = client.post(f"{BASE}/{project['id']}/move", json={"folder_id": None})
+    assert move.status_code == 200
+    moved = move.json()
+    assert moved["folder_id"] is not None
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    default_folder = next(
+        item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"
+    )
+    assert moved["folder_id"] == default_folder["id"]
+
+
+def test_default_sin_nombre_folder_is_reused_without_duplicates(client):
+    first = client.post(f"{BASE}/", json={"name": "Video 1"}).json()
+    second = client.post(f"{BASE}/", json={"name": "Video 2"}).json()
+    assert first["folder_id"] == second["folder_id"]
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    sin_nombre = [item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"]
+    assert len(sin_nombre) == 1
+
+
+def test_default_sin_nombre_folder_consolidates_existing_duplicates(client, db_session):
+    duplicate_a = Folder(
+        organization_id=MOCK_ORG_ID,
+        parent_folder_id=None,
+        name="Sin Nombre",
+    )
+    duplicate_b = Folder(
+        organization_id=MOCK_ORG_ID,
+        parent_folder_id=None,
+        name="sin nombre",
+    )
+    db_session.add_all([duplicate_a, duplicate_b])
+    db_session.commit()
+    db_session.refresh(duplicate_a)
+    db_session.refresh(duplicate_b)
+
+    project = client.post(
+        f"{BASE}/",
+        json={"name": "Video en duplicado", "folder_id": str(duplicate_b.id)},
+    ).json()
+    assert project["folder_id"] == str(duplicate_b.id)
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    default_folders = [item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"]
+    assert len(default_folders) == 1
+    canonical_id = default_folders[0]["id"]
+
+    moved = client.get(f"{BASE}/{project['id']}")
+    assert moved.status_code == 200
+    assert moved.json()["folder_id"] == canonical_id
 
 
 def test_rename_folder(client):
@@ -314,7 +493,15 @@ def test_delete_folder_cascade_preserves_projects(client):
 
     project_res = client.get(f"{BASE}/{project['id']}")
     assert project_res.status_code == 200
-    assert project_res.json()["folder_id"] is None
+    reassigned_folder_id = project_res.json()["folder_id"]
+    assert reassigned_folder_id is not None
+
+    tree_res = client.get(f"{BASE}/folders/tree")
+    assert tree_res.status_code == 200
+    default_folder = next(
+        item for item in tree_res.json()["items"] if item["name"] == "Sin Nombre"
+    )
+    assert reassigned_folder_id == default_folder["id"]
 
     child_res = client.patch(f"{BASE}/folders/{child['id']}", json={"name": "No existe"})
     assert child_res.status_code == 404

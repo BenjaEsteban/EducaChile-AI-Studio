@@ -1,11 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { ChangeEvent, useCallback, useEffect, useState } from "react";
 
 import { AppShell } from "@/components/layout/AppShell";
-import { Project, Slide, api } from "@/lib/api";
+import { Project, ProjectOpenState, Slide, api } from "@/lib/api";
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat("es-CL", {
@@ -42,9 +42,12 @@ function isAllowedPresentation(file: File) {
 
 export default function ProjectDetailPage() {
   const params = useParams<{ projectId: string }>();
+  const router = useRouter();
   const projectId = params.projectId;
   const [project, setProject] = useState<Project | null>(null);
+  const [openState, setOpenState] = useState<ProjectOpenState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRedirecting, setIsRedirecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadStatus, setUploadStatus] = useState<UploadStatus>("idle");
@@ -55,19 +58,41 @@ export default function ProjectDetailPage() {
 
   useEffect(() => {
     async function loadProject() {
+      let shouldRedirect = false;
       try {
+        setIsLoading(true);
         setError(null);
-        const data = await api.projects.get(projectId);
-        setProject(data);
+        const [projectData, stateData] = await Promise.all([
+          api.projects.get(projectId),
+          api.projects.getOpenState(projectId),
+        ]);
+        setProject(projectData);
+        setOpenState(stateData);
+
+        const canOpenExistingState =
+          Boolean(stateData.presentation_id) &&
+          (stateData.has_presentation || stateData.has_slides || stateData.has_generated_video);
+        if (canOpenExistingState && stateData.presentation_id) {
+          shouldRedirect = true;
+          setIsRedirecting(true);
+          setPresentationId(stateData.presentation_id);
+          router.replace(`/projects/${projectId}/editor?presentationId=${stateData.presentation_id}`);
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "No se pudo cargar el proyecto.");
+        setError(
+          err instanceof Error
+            ? err.message
+            : "No se pudo cargar el proyecto y su estado guardado.",
+        );
       } finally {
-        setIsLoading(false);
+        if (!shouldRedirect) {
+          setIsLoading(false);
+        }
       }
     }
 
     void loadProject();
-  }, [projectId]);
+  }, [projectId, router]);
 
   const refreshSlides = useCallback(
     async (id = presentationId) => {
@@ -153,9 +178,9 @@ export default function ProjectDetailPage() {
         </Link>
       </div>
 
-      {isLoading ? (
+      {isLoading || isRedirecting ? (
         <div className="rounded-lg border border-gray-200 bg-white p-6 text-sm text-gray-500 shadow-sm">
-          Cargando proyecto...
+          {isRedirecting ? "Abriendo el proyecto con su estado guardado..." : "Cargando proyecto..."}
         </div>
       ) : error ? (
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -205,6 +230,12 @@ export default function ProjectDetailPage() {
                 </Link>
               ) : null}
             </div>
+
+            {openState && !openState.has_presentation ? (
+              <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+                Este proyecto aun no tiene una presentacion guardada. Sube un PPT/PPTX para comenzar.
+              </div>
+            ) : null}
 
             <div className="mt-5 flex flex-col gap-4">
               <input

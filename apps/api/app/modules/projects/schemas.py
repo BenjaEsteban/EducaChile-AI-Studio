@@ -42,6 +42,20 @@ class ProjectRead(BaseModel):
     updated_at: datetime
 
 
+class ProjectOpenStateRead(BaseModel):
+    project_id: uuid.UUID
+    has_presentation: bool
+    presentation_id: uuid.UUID | None
+    presentation_status: PresentationStatus | None
+    slide_count: int
+    has_slides: bool
+    has_generated_video: bool
+    generated_video_asset_id: uuid.UUID | None
+    generated_video_url: str | None
+    latest_generation_job_id: uuid.UUID | None
+    latest_generation_status: str | None
+
+
 class ProjectList(BaseModel):
     items: list[ProjectRead]
     total: int
