@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-import { AppShell } from "@/components/layout/AppShell";
 import { ApiError, FolderTreeNode, Project, api } from "@/lib/api";
 
 const ALL_SCOPE = "__all__";
@@ -109,6 +108,7 @@ export default function DashboardPage() {
   const [openFolderMenuId, setOpenFolderMenuId] = useState<string | null>(null);
   const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null);
   const [isNewMenuOpen, setIsNewMenuOpen] = useState(false);
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
   const [folderRenameTarget, setFolderRenameTarget] = useState<{ id: string; currentName: string } | null>(null);
   const [renameFolderValue, setRenameFolderValue] = useState("");
   const [isRenamingFolder, setIsRenamingFolder] = useState(false);
@@ -558,60 +558,125 @@ export default function DashboardPage() {
   }
 
   return (
-    <AppShell title="">
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-gray-900">Videos</h2>
-          <p className="mt-1 text-sm text-gray-500">
-            Organiza en carpetas tus videos.
-          </p>
-        </div>
-        <div className="relative" data-new-menu-root="true">
-          <button
-            type="button"
-            onClick={() => setIsNewMenuOpen((value) => !value)}
-            className="inline-flex items-center gap-2 rounded-md bg-brand-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
-          >
-            <span className="text-base leading-none">＋</span>
-            Nuevo
-          </button>
-          {isNewMenuOpen ? (
-            <div className="absolute right-0 z-30 mt-2 w-52 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
+    <div className="min-h-screen bg-gray-50">
+      <header className="sticky top-0 z-40 border-b border-slate-200/70 bg-white/90 backdrop-blur">
+        <div className="px-4 sm:px-6 lg:px-8">
+          <div className="flex min-h-16 items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <Link href="/" className="truncate text-sm font-semibold tracking-tight text-slate-900 sm:text-base">
+                EducaChile
+              </Link>
+              <span className="hidden text-xs text-slate-400 sm:inline">/</span>
+              <span className="hidden text-xs font-medium uppercase tracking-wide text-brand-700 sm:inline">
+                Videos
+              </span>
+            </div>
+
+            <nav className="hidden items-center gap-2 md:flex">
+              <Link
+                href="/"
+                className="rounded-md px-3 py-2 text-sm text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+              >
+                Home
+              </Link>
+              <Link
+                href="/dashboard"
+                className="rounded-md bg-brand-50 px-3 py-2 text-sm font-medium text-brand-700"
+              >
+                Videos
+              </Link>
+            </nav>
+
+            <div className="flex items-center gap-2">
+              <div className="relative" data-new-menu-root="true">
+                <button
+                  type="button"
+                  onClick={() => setIsNewMenuOpen((value) => !value)}
+                  className="inline-flex items-center gap-2 rounded-md bg-brand-600 px-3 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-700"
+                >
+                  <span className="text-base leading-none">＋</span>
+                  Nuevo
+                </button>
+                {isNewMenuOpen ? (
+                  <div className="absolute right-0 z-30 mt-2 w-56 rounded-md border border-gray-200 bg-white py-1 shadow-lg">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsNewMenuOpen(false);
+                        openProjectForm(selectedScope === ALL_SCOPE ? null : selectedScope);
+                      }}
+                      className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+                    >
+                      Crear video
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsNewMenuOpen(false);
+                        openFolderForm(selectedScope === ALL_SCOPE ? null : selectedScope, "folder");
+                      }}
+                      className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+                    >
+                      Crear carpeta
+                    </button>
+                    {selectedScope !== ALL_SCOPE ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsNewMenuOpen(false);
+                          openSubfolderForm(selectedScope);
+                        }}
+                        className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+                      >
+                        Crear subcarpeta
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+
               <button
                 type="button"
-                onClick={() => {
-                  setIsNewMenuOpen(false);
-                  openFolderForm(selectedScope === ALL_SCOPE ? null : selectedScope, "folder");
-                }}
-                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+                className="hidden rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 md:inline-flex"
               >
-                Crear carpeta
+                Cuenta
               </button>
+
               <button
                 type="button"
-                disabled={selectedScope === ALL_SCOPE}
-                onClick={() => {
-                  setIsNewMenuOpen(false);
-                  if (selectedScope !== ALL_SCOPE) openSubfolderForm(selectedScope);
-                }}
-                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
+                onClick={() => setIsMobileNavOpen((value) => !value)}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-700 transition hover:bg-slate-50 md:hidden"
+                aria-label="Abrir navegación"
               >
-                Crear subcarpeta
+                ☰
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsNewMenuOpen(false);
-                  openProjectForm(selectedScope === ALL_SCOPE ? null : selectedScope);
-                }}
-                className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
-              >
-                Crear video
-              </button>
+            </div>
+          </div>
+
+          {isMobileNavOpen ? (
+            <div className="pb-3 md:hidden">
+              <div className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2 py-2">
+                <Link
+                  href="/"
+                  onClick={() => setIsMobileNavOpen(false)}
+                  className="rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-white"
+                >
+                  Home
+                </Link>
+                <Link
+                  href="/dashboard"
+                  onClick={() => setIsMobileNavOpen(false)}
+                  className="rounded-md bg-white px-3 py-2 text-sm font-medium text-brand-700"
+                >
+                  Videos
+                </Link>
+              </div>
             </div>
           ) : null}
         </div>
-      </div>
+      </header>
+
+      <main className="px-4 pb-8 pt-5 sm:px-6 lg:px-8">
 
       {error ? <div className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
       {notice ? <div className="mb-6 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{notice}</div> : null}
@@ -1564,6 +1629,7 @@ export default function DashboardPage() {
           </div>
         </div>
       ) : null}
-    </AppShell>
+      </main>
+    </div>
   );
 }
