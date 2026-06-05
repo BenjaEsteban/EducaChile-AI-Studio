@@ -241,7 +241,7 @@ docker compose -f docker-compose.prod.yml --env-file .env.production.example con
 docker build -t educachile-api:test apps/api
 docker build --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 -t educachile-web:test apps/web
 docker compose exec api pytest
-docker compose exec web npm run build
+docker compose exec web pnpm run build
 ```
 
 The production compose file uses Docker Hub image names from the env file, so it is expected to pull remote images when running for real.
