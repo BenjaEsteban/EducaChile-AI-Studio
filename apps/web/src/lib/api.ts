@@ -142,6 +142,8 @@ export interface ProjectList {
   limit: number;
 }
 
+export type AvatarFitMode = "custom" | "full_slide" | "cover" | "contain";
+
 export interface ProjectAvatar {
   object_key: string;
   filename: string;
@@ -151,6 +153,8 @@ export interface ProjectAvatar {
   y: number;
   width: number;
   height: number;
+  border_radius: number;
+  fit_mode: AvatarFitMode;
   updated_at: string | null;
   avatar_asset_id: string;
   avatar_preview_url: string;
@@ -163,6 +167,77 @@ export interface ProjectAvatarLayoutUpdate {
   y: number;
   width: number;
   height: number;
+  border_radius?: number;
+  fit_mode?: AvatarFitMode;
+}
+
+/** Per-slide avatar placement metadata stored inside slide.metadata. */
+export interface SlideAvatarMeta {
+  x: number;        // canvas x in 960×540 coordinate space
+  y: number;
+  width: number;
+  height: number;
+  visible: boolean;
+  borderRadius: number;  // 0–50 (0 = square, 50 = circle)
+  fitMode: AvatarFitMode;
+}
+
+export const CANVAS_W = 960;
+export const CANVAS_H = 540;
+
+export const DEFAULT_SLIDE_AVATAR: SlideAvatarMeta = {
+  x: 720,
+  y: 310,
+  width: 200,
+  height: 200,
+  visible: true,
+  borderRadius: 0,
+  fitMode: "custom",
+};
+
+export function extractSlideAvatarMeta(slide: Slide): SlideAvatarMeta {
+  const meta = slide.metadata;
+  const canvas = (meta.canvas as Record<string, unknown>) || {};
+  const avatar = (canvas.avatar as Record<string, unknown>) || {};
+
+  const visible = meta.avatar_visible !== false;
+  const borderRadius =
+    typeof meta.avatar_border_radius === "number" ? meta.avatar_border_radius : 0;
+  const fitMode = (meta.avatar_fit_mode as AvatarFitMode) || "custom";
+
+  return {
+    x: typeof avatar.x === "number" ? avatar.x : DEFAULT_SLIDE_AVATAR.x,
+    y: typeof avatar.y === "number" ? avatar.y : DEFAULT_SLIDE_AVATAR.y,
+    width: typeof avatar.width === "number" ? avatar.width : DEFAULT_SLIDE_AVATAR.width,
+    height: typeof avatar.height === "number" ? avatar.height : DEFAULT_SLIDE_AVATAR.height,
+    visible,
+    borderRadius,
+    fitMode,
+  };
+}
+
+/** Build the metadata patch that stores avatar config inside a slide's canvas. */
+export function buildSlideAvatarPatch(
+  slide: Slide,
+  avatarMeta: SlideAvatarMeta,
+): Record<string, unknown> {
+  const existingCanvas = (slide.metadata.canvas as Record<string, unknown>) || {};
+  return {
+    canvas: {
+      ...existingCanvas,
+      width: CANVAS_W,
+      height: CANVAS_H,
+      avatar: {
+        x: avatarMeta.x,
+        y: avatarMeta.y,
+        width: avatarMeta.width,
+        height: avatarMeta.height,
+      },
+    },
+    avatar_visible: avatarMeta.visible,
+    avatar_border_radius: avatarMeta.borderRadius,
+    avatar_fit_mode: avatarMeta.fitMode,
+  };
 }
 
 export interface CreateProjectInput {
@@ -294,6 +369,7 @@ export interface ProviderCredentialStatus {
   provider_type: "ai" | "tts" | "avatar_video";
   masked_api_key: string | null;
   key_last_four: string | null;
+  voice_id: string | null;
   status: "not_configured" | "configured" | "valid" | "invalid" | "expired_or_revoked";
   last_validated_at: string | null;
   updated_at: string | null;
@@ -512,7 +588,8 @@ export const api = {
     save: (input: {
       provider_name: ProviderCredentialStatus["provider_name"];
       provider_type: ProviderCredentialStatus["provider_type"];
-      api_key: string;
+      api_key?: string | null;
+      voice_id?: string | null;
     }) =>
       apiFetch<ProviderCredentialStatus>("/api/v1/provider-credentials", {
         method: "POST",

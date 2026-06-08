@@ -285,7 +285,7 @@ def test_upload_avatar_success(client, monkeypatch):
     assert body["filename"] == "avatar.png"
     assert body["content_type"] == "image/png"
     assert body["url"].startswith("http://minio-test/download/")
-    assert body["width"] == 160.0
+    assert body["width"] == 200.0
     assert storage.download_file(body["object_key"]) == b"png-bytes"
 
 

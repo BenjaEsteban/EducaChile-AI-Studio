@@ -11,7 +11,10 @@ from fastapi import HTTPException, status
 from app.config import settings as app_settings
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.repository import GenerationRepository
-from app.modules.generation.pipeline import resolve_saved_tts_credentials
+from app.modules.generation.pipeline import (
+    resolve_global_wavespeed_key,
+    resolve_saved_tts_credentials,
+)
 from app.modules.generation.schemas import (
     FinalVideoRead,
     GenerationJobRead,
@@ -438,7 +441,8 @@ class GenerationService:
             )
             raise GenerationReadinessError(
                 "MISSING_ELEVENLABS_API_KEY",
-                "Please configure ElevenLabs API key and voice ID in project settings before generating video.",
+                "Configura la API key y el Voice ID de ElevenLabs en el panel de "
+                "Configuración del dashboard antes de generar el video.",
             )
         if not (wavespeed_key or "").strip():
             raise GenerationReadinessError(
@@ -478,8 +482,12 @@ class GenerationService:
             if project_config is not None
             else None
         )
+        # PRIMARY SOURCE: global dashboard-managed WaveSpeed key; legacy
+        # per-project keys and env are only fallbacks.
+        global_wavespeed_key = resolve_global_wavespeed_key(self.repo.db, MOCK_ORG_ID)
         wavespeed_key = (
-            project_wavespeed_key
+            global_wavespeed_key
+            or project_wavespeed_key
             or decrypt_secret(settings.wavespeed_api_key_encrypted)
             or app_settings.WAVESPEED_API_KEY
         )

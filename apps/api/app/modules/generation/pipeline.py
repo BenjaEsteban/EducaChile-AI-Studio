@@ -21,6 +21,7 @@ from app.config import settings as app_settings
 from app.modules.composer.service import ComposerService
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.projects.models import Asset, Presentation, ProjectGenerationConfig, Slide
+from app.modules.provider_credentials.models import ProviderCredential
 from app.modules.tts.adapters import TTSProviderError, get_tts_provider
 from app.modules.video.adapters import AvatarVideoProviderError, get_avatar_video_provider
 from app.services.wavespeed_client import WavespeedClient, WavespeedClientError
@@ -82,6 +83,50 @@ class PipelineError(RuntimeError):
         self.slide_index = slide_index
         self.chunk_index = chunk_index
         self.details = details
+
+
+def resolve_global_tts_credentials(
+    db: Session,
+    organization_id: uuid.UUID,
+) -> tuple[str | None, str | None]:
+    """Read the global ElevenLabs credential (dashboard-managed) for an org.
+
+    Returns (api_key, voice_id). These are the *primary* source for generation;
+    environment variables are only an optional fallback.
+    """
+    credential = (
+        db.query(ProviderCredential)
+        .filter(
+            ProviderCredential.organization_id == organization_id,
+            ProviderCredential.provider_name == "elevenlabs",
+            ProviderCredential.provider_type == "tts",
+        )
+        .first()
+    )
+    if credential is None:
+        return None, None
+    api_key = decrypt_secret(credential.encrypted_api_key) or None
+    voice_id = (credential.voice_id or "").strip() or None
+    return api_key, voice_id
+
+
+def resolve_global_wavespeed_key(
+    db: Session,
+    organization_id: uuid.UUID,
+) -> str | None:
+    """Read the global WaveSpeed API key (dashboard-managed) for an org."""
+    credential = (
+        db.query(ProviderCredential)
+        .filter(
+            ProviderCredential.organization_id == organization_id,
+            ProviderCredential.provider_name == "wavespeed",
+            ProviderCredential.provider_type == "avatar_video",
+        )
+        .first()
+    )
+    if credential is None:
+        return None
+    return decrypt_secret(credential.encrypted_api_key) or None
 
 
 def resolve_tts_credentials(
@@ -153,6 +198,20 @@ def resolve_saved_tts_credentials(
         .first()
     )
     project_resolution = resolve_tts_credentials(project_config, settings_module)
+
+    # PRIMARY SOURCE: global dashboard-managed credentials. When an ElevenLabs
+    # credential is configured globally it takes precedence over project config,
+    # legacy per-project video settings, and environment variables. The presence
+    # of a global ElevenLabs key also implies the ElevenLabs provider.
+    global_api_key, global_voice_id = resolve_global_tts_credentials(db, organization_id)
+    if global_api_key and global_voice_id:
+        return TTSCredentialsResolution(
+            provider="elevenlabs",
+            api_key=global_api_key,
+            voice_id=global_voice_id,
+            credentials_source="global_provider_credentials",
+        )
+
     if project_resolution.provider == "elevenlabs":
         if project_resolution.api_key and project_resolution.voice_id:
             return project_resolution
@@ -219,11 +278,17 @@ def validate_generation_job(
             wavespeed_valid=True,
             elevenlabs_valid=False,
         )
-    wavespeed_api_key = (app_settings.WAVESPEED_API_KEY or "").strip()
+    # PRIMARY SOURCE: global dashboard-managed WaveSpeed key; env is fallback.
+    wavespeed_api_key = (
+        resolve_global_wavespeed_key(db, organization_id)
+        or app_settings.WAVESPEED_API_KEY
+        or ""
+    ).strip()
     if not wavespeed_api_key:
         raise PipelineError(
             "validation_failed",
-            "WAVESPEED_API_KEY is missing in worker environment",
+            "No hay una WaveSpeed API Key configurada. Configúrala en el panel de "
+            "Configuración del dashboard.",
             stage="validating",
         )
     tts_resolution = resolve_saved_tts_credentials(
@@ -1922,7 +1987,13 @@ def compose_segment_for_slide(
             avatar_clip_bytes=avatar_clip,
             audio_bytes=audio_bytes,
             duration_seconds=segment_duration_seconds,
-            avatar_overlay=_avatar_overlay_from_metadata(metadata, "1080p"),
+            avatar_overlay=(
+                # When avatar_visible is explicitly False, place overlay offscreen
+                # so it does not appear in the composed video segment.
+                {"x": 99999, "y": 99999, "width": 1, "height": 1}
+                if metadata.get("avatar_visible") is False
+                else _avatar_overlay_from_metadata(metadata, "1080p")
+            ),
             resolution="1080p",
             audio_pad_seconds=float(app_settings.SLIDE_PAUSE_SECONDS),
             avatar_chromakey=apply_avatar_chromakey,

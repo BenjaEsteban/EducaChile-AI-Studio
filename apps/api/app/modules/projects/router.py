@@ -143,6 +143,8 @@ def update_project_avatar_layout(
         y=data.y,
         width=data.width,
         height=data.height,
+        border_radius=data.border_radius,
+        fit_mode=data.fit_mode,
     )
     return _avatar_read(asset)
 
@@ -175,6 +177,8 @@ def _avatar_read(asset) -> ProjectAvatarRead:
         y=layout["y"],
         width=layout["width"],
         height=layout["height"],
+        border_radius=layout["border_radius"],
+        fit_mode=layout["fit_mode"],
         updated_at=asset.updated_at,
         avatar_asset_id=asset.id,
         avatar_preview_url=url,
@@ -183,13 +187,15 @@ def _avatar_read(asset) -> ProjectAvatarRead:
     )
 
 
-def _avatar_layout(metadata: dict | None) -> dict[str, float]:
+def _avatar_layout(metadata: dict | None) -> dict:
     layout = (metadata or {}).get("layout") if isinstance(metadata, dict) else None
     if not isinstance(layout, dict):
         layout = {}
     return {
-        "x": float(layout.get("x", 0.0)),
-        "y": float(layout.get("y", 0.0)),
-        "width": float(layout.get("width", 160.0)),
-        "height": float(layout.get("height", 160.0)),
+        "x": float(layout.get("x", 720.0)),
+        "y": float(layout.get("y", 310.0)),
+        "width": float(layout.get("width", 200.0)),
+        "height": float(layout.get("height", 200.0)),
+        "border_radius": float(layout.get("border_radius", 0.0)),
+        "fit_mode": str(layout.get("fit_mode", "custom")),
     }

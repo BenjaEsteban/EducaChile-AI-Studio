@@ -48,3 +48,70 @@ def test_provider_credentials_invalid_key_sets_invalid_status(client: TestClient
     assert validate.status_code == 200
     assert validate.json()["valid"] is False
     assert validate.json()["status"] == "invalid"
+
+
+def test_provider_credentials_save_and_read_voice_id(client: TestClient):
+    save = client.post(
+        BASE,
+        json={
+            "provider_name": "elevenlabs",
+            "provider_type": "tts",
+            "api_key": "eleven-test-key-1234",
+            "voice_id": "voice-abc-123",
+        },
+    )
+    assert save.status_code == 200
+    body = save.json()
+    assert body["voice_id"] == "voice-abc-123"
+    assert body["masked_api_key"] == "************1234"
+    assert "eleven-test-key" not in str(body)
+
+    # Voice id can be updated without re-sending the API key.
+    update = client.post(
+        BASE,
+        json={
+            "provider_name": "elevenlabs",
+            "provider_type": "tts",
+            "voice_id": "voice-xyz-789",
+        },
+    )
+    assert update.status_code == 200
+    assert update.json()["voice_id"] == "voice-xyz-789"
+    # Existing key is preserved (still masked, same last four).
+    assert update.json()["masked_api_key"] == "************1234"
+
+
+def test_global_credentials_are_primary_source_for_generation(client, db_session):
+    """Global dashboard credentials feed the generation pipeline resolution."""
+    from app.modules.generation.pipeline import (
+        resolve_global_wavespeed_key,
+        resolve_saved_tts_credentials,
+    )
+    from app.modules.projects.service import MOCK_ORG_ID
+    import uuid as _uuid
+
+    client.post(
+        BASE,
+        json={
+            "provider_name": "elevenlabs",
+            "provider_type": "tts",
+            "api_key": "eleven-global-key-1234",
+            "voice_id": "global-voice-1",
+        },
+    )
+    client.post(
+        BASE,
+        json={
+            "provider_name": "wavespeed",
+            "provider_type": "avatar_video",
+            "api_key": "wavespeed-global-key-1234",
+        },
+    )
+
+    resolution = resolve_saved_tts_credentials(db_session, _uuid.uuid4(), MOCK_ORG_ID)
+    assert resolution.provider == "elevenlabs"
+    assert resolution.api_key == "eleven-global-key-1234"
+    assert resolution.voice_id == "global-voice-1"
+    assert resolution.credentials_source == "global_provider_credentials"
+
+    assert resolve_global_wavespeed_key(db_session, MOCK_ORG_ID) == "wavespeed-global-key-1234"
