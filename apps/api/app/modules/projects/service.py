@@ -39,7 +39,16 @@ ALLOWED_AVATAR_MIME_TYPES = {
     "image/webp",
 }
 MAX_AVATAR_BYTES = 5 * 1024 * 1024
-DEFAULT_AVATAR_LAYOUT = {"x": 0.0, "y": 0.0, "width": 160.0, "height": 160.0}
+# Default avatar position in canvas coordinates (960×540 space, matching the
+# pipeline canvas defaults). Bottom-right quadrant — mirrors the pipeline fallback.
+DEFAULT_AVATAR_LAYOUT = {
+    "x": 720.0,
+    "y": 310.0,
+    "width": 200.0,
+    "height": 200.0,
+    "border_radius": 0.0,
+    "fit_mode": "custom",
+}
 
 
 class ProjectService:
@@ -356,6 +365,8 @@ class ProjectService:
         y: float,
         width: float,
         height: float,
+        border_radius: float = 0.0,
+        fit_mode: str = "custom",
     ) -> Asset:
         asset = self.get_avatar(project_id)
         metadata = dict(asset.metadata_json or {})
@@ -364,6 +375,8 @@ class ProjectService:
             "y": float(y),
             "width": float(width),
             "height": float(height),
+            "border_radius": float(border_radius),
+            "fit_mode": str(fit_mode),
         }
         asset.metadata_json = metadata
         self.repo.db.add(asset)

@@ -18,7 +18,12 @@ CredentialStatus = Literal[
 class ProviderCredentialUpsert(BaseModel):
     provider_name: ProviderName
     provider_type: ProviderTypeValue
-    api_key: str = Field(min_length=1)
+    # Optional so a credential's voice_id can be updated without re-sending the
+    # secret. When the credential does not yet exist, an api_key is required
+    # (enforced in the service layer).
+    api_key: str | None = Field(default=None)
+    # Only meaningful for ElevenLabs; ignored for other providers.
+    voice_id: str | None = Field(default=None)
 
 
 class ProviderCredentialRead(BaseModel):
@@ -27,6 +32,7 @@ class ProviderCredentialRead(BaseModel):
     provider_type: str
     masked_api_key: str | None
     key_last_four: str | None
+    voice_id: str | None = None
     status: CredentialStatus
     last_validated_at: datetime | None
     updated_at: datetime | None

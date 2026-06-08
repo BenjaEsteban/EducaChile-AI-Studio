@@ -41,23 +41,37 @@ class ProviderCredentialService:
         ]
 
     def upsert(self, data: ProviderCredentialUpsert) -> ProviderCredentialRead:
-        api_key = data.api_key.strip()
+        api_key = (data.api_key or "").strip()
+        voice_id = data.voice_id.strip() if data.voice_id is not None else None
         credential = self.repo.get(MOCK_ORG_ID, data.provider_name, data.provider_type)
         if credential is None:
+            # A new credential must include the secret; voice id alone is not
+            # enough to create a usable provider credential.
+            if not api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="An API key is required to configure this provider.",
+                )
             credential = ProviderCredential(
                 organization_id=MOCK_ORG_ID,
                 provider_name=data.provider_name,
                 provider_type=data.provider_type,
                 encrypted_api_key=encrypt_secret(api_key) or "",
                 key_last_four=api_key[-4:],
+                voice_id=voice_id or None,
                 status="configured",
                 created_by=MOCK_USER_ID,
                 updated_by=MOCK_USER_ID,
             )
         else:
-            credential.encrypted_api_key = encrypt_secret(api_key) or ""
-            credential.key_last_four = api_key[-4:]
-            credential.status = "configured"
+            # Only replace the secret when a new one is provided; this lets the
+            # UI update the voice id without re-entering the key.
+            if api_key:
+                credential.encrypted_api_key = encrypt_secret(api_key) or ""
+                credential.key_last_four = api_key[-4:]
+                credential.status = "configured"
+            if data.voice_id is not None:
+                credential.voice_id = voice_id or None
             credential.updated_by = MOCK_USER_ID
         return self._read(self.repo.save(credential), data.provider_name, data.provider_type)
 
@@ -111,6 +125,7 @@ class ProviderCredentialService:
                 provider_type=provider_type,
                 masked_api_key=None,
                 key_last_four=None,
+                voice_id=None,
                 status="not_configured",
                 last_validated_at=None,
                 updated_at=None,
@@ -121,6 +136,7 @@ class ProviderCredentialService:
             provider_type=credential.provider_type,
             masked_api_key=mask_api_key(credential.key_last_four),
             key_last_four=credential.key_last_four,
+            voice_id=credential.voice_id,
             status=credential.status,
             last_validated_at=credential.last_validated_at,
             updated_at=credential.updated_at,

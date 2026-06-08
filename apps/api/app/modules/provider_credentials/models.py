@@ -41,6 +41,8 @@ class ProviderCredential(Base, TimestampMixin):
     provider_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     encrypted_api_key: Mapped[str] = mapped_column(Text, nullable=False)
     key_last_four: Mapped[str] = mapped_column(String(8), nullable=False)
+    # Optional global ElevenLabs voice id (not a secret; stored in clear text).
+    voice_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default=ProviderCredentialStatus.configured, index=True
     )

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { ApiError, FolderTreeNode, Project, api } from "@/lib/api";
+import { GlobalSettingsMenu } from "@/components/dashboard/GlobalSettingsMenu";
 
 const ALL_SCOPE = "__all__";
 const DEFAULT_FOLDER_NAME = "Sin Nombre";
@@ -634,6 +635,8 @@ export default function DashboardPage() {
                   </div>
                 ) : null}
               </div>
+
+              <GlobalSettingsMenu />
 
               <button
                 type="button"

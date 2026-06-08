@@ -245,6 +245,8 @@ class ProjectAvatarRead(BaseModel):
     y: float
     width: float
     height: float
+    border_radius: float = 0.0
+    fit_mode: str = "custom"
     updated_at: datetime | None
     avatar_asset_id: uuid.UUID
     avatar_preview_url: str
@@ -257,6 +259,8 @@ class ProjectAvatarLayoutUpdate(BaseModel):
     y: float = Field(..., ge=0)
     width: float = Field(..., gt=0)
     height: float = Field(..., gt=0)
+    border_radius: float = Field(default=0.0, ge=0.0, le=100.0)
+    fit_mode: str = Field(default="custom")
 
 
 FolderTreeNode.model_rebuild()

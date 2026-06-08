@@ -558,7 +558,8 @@ def test_start_generation_rejects_missing_elevenlabs_credentials_with_project_co
     assert res.status_code == 409
     detail = res.json()["detail"]
     assert detail["code"] == "MISSING_ELEVENLABS_API_KEY"
-    assert "project settings" in detail["message"]
+    # Credentials are now managed globally from the dashboard Configuración panel.
+    assert "dashboard" in detail["message"]
 
 
 def test_start_generation_rejects_dummy_tts_when_audio_lipsync_requires_real_tts(
