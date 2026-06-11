@@ -13,11 +13,12 @@ import {
 } from "react";
 
 import { AvatarSettingsPanel } from "@/components/editor/AvatarSettingsPanel";
-import { CollapsibleSection } from "@/components/editor/CollapsibleSection";
+import { NavPopover } from "@/components/editor/NavPopover";
 import {
   CANVAS_H,
   CANVAS_W,
   DebugGenerationAsset,
+  DEFAULT_AVATAR_BORDER_WIDTH,
   DEFAULT_SLIDE_AVATAR,
   GenerationStatus,
   ProjectAvatar,
@@ -34,10 +35,6 @@ import { AppShell } from "@/components/layout/AppShell";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
-function preview(value: string | null | undefined) {
-  if (!value) return "Sin contenido";
-  return value.length > 120 ? `${value.slice(0, 120)}...` : value;
-}
 
 function generationErrorMessage(status: GenerationStatus): string | null {
   if (status.status !== "failed") return null;
@@ -129,6 +126,9 @@ export default function ProjectEditorPage() {
   const isDraggingRef = useRef(false);
   const isResizingRef = useRef(false);
   const [isDragging, setIsDragging] = useState(false);
+  // Displayed canvas width (px) so the avatar border can be rendered with a
+  // thickness proportional to the export (which scales canvas units → output px).
+  const [canvasDisplayWidth, setCanvasDisplayWidth] = useState(0);
 
   // ── derived ──
   const selectedSlide = useMemo(
@@ -286,6 +286,19 @@ export default function ProjectEditorPage() {
     };
   }, [avatarPreviewUrl]);
 
+  // Track the displayed canvas width to render a proportional avatar border.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w) setCanvasDisplayWidth(w);
+    });
+    observer.observe(el);
+    setCanvasDisplayWidth(el.getBoundingClientRect().width);
+    return () => observer.disconnect();
+  }, [selectedSlideId, isLoading]);
+
   // ── slide selection ──
   function selectSlide(slide: Slide) {
     setSelectedSlideId(slide.id);
@@ -408,6 +421,9 @@ export default function ProjectEditorPage() {
         borderRadius: projectAvatar.border_radius,
         fitMode: projectAvatar.fit_mode,
         visible: true,
+        offsetY: 0,
+        borderColor: null,
+        borderWidth: DEFAULT_AVATAR_BORDER_WIDTH,
       },
     }));
     setAvatarMetaSaveState("idle");
@@ -566,21 +582,237 @@ export default function ProjectEditorPage() {
 
   // ── render ────────────────────────────────────────────────────────────────
 
-  return (
-    <AppShell title="Video generation">
-      <div className="mb-6 flex flex-col gap-2">
-        <Link
-          href={`/projects/${params.projectId}`}
-          className="text-sm font-medium text-brand-700 hover:text-brand-800"
-        >
-          Volver al proyecto
-        </Link>
-        <div>
-          <h2 className="text-xl font-semibold text-gray-900">Slide Preview</h2>
-          <p className="mt-1 text-sm text-gray-500">
-            Revisa los slides renderizados, configura narracion, avatar y credenciales, y genera el
-            video.
+  // Generation panel content, reused inside the navbar "Generar video" popover.
+  const generationPanel = (
+    <div className="space-y-4">
+      <h3 className="text-sm font-semibold text-gray-900">Generación del video</h3>
+
+      {!allSlidesHavePreview ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Cada lámina necesita una imagen renderizada antes de generar el video.
+        </div>
+      ) : null}
+      {!allSlidesHaveDialogue ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Cada lámina necesita narración antes de generar el video.
+        </div>
+      ) : null}
+      {isDirty ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Guarda la narración antes de generar el video.
+        </div>
+      ) : null}
+      {!hasAvatar ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Sube una imagen de avatar antes de generar el video.
+        </div>
+      ) : null}
+      {generationDisabledMessage && !videoError && generationStatus.status === "idle" ? (
+        <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+          {generationDisabledMessage}
+        </div>
+      ) : null}
+      {videoMessage ? (
+        <div className="rounded-md border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-700">
+          {videoMessage}
+        </div>
+      ) : null}
+      {videoError ? (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {videoError}
+        </div>
+      ) : null}
+
+      <div className="space-y-2 rounded-md border border-gray-200 bg-gray-50 p-3">
+        <div className="flex items-center justify-between text-xs text-gray-600">
+          <span>{generationStatusText}</span>
+          <span>{Math.round(generationStatus.progress)}%</span>
+        </div>
+        <div className="h-2 overflow-hidden rounded-full bg-gray-200">
+          <div
+            className="h-full rounded-full bg-brand-600 transition-all"
+            style={{ width: `${clamp(generationStatus.progress, 0, 100)}%` }}
+          />
+        </div>
+        {generationStatus.current_slide && generationStatus.total_slides ? (
+          <p className="text-xs text-gray-500">
+            Lámina {generationStatus.current_slide} de {generationStatus.total_slides}
           </p>
+        ) : null}
+        {generationFailureMessage ? (
+          <p className="text-xs text-red-700">{generationFailureMessage}</p>
+        ) : null}
+      </div>
+
+      <button
+        type="button"
+        onClick={startVideoGeneration}
+        disabled={!canGenerateVideo || isStartingGeneration}
+        className="w-full rounded-md bg-brand-600 px-3 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-gray-400"
+      >
+        {isStartingGeneration
+          ? "Iniciando..."
+          : isGenerationRunning
+            ? generationStatus.message || "Generando..."
+            : generationButtonLabel}
+      </button>
+
+      {generationStatus.final_video_url ? (
+        <div className="space-y-2">
+          <video
+            controls
+            src={generationStatus.final_video_url}
+            className="aspect-video w-full rounded-md border border-gray-200 bg-black"
+          />
+          <a
+            href={generationStatus.final_video_url}
+            className="block rounded-md border border-gray-300 px-3 py-2 text-center text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50"
+          >
+            Descargar MP4
+          </a>
+        </div>
+      ) : null}
+
+      {process.env.NODE_ENV !== "production" && debugAssets.length > 0 ? (
+        <div className="space-y-2 rounded-md border border-dashed border-gray-300 bg-white p-3">
+          <h5 className="text-xs font-semibold uppercase text-gray-500">Debug assets</h5>
+          <div className="space-y-1">
+            {debugAssets.map((asset) => (
+              <a
+                key={asset.id}
+                href={asset.download_url}
+                className="block truncate text-xs font-medium text-brand-700 hover:text-brand-800"
+              >
+                {asset.asset_type}
+                {asset.slide_id ? ` / ${asset.filename}` : ""}
+              </a>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <AppShell title="Editor de video">
+      {/* Editor navbar — the editor's only chrome (no sidebar). Navigation +
+          main actions (avatar config, generation) live here. */}
+      <div className="sticky top-0 z-30 -mx-1 mb-6 rounded-lg border border-gray-200 bg-white/95 px-4 py-3 shadow-sm backdrop-blur">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+            >
+              <svg
+                className="h-4 w-4"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="m15 18-6-6 6-6" />
+              </svg>
+              Volver a mis videos
+            </Link>
+            <div className="min-w-0">
+              <h2 className="truncate text-base font-semibold text-gray-900">Editor de video</h2>
+              <p className="hidden truncate text-xs text-gray-500 lg:block">
+                Configura narración y avatar, y genera el video.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {slides.length > 0 ? (
+              <>
+                {/* Avatar configuration — popover (no sidebar) */}
+                <NavPopover
+                  label="Configuración de avatar"
+                  width={360}
+                  icon={
+                    <svg
+                      className="h-4 w-4 text-brand-600"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="8" r="4" />
+                      <path d="M4 21c0-4 4-6 8-6s8 2 8 6" />
+                    </svg>
+                  }
+                >
+                  <AvatarSettingsPanel
+                    variant="bare"
+                    projectAvatar={projectAvatar}
+                    avatarPreviewUrl={avatarPreviewUrl}
+                    avatarUploadState={avatarUploadState}
+                    avatarUploadError={avatarUploadError}
+                    onAvatarFileChange={handleAvatarFile}
+                    slideMeta={currentSlideAvatarMeta}
+                    onSlideMetaChange={updateCurrentSlideAvatarMeta}
+                    onSaveSlideAvatarMeta={saveCurrentSlideAvatarMeta}
+                    isSavingSlideAvatarMeta={isSavingSlideAvatarMeta}
+                    onApplyToAllSlides={applyAvatarToAllSlides}
+                    isApplyingToAll={isApplyingToAll}
+                    onResetToProjectDefault={resetToProjectDefault}
+                    hasSlide={Boolean(selectedSlide)}
+                  />
+                </NavPopover>
+
+                {/* Generation — popover */}
+                <NavPopover
+                  label="Generar video"
+                  variant="primary"
+                  width={380}
+                  badge={
+                    <span
+                      className={`ml-0.5 inline-block h-2 w-2 rounded-full ${
+                        generationStatus.status === "completed"
+                          ? "bg-green-300"
+                          : generationStatus.status === "failed"
+                            ? "bg-red-300"
+                            : isGenerationRunning
+                              ? "bg-amber-300"
+                              : "bg-white/60"
+                      }`}
+                    />
+                  }
+                  icon={
+                    <svg
+                      className="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="m22 8-6 4 6 4V8Z" />
+                      <rect x="2" y="6" width="14" height="12" rx="2" />
+                    </svg>
+                  }
+                >
+                  <div className="p-4">{generationPanel}</div>
+                </NavPopover>
+              </>
+            ) : null}
+
+            <Link
+              href={`/projects/${params.projectId}`}
+              className="hidden text-sm font-medium text-brand-700 hover:text-brand-800 sm:inline"
+            >
+              Detalles del video
+            </Link>
+          </div>
         </div>
       </div>
 
@@ -604,13 +836,16 @@ export default function ProjectEditorPage() {
           </p>
         </div>
       ) : (
-        <div className="grid gap-5 xl:grid-cols-[280px_minmax(0,1fr)_360px]">
-          {/* ── Left: Slide list ── */}
-          <aside className="rounded-lg border border-gray-200 bg-white shadow-sm">
-            <div className="border-b border-gray-200 px-4 py-3">
-              <h3 className="text-sm font-semibold text-gray-900">Slides</h3>
+        <div className="mx-auto w-full max-w-4xl space-y-5">
+          {/* ── Slide filmstrip (replaces the old left sidebar) ── */}
+          <div className="rounded-lg border border-gray-200 bg-white p-3 shadow-sm">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-900">Láminas</h3>
+              <span className="text-xs text-gray-500">
+                {slides.length} {slides.length === 1 ? "lámina" : "láminas"}
+              </span>
             </div>
-            <div className="max-h-[760px] overflow-auto">
+            <div className="flex gap-3 overflow-x-auto pb-1">
               {slides.map((slide) => {
                 const isSelected = slide.id === selectedSlideId;
                 const imageUrl = slidePreviewUrl(slide);
@@ -620,48 +855,47 @@ export default function ProjectEditorPage() {
                     key={slide.id}
                     type="button"
                     onClick={() => selectSlide(slide)}
-                    className={`block w-full border-b border-gray-100 px-4 py-3 text-left transition-colors ${
-                      isSelected ? "bg-brand-50" : "hover:bg-gray-50"
+                    title={slide.title || `Lámina ${slide.position}`}
+                    className={`group relative w-40 flex-shrink-0 rounded-md border p-1.5 text-left transition-colors ${
+                      isSelected
+                        ? "border-brand-500 bg-brand-50 ring-1 ring-brand-300"
+                        : "border-gray-200 hover:bg-gray-50"
                     }`}
                   >
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center justify-between">
                       <span className="text-xs font-medium uppercase text-gray-500">
-                        Slide {slide.position}
+                        Lámina {slide.position}
                       </span>
-                      <div className="flex items-center gap-1.5">
-                        {avatarMeta && !avatarMeta.visible && (
-                          <span className="text-xs font-medium text-gray-400" title="Avatar oculto en esta lámina">
-                            sin avatar
-                          </span>
-                        )}
-                        {imageUrl ? (
-                          <span className="text-xs font-medium text-green-700">Preview</span>
-                        ) : (
-                          <span className="text-xs font-medium text-amber-700">No preview</span>
-                        )}
-                      </div>
+                      {avatarMeta && !avatarMeta.visible ? (
+                        <span className="text-[10px] font-medium text-gray-400" title="Avatar oculto en esta lámina">
+                          sin avatar
+                        </span>
+                      ) : imageUrl ? null : (
+                        <span className="text-[10px] font-medium text-amber-700">sin preview</span>
+                      )}
                     </div>
                     {imageUrl ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
                         src={imageUrl}
-                        alt={`Slide ${slide.position} preview`}
-                        className="mt-2 aspect-video w-full rounded-md border border-gray-200 object-contain"
+                        alt={`Lámina ${slide.position}`}
+                        className="mt-1 aspect-video w-full rounded border border-gray-200 object-contain"
                       />
-                    ) : null}
-                    <p className="mt-2 text-sm font-semibold text-gray-900">
-                      {slide.title || "Sin titulo"}
-                    </p>
-                    <p className="mt-1 text-xs text-gray-500">
-                      {preview(dialogueBySlideId[slide.id] || slide.visible_text)}
+                    ) : (
+                      <div className="mt-1 flex aspect-video w-full items-center justify-center rounded border border-dashed border-gray-300 bg-gray-50 text-[10px] text-gray-400">
+                        Sin preview
+                      </div>
+                    )}
+                    <p className="mt-1 truncate text-xs font-semibold text-gray-900">
+                      {slide.title || "Sin título"}
                     </p>
                   </button>
                 );
               })}
             </div>
-          </aside>
+          </div>
 
-          {/* ── Center: Canvas + Narration ── */}
+          {/* ── Main editor content ── */}
           <main className="min-w-0 space-y-5">
             {selectedSlide ? (
               <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
@@ -704,7 +938,7 @@ export default function ProjectEditorPage() {
                       />
                     ) : (
                       <div className="flex h-full items-center justify-center text-sm text-amber-700">
-                        No rendered slide preview is available.
+                        No hay una imagen renderizada disponible para esta lámina.
                       </div>
                     )}
 
@@ -716,7 +950,9 @@ export default function ProjectEditorPage() {
                           style={{
                             position: "absolute",
                             left: `${(currentSlideAvatarMeta.x / CANVAS_W) * 100}%`,
-                            top: `${(currentSlideAvatarMeta.y / CANVAS_H) * 100}%`,
+                            // offsetY: vertical fine-tune (full-slide face centering),
+                            // applied the same way the export shifts the overlay.
+                            top: `${((currentSlideAvatarMeta.y + currentSlideAvatarMeta.offsetY) / CANVAS_H) * 100}%`,
                             width: `${(currentSlideAvatarMeta.width / CANVAS_W) * 100}%`,
                             height: `${(currentSlideAvatarMeta.height / CANVAS_H) * 100}%`,
                             cursor: isDragging ? "grabbing" : "grab",
@@ -736,6 +972,24 @@ export default function ProjectEditorPage() {
                               pointerEvents: "none",
                             }}
                           />
+                          {/* Configured avatar frame border (persisted, used in export).
+                              Width is rendered proportional to the displayed canvas so it
+                              matches the exported thickness (canvas units → output px). */}
+                          {currentSlideAvatarMeta.borderColor ? (
+                            <div
+                              className="pointer-events-none absolute inset-0"
+                              style={{
+                                borderRadius: `${currentSlideAvatarMeta.borderRadius}%`,
+                                border: `${Math.max(
+                                  2,
+                                  Math.round(
+                                    currentSlideAvatarMeta.borderWidth *
+                                      ((canvasDisplayWidth || CANVAS_W) / CANVAS_W),
+                                  ),
+                                )}px solid ${currentSlideAvatarMeta.borderColor}`,
+                              }}
+                            />
+                          ) : null}
                           {/* Selection border */}
                           <div
                             className="pointer-events-none absolute inset-0 border-2 border-indigo-500"
@@ -784,10 +1038,10 @@ export default function ProjectEditorPage() {
               >
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div>
-                    <h3 className="text-sm font-semibold text-gray-900">Narration</h3>
+                    <h3 className="text-sm font-semibold text-gray-900">Narración</h3>
                     <p className="mt-1 text-xs text-gray-500">
-                      This text is sent to Wavespeed for the talking avatar clip. It does not
-                      change the slide image.
+                      Este texto se envía a Wavespeed para el clip del avatar parlante. No
+                      modifica la imagen de la lámina.
                     </p>
                   </div>
                   <button
@@ -795,7 +1049,7 @@ export default function ProjectEditorPage() {
                     disabled={saveState === "saving" || !selectedSlide}
                     className="rounded-md bg-brand-600 px-3 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-gray-400"
                   >
-                    {saveState === "saving" ? "Saving..." : "Save Narration"}
+                    {saveState === "saving" ? "Guardando..." : "Guardar narración"}
                   </button>
                 </div>
                 <textarea
@@ -806,7 +1060,7 @@ export default function ProjectEditorPage() {
                 />
                 <div className="mt-2 min-h-5">
                   {saveState === "saved" ? (
-                    <p className="text-xs font-medium text-green-700">Narration saved.</p>
+                    <p className="text-xs font-medium text-green-700">Narración guardada.</p>
                   ) : null}
                   {saveError ? (
                     <p className="text-xs font-medium text-red-700">{saveError}</p>
@@ -816,158 +1070,6 @@ export default function ProjectEditorPage() {
             ) : null}
           </main>
 
-          {/* ── Right: Avatar settings + Video settings + Generation ── */}
-          <aside className="space-y-5">
-            {/* Avatar settings — inline collapsible accordion */}
-            <CollapsibleSection
-              title="Configuraciones del avatar"
-              defaultOpen
-              icon={
-                <svg
-                  className="h-4 w-4 text-brand-600"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  <circle cx="12" cy="8" r="4" />
-                  <path d="M4 21c0-4 4-6 8-6s8 2 8 6" />
-                </svg>
-              }
-            >
-              <AvatarSettingsPanel
-                variant="bare"
-                projectAvatar={projectAvatar}
-                avatarPreviewUrl={avatarPreviewUrl}
-                avatarUploadState={avatarUploadState}
-                avatarUploadError={avatarUploadError}
-                onAvatarFileChange={handleAvatarFile}
-                slideMeta={currentSlideAvatarMeta}
-                onSlideMetaChange={updateCurrentSlideAvatarMeta}
-                onSaveSlideAvatarMeta={saveCurrentSlideAvatarMeta}
-                isSavingSlideAvatarMeta={isSavingSlideAvatarMeta}
-                onApplyToAllSlides={applyAvatarToAllSlides}
-                isApplyingToAll={isApplyingToAll}
-                onResetToProjectDefault={resetToProjectDefault}
-                hasSlide={Boolean(selectedSlide)}
-              />
-            </CollapsibleSection>
-
-
-            {/* Generation progress */}
-            <section className="space-y-4 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
-              <h3 className="text-sm font-semibold text-gray-900">Generation Progress</h3>
-
-              {!allSlidesHavePreview ? (
-                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                  Every slide needs a rendered image preview before video generation.
-                </div>
-              ) : null}
-              {!allSlidesHaveDialogue ? (
-                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                  Every slide needs narration before video generation.
-                </div>
-              ) : null}
-              {isDirty ? (
-                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                  Save narration before generating video.
-                </div>
-              ) : null}
-              {!hasAvatar ? (
-                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                  Upload an avatar image before generating video.
-                </div>
-              ) : null}
-              {generationDisabledMessage &&
-              !videoError &&
-              generationStatus.status === "idle" ? (
-                <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
-                  {generationDisabledMessage}
-                </div>
-              ) : null}
-              {videoMessage ? (
-                <div className="rounded-md border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-700">
-                  {videoMessage}
-                </div>
-              ) : null}
-              {videoError ? (
-                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                  {videoError}
-                </div>
-              ) : null}
-
-              <div className="space-y-2 rounded-md border border-gray-200 bg-gray-50 p-3">
-                <div className="flex items-center justify-between text-xs text-gray-600">
-                  <span>{generationStatusText}</span>
-                  <span>{Math.round(generationStatus.progress)}%</span>
-                </div>
-                <div className="h-2 overflow-hidden rounded-full bg-gray-200">
-                  <div
-                    className="h-full rounded-full bg-brand-600 transition-all"
-                    style={{ width: `${clamp(generationStatus.progress, 0, 100)}%` }}
-                  />
-                </div>
-                {generationStatus.current_slide && generationStatus.total_slides ? (
-                  <p className="text-xs text-gray-500">
-                    Slide {generationStatus.current_slide} of {generationStatus.total_slides}
-                  </p>
-                ) : null}
-                {generationFailureMessage ? (
-                  <p className="text-xs text-red-700">{generationFailureMessage}</p>
-                ) : null}
-              </div>
-
-              <button
-                type="button"
-                onClick={startVideoGeneration}
-                disabled={!canGenerateVideo || isStartingGeneration}
-                className="w-full rounded-md bg-brand-600 px-3 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-gray-400"
-              >
-                {isStartingGeneration
-                  ? "Starting..."
-                  : isGenerationRunning
-                    ? generationStatus.message || "Generating..."
-                    : generationButtonLabel}
-              </button>
-
-              {generationStatus.final_video_url ? (
-                <div className="space-y-2">
-                  <video
-                    controls
-                    src={generationStatus.final_video_url}
-                    className="aspect-video w-full rounded-md border border-gray-200 bg-black"
-                  />
-                  <a
-                    href={generationStatus.final_video_url}
-                    className="block rounded-md border border-gray-300 px-3 py-2 text-center text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50"
-                  >
-                    Download MP4
-                  </a>
-                </div>
-              ) : null}
-
-              {process.env.NODE_ENV !== "production" && debugAssets.length > 0 ? (
-                <div className="space-y-2 rounded-md border border-dashed border-gray-300 bg-white p-3">
-                  <h5 className="text-xs font-semibold uppercase text-gray-500">Debug assets</h5>
-                  <div className="space-y-1">
-                    {debugAssets.map((asset) => (
-                      <a
-                        key={asset.id}
-                        href={asset.download_url}
-                        className="block truncate text-xs font-medium text-brand-700 hover:text-brand-800"
-                      >
-                        {asset.asset_type}
-                        {asset.slide_id ? ` / ${asset.filename}` : ""}
-                      </a>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-            </section>
-          </aside>
         </div>
       )}
     </AppShell>

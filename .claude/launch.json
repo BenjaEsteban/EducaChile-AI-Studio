@@ -1,0 +1,22 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web (Next.js)",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "apps/web", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "api (FastAPI)",
+      "runtimeExecutable": "uvicorn",
+      "runtimeArgs": ["app.main:app", "--reload", "--port", "8000", "--app-dir", "apps/api"],
+      "port": 8000
+    },
+    {
+      "name": "worker (Celery)",
+      "runtimeExecutable": "celery",
+      "runtimeArgs": ["-A", "app.workers.celery_app", "worker", "--loglevel=info", "--workdir", "apps/api"]
+    }
+  ]
+}

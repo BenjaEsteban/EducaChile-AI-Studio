@@ -2002,6 +2002,19 @@ def compose_segment_for_slide(
             chromakey_blend=float(app_settings.AVATAR_CHROMAKEY_BLEND),
             subtitle_text=str(metadata.get("dialogue") or slide.notes or "").strip() or None,
             subtitle_duration_seconds=audio_duration if audio_duration > 0 else None,
+            # Match the editor preview: rounded/circular avatars and the
+            # configured border color must survive into the exported video.
+            avatar_border_radius_pct=(
+                0.0
+                if metadata.get("avatar_visible") is False
+                else _slide_avatar_border_radius(metadata)
+            ),
+            avatar_border_color=(
+                None
+                if metadata.get("avatar_visible") is False
+                else _slide_avatar_border_color(metadata)
+            ),
+            avatar_border_width_px=_slide_avatar_border_width_px(metadata, "1080p"),
         )
     except subprocess.CalledProcessError as exc:
         raise PipelineError(
@@ -4024,12 +4037,64 @@ def _avatar_overlay_from_metadata(metadata: dict, resolution: str) -> dict[str, 
     height = max(1, int(float(avatar.get("height") or default_height) * scale_y))
     x = int(float(avatar.get("x") or 0) * scale_x)
     y = int(float(avatar.get("y") or 0) * scale_y)
+    # Vertical fine-tune offset (canvas units, may be negative). Applied after
+    # clamping so full-slide avatars can be shifted up/down to center the face;
+    # FFmpeg overlay accepts off-frame coordinates.
+    offset_y = 0
+    try:
+        offset_y = int(float(metadata.get("avatar_offset_y") or 0) * scale_y)
+    except (TypeError, ValueError):
+        offset_y = 0
     return {
         "x": max(0, min(x, output_width - width)),
-        "y": max(0, min(y, output_height - height)),
+        "y": max(0, min(y, output_height - height)) + offset_y,
         "width": min(width, output_width),
         "height": min(height, output_height),
     }
+
+
+def _slide_avatar_border_radius(metadata: dict) -> float:
+    """Border radius percentage (0–50) stored by the editor; 50 = circle."""
+    try:
+        value = float(metadata.get("avatar_border_radius") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(value, 50.0))
+
+
+_HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def _slide_avatar_border_color(metadata: dict) -> str | None:
+    """Validated avatar border color as #RRGGBB, or None when unset/invalid."""
+    raw = metadata.get("avatar_border_color")
+    if not isinstance(raw, str):
+        return None
+    match = _HEX_COLOR_RE.match(raw.strip())
+    if not match:
+        return None
+    return f"#{match.group(1)}"
+
+
+def _slide_avatar_border_width_px(metadata: dict, resolution: str) -> int:
+    """Avatar border thickness in OUTPUT pixels.
+
+    Stored as canvas-space units (`avatar_border_width`, default 6) and scaled to
+    the output resolution the same way the overlay geometry is scaled.
+    """
+    try:
+        width_canvas = float(metadata.get("avatar_border_width"))
+    except (TypeError, ValueError):
+        width_canvas = 6.0
+    if width_canvas <= 0:
+        width_canvas = 6.0
+    canvas = metadata.get("canvas") if isinstance(metadata, dict) else None
+    canvas_height = 540.0
+    if isinstance(canvas, dict):
+        canvas_height = float(canvas.get("height") or canvas_height)
+    _, output_height = _resolution_size_for_generation(resolution)
+    scale = output_height / max(canvas_height, 1.0)
+    return max(2, round(width_canvas * scale))
 
 
 def _avatar_overlay_type(metadata: dict | None, *, fallback_reason: str | None = None) -> str:
