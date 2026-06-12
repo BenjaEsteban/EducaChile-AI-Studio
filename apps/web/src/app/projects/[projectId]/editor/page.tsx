@@ -13,7 +13,9 @@ import {
 } from "react";
 
 import { AvatarSettingsPanel } from "@/components/editor/AvatarSettingsPanel";
-import { NavPopover } from "@/components/editor/NavPopover";
+import { CollapsibleSection } from "@/components/editor/CollapsibleSection";
+// Note: the editor intentionally does NOT use AppShell (no global sidebar);
+// it renders its own full-width top navbar + a 3-column workspace.
 import {
   CANVAS_H,
   CANVAS_W,
@@ -29,7 +31,6 @@ import {
   buildSlideAvatarPatch,
   extractSlideAvatarMeta,
 } from "@/lib/api";
-import { AppShell } from "@/components/layout/AppShell";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -694,15 +695,25 @@ export default function ProjectEditorPage() {
   );
 
   return (
-    <AppShell title="Editor de video">
-      {/* Editor navbar — the editor's only chrome (no sidebar). Navigation +
+    <div className="min-h-screen bg-gray-50">
+      {/* Top navbar — the editor's only chrome (no sidebar). Navigation +
           main actions (avatar config, generation) live here. */}
-      <div className="sticky top-0 z-30 -mx-1 mb-6 rounded-lg border border-gray-200 bg-white/95 px-4 py-3 shadow-sm backdrop-blur">
-        <div className="flex flex-wrap items-center justify-between gap-3">
+      <header className="sticky top-0 z-40 border-b border-slate-200/70 bg-white/90 backdrop-blur">
+        <div className="mx-auto flex min-h-16 w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-2 sm:px-6 lg:px-8">
           <div className="flex min-w-0 items-center gap-3">
             <Link
+              href="/"
+              className="truncate text-sm font-semibold tracking-tight text-slate-900 sm:text-base"
+            >
+              EducaChile
+            </Link>
+            <span className="hidden text-xs text-slate-400 sm:inline">/</span>
+            <span className="hidden text-xs font-medium uppercase tracking-wide text-brand-700 sm:inline">
+              Editor
+            </span>
+            <Link
               href="/dashboard"
-              className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+              className="ml-1 inline-flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
             >
               <svg
                 className="h-4 w-4"
@@ -716,106 +727,13 @@ export default function ProjectEditorPage() {
               >
                 <path d="m15 18-6-6 6-6" />
               </svg>
-              Volver a mis videos
-            </Link>
-            <div className="min-w-0">
-              <h2 className="truncate text-base font-semibold text-gray-900">Editor de video</h2>
-              <p className="hidden truncate text-xs text-gray-500 lg:block">
-                Configura narración y avatar, y genera el video.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {slides.length > 0 ? (
-              <>
-                {/* Avatar configuration — popover (no sidebar) */}
-                <NavPopover
-                  label="Configuración de avatar"
-                  width={360}
-                  icon={
-                    <svg
-                      className="h-4 w-4 text-brand-600"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth={2}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <circle cx="12" cy="8" r="4" />
-                      <path d="M4 21c0-4 4-6 8-6s8 2 8 6" />
-                    </svg>
-                  }
-                >
-                  <AvatarSettingsPanel
-                    variant="bare"
-                    projectAvatar={projectAvatar}
-                    avatarPreviewUrl={avatarPreviewUrl}
-                    avatarUploadState={avatarUploadState}
-                    avatarUploadError={avatarUploadError}
-                    onAvatarFileChange={handleAvatarFile}
-                    slideMeta={currentSlideAvatarMeta}
-                    onSlideMetaChange={updateCurrentSlideAvatarMeta}
-                    onSaveSlideAvatarMeta={saveCurrentSlideAvatarMeta}
-                    isSavingSlideAvatarMeta={isSavingSlideAvatarMeta}
-                    onApplyToAllSlides={applyAvatarToAllSlides}
-                    isApplyingToAll={isApplyingToAll}
-                    onResetToProjectDefault={resetToProjectDefault}
-                    hasSlide={Boolean(selectedSlide)}
-                  />
-                </NavPopover>
-
-                {/* Generation — popover */}
-                <NavPopover
-                  label="Generar video"
-                  variant="primary"
-                  width={380}
-                  badge={
-                    <span
-                      className={`ml-0.5 inline-block h-2 w-2 rounded-full ${
-                        generationStatus.status === "completed"
-                          ? "bg-green-300"
-                          : generationStatus.status === "failed"
-                            ? "bg-red-300"
-                            : isGenerationRunning
-                              ? "bg-amber-300"
-                              : "bg-white/60"
-                      }`}
-                    />
-                  }
-                  icon={
-                    <svg
-                      className="h-4 w-4"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth={2}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      <path d="m22 8-6 4 6 4V8Z" />
-                      <rect x="2" y="6" width="14" height="12" rx="2" />
-                    </svg>
-                  }
-                >
-                  <div className="p-4">{generationPanel}</div>
-                </NavPopover>
-              </>
-            ) : null}
-
-            <Link
-              href={`/projects/${params.projectId}`}
-              className="hidden text-sm font-medium text-brand-700 hover:text-brand-800 sm:inline"
-            >
-              Detalles del video
+              Mis videos
             </Link>
           </div>
         </div>
-      </div>
+      </header>
 
+      <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
       {!presentationId ? (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           Falta el parametro presentationId.
@@ -836,16 +754,14 @@ export default function ProjectEditorPage() {
           </p>
         </div>
       ) : (
-        <div className="mx-auto w-full max-w-4xl space-y-5">
-          {/* ── Slide filmstrip (replaces the old left sidebar) ── */}
-          <div className="rounded-lg border border-gray-200 bg-white p-3 shadow-sm">
-            <div className="mb-2 flex items-center justify-between">
+        <div className="grid gap-5 lg:grid-cols-[240px_minmax(0,1fr)] xl:grid-cols-[240px_minmax(0,1fr)_360px]">
+          {/* ── Left column: vertical slide list ("Láminas") ── */}
+          <aside className="rounded-lg border border-gray-200 bg-white shadow-sm lg:sticky lg:top-20 lg:self-start">
+            <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2.5">
               <h3 className="text-sm font-semibold text-gray-900">Láminas</h3>
-              <span className="text-xs text-gray-500">
-                {slides.length} {slides.length === 1 ? "lámina" : "láminas"}
-              </span>
+              <span className="text-xs text-gray-500">{slides.length}</span>
             </div>
-            <div className="flex gap-3 overflow-x-auto pb-1">
+            <div className="flex max-h-[70vh] flex-col gap-2 overflow-y-auto p-2">
               {slides.map((slide) => {
                 const isSelected = slide.id === selectedSlideId;
                 const imageUrl = slidePreviewUrl(slide);
@@ -856,7 +772,7 @@ export default function ProjectEditorPage() {
                     type="button"
                     onClick={() => selectSlide(slide)}
                     title={slide.title || `Lámina ${slide.position}`}
-                    className={`group relative w-40 flex-shrink-0 rounded-md border p-1.5 text-left transition-colors ${
+                    className={`group w-full rounded-md border p-1.5 text-left transition-colors ${
                       isSelected
                         ? "border-brand-500 bg-brand-50 ring-1 ring-brand-300"
                         : "border-gray-200 hover:bg-gray-50"
@@ -893,10 +809,10 @@ export default function ProjectEditorPage() {
                 );
               })}
             </div>
-          </div>
+          </aside>
 
-          {/* ── Main editor content ── */}
-          <main className="min-w-0 space-y-5">
+          {/* ── Center column: PPT / slide canvas + narration ── */}
+          <div className="min-w-0 space-y-5">
             {selectedSlide ? (
               <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
                 <div className="mb-3 flex items-start justify-between gap-3">
@@ -1068,10 +984,85 @@ export default function ProjectEditorPage() {
                 </div>
               </form>
             ) : null}
-          </main>
+          </div>
 
+          {/* ── Right column: avatar settings + video generation ── */}
+          <aside className="space-y-5 xl:sticky xl:top-20 xl:self-start">
+            <CollapsibleSection
+              title="Configuración de avatar"
+              defaultOpen
+              icon={
+                <svg
+                  className="h-4 w-4 text-brand-600"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <circle cx="12" cy="8" r="4" />
+                  <path d="M4 21c0-4 4-6 8-6s8 2 8 6" />
+                </svg>
+              }
+            >
+              <AvatarSettingsPanel
+                variant="bare"
+                projectAvatar={projectAvatar}
+                avatarPreviewUrl={avatarPreviewUrl}
+                avatarUploadState={avatarUploadState}
+                avatarUploadError={avatarUploadError}
+                onAvatarFileChange={handleAvatarFile}
+                slideMeta={currentSlideAvatarMeta}
+                onSlideMetaChange={updateCurrentSlideAvatarMeta}
+                onSaveSlideAvatarMeta={saveCurrentSlideAvatarMeta}
+                isSavingSlideAvatarMeta={isSavingSlideAvatarMeta}
+                onApplyToAllSlides={applyAvatarToAllSlides}
+                isApplyingToAll={isApplyingToAll}
+                onResetToProjectDefault={resetToProjectDefault}
+                hasSlide={Boolean(selectedSlide)}
+              />
+            </CollapsibleSection>
+
+            <CollapsibleSection
+              title="Generar video"
+              defaultOpen
+              badge={
+                <span
+                  className={`inline-block h-2 w-2 rounded-full ${
+                    generationStatus.status === "completed"
+                      ? "bg-green-500"
+                      : generationStatus.status === "failed"
+                        ? "bg-red-500"
+                        : isGenerationRunning
+                          ? "bg-amber-500"
+                          : "bg-gray-300"
+                  }`}
+                />
+              }
+              icon={
+                <svg
+                  className="h-4 w-4 text-brand-600"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m22 8-6 4 6 4V8Z" />
+                  <rect x="2" y="6" width="14" height="12" rx="2" />
+                </svg>
+              }
+            >
+              <div className="p-4">{generationPanel}</div>
+            </CollapsibleSection>
+          </aside>
         </div>
       )}
-    </AppShell>
+      </main>
+    </div>
   );
 }
