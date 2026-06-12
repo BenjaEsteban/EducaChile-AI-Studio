@@ -39,6 +39,19 @@ ALLOWED_AVATAR_MIME_TYPES = {
     "image/webp",
 }
 MAX_AVATAR_BYTES = 5 * 1024 * 1024
+
+ALLOWED_MUSIC_MIME_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/ogg",
+    "audio/aac",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/m4a",
+}
+MAX_MUSIC_BYTES = 20 * 1024 * 1024
 # Default avatar position in canvas coordinates (960×540 space, matching the
 # pipeline canvas defaults). Bottom-right quadrant — mirrors the pipeline fallback.
 DEFAULT_AVATAR_LAYOUT = {

@@ -1040,3 +1040,79 @@ def test_start_generation_can_regenerate_missing_previews_from_pptx(
 
     assert res.status_code == 200
     assert res.json()["generation_job"]["status"] == "queued"
+
+
+def test_video_settings_persist_media_settings(client: TestClient):
+    project = client.post(PROJECTS_BASE, json={"name": "Media Settings"}).json()
+    base = f"/api/v1/projects/{project['id']}/video-settings"
+
+    # Defaults present on first read.
+    res = client.get(base)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["media_settings"]["subtitles"]["enabled"] is True
+    assert body["media_settings"]["background_music"]["enabled"] is False
+    assert body["background_music_url"] is None
+
+    # Update subtitle + music settings (partial blob).
+    res = client.put(
+        base,
+        json={
+            "media_settings": {
+                "subtitles": {
+                    "enabled": True,
+                    "font_family": "Verdana",
+                    "font_size": 40,
+                    "text_color": "#FF0000",
+                    "background_opacity": 0.8,
+                    "position": "top",
+                },
+                "background_music": {"loop": False, "volume": 0.7, "fade_out_seconds": 5},
+            }
+        },
+    ).json()
+    subs = res["media_settings"]["subtitles"]
+    assert subs["font_size"] == 40
+    assert subs["font_family"] == "Verdana"
+    assert subs["text_color"] == "#FF0000"
+    assert subs["position"] == "top"
+    music = res["media_settings"]["background_music"]
+    assert music["loop"] is False
+    assert music["volume"] == 0.7
+    assert music["fade_out_seconds"] == 5.0
+
+    # Persisted after reload.
+    reload = client.get(base).json()
+    assert reload["media_settings"]["subtitles"]["font_size"] == 40
+    assert reload["media_settings"]["background_music"]["volume"] == 0.7
+
+
+def test_background_music_upload_and_delete(client: TestClient, monkeypatch):
+    storage = InMemoryStorageProvider()
+    monkeypatch.setattr("app.modules.generation.service.get_storage", lambda: storage)
+    project = client.post(PROJECTS_BASE, json={"name": "Music Upload"}).json()
+    base = f"/api/v1/projects/{project['id']}/video-settings/background-music"
+
+    res = client.post(
+        base,
+        files={"file": ("song.mp3", b"id3-fake-mp3-bytes", "audio/mpeg")},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["media_settings"]["background_music"]["enabled"] is True
+    assert body["media_settings"]["background_music"]["asset_id"]
+    assert body["background_music_url"]
+    assert body["background_music_filename"] == "song.mp3"
+
+    # Reject non-audio.
+    bad = client.post(base, files={"file": ("x.txt", b"text", "text/plain")})
+    assert bad.status_code == 400
+    assert bad.json()["detail"]["code"] == "INVALID_MUSIC_MIME_TYPE"
+
+    # Delete clears the music.
+    res = client.delete(base)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["media_settings"]["background_music"]["enabled"] is False
+    assert body["media_settings"]["background_music"]["asset_id"] is None
+    assert body["background_music_url"] is None

@@ -155,6 +155,7 @@ class ComposerService:
         chromakey_blend: float = 0.05,
         subtitle_text: str | None = None,
         subtitle_duration_seconds: float | None = None,
+        subtitle_style: str | None = None,
         avatar_border_radius_pct: float = 0.0,
         avatar_border_color: str | None = None,
         avatar_border_width_px: int = 8,
@@ -217,13 +218,18 @@ class ComposerService:
                     subtitle_content = build_srt_content(subtitle_text, subtitle_duration)
                     if subtitle_content.strip():
                         subtitle_srt.write_text(subtitle_content, encoding="utf-8")
-                        subtitle_style = (
+                        # Use the per-project configured style when provided,
+                        # else the previous default (preserves prior behavior).
+                        effective_style = subtitle_style or (
                             "FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF,"
                             "OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=40"
                         )
                         subtitle_path = _escape_subtitles_filter_path(subtitle_srt)
+                        # Commas separate options in a filtergraph, so commas
+                        # inside force_style must be escaped even when quoted.
+                        escaped_style = effective_style.replace(",", "\\,")
                         subtitle_filter = (
-                            f";[basev]subtitles='{subtitle_path}':force_style='{subtitle_style}'[outv]"
+                            f";[basev]subtitles='{subtitle_path}':force_style='{escaped_style}'[outv]"
                         )
                 except Exception as exc:
                     logger.warning("Subtitle generation skipped: %s", exc)
@@ -420,6 +426,106 @@ class ComposerService:
                 timeout=settings.FFMPEG_TIMEOUT_SECONDS,
             )
             return output.read_bytes()
+
+    def mix_background_music(
+        self,
+        video_bytes: bytes,
+        music_bytes: bytes,
+        *,
+        volume: float = 0.35,
+        loop: bool = True,
+        fade_out_enabled: bool = True,
+        fade_out_seconds: float = 3.0,
+    ) -> bytes:
+        """Mix background music under the video's narration audio.
+
+        Narration is kept at full volume; the music is attenuated to ``volume``
+        (0–1), optionally looped to cover the whole video, and optionally faded
+        out over the final ``fade_out_seconds``. The output length always matches
+        the input video (``amix=duration=first``), so narration timing is never
+        affected. On any failure the original video is returned unchanged.
+        """
+        _ensure_ffmpeg_available()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            video_path = tmpdir / "video.mp4"
+            music_path = tmpdir / "music.bin"
+            output = tmpdir / "mixed.mp4"
+            video_path.write_bytes(video_bytes)
+            music_path.write_bytes(music_bytes)
+
+            duration = float(_probe_duration_seconds(video_path) or 0.0)
+            vol = max(0.0, min(float(volume), 1.0))
+
+            music_chain = f"[1:a]volume={vol:.3f}"
+            if fade_out_enabled and fade_out_seconds > 0 and duration > 0:
+                fade = min(float(fade_out_seconds), duration)
+                start = max(duration - fade, 0.0)
+                music_chain += f",afade=t=out:st={start:.3f}:d={fade:.3f}"
+            music_chain += "[bg]"
+            # normalize=0 keeps narration at full level instead of averaging.
+            filter_complex = (
+                f"{music_chain};"
+                "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+            )
+
+            command = ["ffmpeg", "-y", "-i", str(video_path)]
+            if loop:
+                command += ["-stream_loop", "-1"]
+            command += [
+                "-i",
+                str(music_path),
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "0:v:0",
+                "-map",
+                "[aout]",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(output),
+            ]
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    timeout=settings.FFMPEG_TIMEOUT_SECONDS,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                stderr = exc.stderr.decode("utf-8", errors="ignore") if isinstance(exc.stderr, bytes) else ""
+                logger.error(
+                    "Background music mix failed, returning video without music: %s",
+                    stderr[-1000:] if stderr else type(exc).__name__,
+                )
+                return video_bytes
+            return output.read_bytes()
+
+
+def _probe_duration_seconds(path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, OSError):
+        return None
 
 
 def _escape_subtitles_filter_path(path: Path) -> str:

@@ -19,6 +19,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings as app_settings
 from app.modules.composer.service import ComposerService
+from app.modules.generation.media_settings import (
+    build_subtitle_force_style,
+    normalize_media_settings,
+)
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.projects.models import Asset, Presentation, ProjectGenerationConfig, Slide
 from app.modules.provider_credentials.models import ProviderCredential
@@ -1982,6 +1986,19 @@ def compose_segment_for_slide(
                         "provider_requires_chromakey": provider_requires_chromakey,
                     },
                 )
+        # Per-project subtitle configuration (enable toggle + styling). Defaults
+        # preserve the previous always-on subtitle behavior.
+        media = normalize_media_settings(
+            context.settings.media_settings if context.settings is not None else None
+        )
+        subtitles_cfg = media["subtitles"]
+        subtitle_text = (
+            str(metadata.get("dialogue") or slide.notes or "").strip() or None
+            if subtitles_cfg["enabled"]
+            else None
+        )
+        subtitle_style = build_subtitle_force_style(subtitles_cfg) if subtitle_text else None
+
         segment = composer.compose_slide_video(
             slide_image_bytes=slide_image,
             avatar_clip_bytes=avatar_clip,
@@ -2000,8 +2017,9 @@ def compose_segment_for_slide(
             chromakey_color=app_settings.AVATAR_CHROMAKEY_COLOR,
             chromakey_similarity=float(app_settings.AVATAR_CHROMAKEY_SIMILARITY),
             chromakey_blend=float(app_settings.AVATAR_CHROMAKEY_BLEND),
-            subtitle_text=str(metadata.get("dialogue") or slide.notes or "").strip() or None,
+            subtitle_text=subtitle_text,
             subtitle_duration_seconds=audio_duration if audio_duration > 0 else None,
+            subtitle_style=subtitle_style,
             # Match the editor preview: rounded/circular avatars and the
             # configured border color must survive into the exported video.
             avatar_border_radius_pct=(
@@ -2166,6 +2184,58 @@ def compose_segment_for_slide(
     return asset
 
 
+def _apply_background_music(
+    db: Session,
+    storage,
+    composer: ComposerService,
+    context: GenerationContext,
+    final_video: bytes,
+    job: GenerationJob,
+) -> bytes:
+    """Mix the project's background music under the final video, if configured.
+
+    Returns the original video unchanged when no music is enabled/available, so
+    the default generation path is unaffected.
+    """
+    settings_row = context.settings
+    media = normalize_media_settings(
+        settings_row.media_settings if settings_row is not None else None
+    )
+    music = media["background_music"]
+    if not music.get("enabled") or not music.get("asset_id"):
+        return final_video
+    try:
+        asset = db.get(Asset, uuid.UUID(str(music["asset_id"])))
+    except (ValueError, TypeError):
+        asset = None
+    if asset is None or asset.project_id != context.project_id:
+        logger.warning(
+            "Generation job %s: background music asset missing; skipping music", job.id
+        )
+        return final_video
+    try:
+        music_bytes = storage.download_bytes(asset.storage_key)
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("Generation job %s: could not load background music: %s", job.id, exc)
+        return final_video
+    logger.info(
+        "Generation job %s: mixing background music (loop=%s volume=%s fade_out=%s/%ss)",
+        job.id,
+        music["loop"],
+        music["volume"],
+        music["fade_out_enabled"],
+        music["fade_out_seconds"],
+    )
+    return composer.mix_background_music(
+        final_video,
+        music_bytes,
+        volume=float(music["volume"]),
+        loop=bool(music["loop"]),
+        fade_out_enabled=bool(music["fade_out_enabled"]),
+        fade_out_seconds=float(music["fade_out_seconds"]),
+    )
+
+
 def compose_final_video(
     db: Session,
     storage,
@@ -2212,6 +2282,10 @@ def compose_final_video(
             _ffmpeg_error_message(exc),
             stage="composing_video",
         ) from exc
+
+    # Optional background music overlay. No-op when no music is configured, so
+    # existing videos are byte-for-byte unchanged.
+    final_video = _apply_background_music(db, storage, composer, context, final_video, job)
     final_info = _probe_media_info(final_video, ".mp4")
     duration = float(final_info.get("duration_seconds") or 0)
     if duration <= 0 or not final_info.get("has_video") or not final_info.get("has_audio"):

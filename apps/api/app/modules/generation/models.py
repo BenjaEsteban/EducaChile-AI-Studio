@@ -80,3 +80,6 @@ class VideoGenerationSettings(Base, TimestampMixin):
     last_validated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Project-level background music + subtitle styling (JSON). See
+    # app.modules.generation.media_settings for the normalized shape.
+    media_settings: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
