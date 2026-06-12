@@ -114,7 +114,7 @@ export function AvatarSettingsPanel({
       {/* ── Header (hidden in bare mode; the accordion provides the title) ── */}
       {!isBare && (
         <div>
-          <h3 className="text-sm font-semibold text-gray-900">Configuraciones del avatar</h3>
+          <h3 className="text-sm font-semibold text-gray-900">Configuración de avatar</h3>
           <p className="mt-0.5 text-xs text-gray-500">
             Sube una imagen de avatar y configura su ubicación en cada lámina.
           </p>
@@ -228,6 +228,41 @@ export function AvatarSettingsPanel({
             </div>
           </div>
 
+          {/* Vertical offset — only relevant in full-slide mode, where it lets
+              the user center the face vertically. */}
+          {slideMeta.fitMode === "full_slide" ? (
+            <div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                  Ajuste vertical
+                </span>
+                <span className="text-xs text-gray-500">
+                  {slideMeta.offsetY === 0
+                    ? "Centrado"
+                    : slideMeta.offsetY < 0
+                      ? `${Math.abs(Math.round(slideMeta.offsetY))} px hacia arriba`
+                      : `${Math.round(slideMeta.offsetY)} px hacia abajo`}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={-270}
+                max={270}
+                step={5}
+                value={slideMeta.offsetY}
+                onChange={(e) => update({ offsetY: Number(e.target.value) })}
+                className="mt-2 w-full accent-brand-600"
+              />
+              <div className="mt-1 flex justify-between text-xs text-gray-400">
+                <span>Arriba</span>
+                <span>Abajo</span>
+              </div>
+              <p className="mt-1 text-xs text-gray-500">
+                Desplaza la imagen del avatar para centrar el rostro en la lámina.
+              </p>
+            </div>
+          ) : null}
+
           {/* Shape */}
           <div>
             <div className="flex items-center justify-between">
@@ -255,6 +290,59 @@ export function AvatarSettingsPanel({
               <span>Cuadrado</span>
               <span>Redondo</span>
             </div>
+          </div>
+
+          {/* Border color */}
+          <div>
+            <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+              Borde del avatar
+            </span>
+            <div className="mt-2 flex items-center gap-2">
+              <label className="flex flex-1 items-center gap-2">
+                <span className="text-xs text-gray-600">Color del borde</span>
+                <input
+                  type="color"
+                  value={slideMeta.borderColor ?? "#ffffff"}
+                  onChange={(e) => update({ borderColor: e.target.value })}
+                  className="h-8 w-12 cursor-pointer rounded border border-gray-300 bg-white p-0.5"
+                  aria-label="Color del borde"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => update({ borderColor: null })}
+                disabled={!slideMeta.borderColor}
+                className="rounded-md border border-gray-300 px-2.5 py-1.5 text-xs font-semibold text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
+              >
+                Sin borde
+              </button>
+            </div>
+            {slideMeta.borderColor ? (
+              <div className="mt-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-600">Grosor del borde</span>
+                  <span className="text-xs text-gray-500">{Math.round(slideMeta.borderWidth)} px</span>
+                </div>
+                <input
+                  type="range"
+                  min={2}
+                  max={24}
+                  step={1}
+                  value={slideMeta.borderWidth}
+                  onChange={(e) => update({ borderWidth: Number(e.target.value) })}
+                  className="mt-1 w-full accent-brand-600"
+                />
+                <div className="mt-1 flex justify-between text-xs text-gray-400">
+                  <span>Fino</span>
+                  <span>Grueso</span>
+                </div>
+              </div>
+            ) : null}
+            <p className="mt-1 text-xs text-gray-500">
+              {slideMeta.borderColor
+                ? `Borde activo (${slideMeta.borderColor}). Se aplicará también al video exportado.`
+                : "Sin borde configurado."}
+            </p>
           </div>
 
           {/* Position */}

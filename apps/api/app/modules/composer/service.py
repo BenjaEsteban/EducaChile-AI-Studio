@@ -18,6 +18,77 @@ class AvatarOverlay(TypedDict):
     height: int
 
 
+def _rounded_alpha_expr(width: int, height: int, radius_px: int) -> str:
+    """FFmpeg geq alpha expression for a rounded-rectangle mask.
+
+    Pixels inside the rounded rectangle keep their alpha; corner pixels outside
+    the corner circles become transparent. radius_px = min(w,h)/2 yields a
+    circle/ellipse, matching the editor's CSS border-radius preview.
+    """
+    half_w = width / 2
+    half_h = height / 2
+    inner_x = max(half_w - radius_px, 0)
+    inner_y = max(half_h - radius_px, 0)
+    corner = (
+        f"if(lte(hypot(max(abs(X-{half_w})-{inner_x},0),"
+        f"max(abs(Y-{half_h})-{inner_y},0)),{radius_px}),255,0)"
+    )
+    return f"alpha(X,Y)*{corner}/255"
+
+
+def build_avatar_shape_filters(
+    width: int,
+    height: int,
+    border_radius_pct: float,
+    border_color: str | None,
+    duration_seconds: float,
+    border_width_px: int = 8,
+) -> tuple[str, str, int]:
+    """Build optional shape/border filter snippets for the avatar overlay.
+
+    Returns (shape_filter_suffix, border_chain, border_margin):
+    - shape_filter_suffix is appended to the avatar scale filter to round its
+      corners (empty when border_radius_pct <= 0).
+    - border_chain is a standalone filter_complex fragment that composes the
+      rounded avatar over a slightly larger colored plate, producing
+      [avatarframed]; empty when no border color is configured.
+    - border_margin is the plate margin (= border thickness) in pixels (0 without
+      border), used by the caller to offset the overlay position.
+
+    border_width_px controls the visible border thickness in output pixels.
+    """
+    radius_pct = max(0.0, min(float(border_radius_pct or 0.0), 50.0))
+    shape_suffix = ""
+    radius_px = 0
+    if radius_pct > 0:
+        radius_px = max(1, round(min(width, height) * radius_pct / 100))
+        alpha_expr = _rounded_alpha_expr(width, height, radius_px)
+        shape_suffix = (
+            f",format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha_expr}'"
+        )
+
+    border_chain = ""
+    border_margin = 0
+    if border_color:
+        border_margin = max(2, int(border_width_px))
+        plate_w = width + 2 * border_margin
+        plate_h = height + 2 * border_margin
+        plate_filters = "format=rgba"
+        if radius_pct > 0:
+            plate_radius = max(1, round(min(plate_w, plate_h) * radius_pct / 100))
+            plate_alpha = _rounded_alpha_expr(plate_w, plate_h, plate_radius)
+            plate_filters += (
+                f",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{plate_alpha}'"
+            )
+        border_chain = (
+            f"color=c={border_color}:s={plate_w}x{plate_h}:d={duration_seconds}"
+            f",{plate_filters}[avatarplate];"
+            f"[avatarplate][avatar]overlay={border_margin}:{border_margin}"
+            ":shortest=0:eof_action=repeat[avatarframed];"
+        )
+    return shape_suffix, border_chain, border_margin
+
+
 class ComposerService:
     def normalize_audio_to_mp3(self, audio_bytes: bytes) -> bytes:
         _ensure_ffmpeg_available()
@@ -84,6 +155,9 @@ class ComposerService:
         chromakey_blend: float = 0.05,
         subtitle_text: str | None = None,
         subtitle_duration_seconds: float | None = None,
+        avatar_border_radius_pct: float = 0.0,
+        avatar_border_color: str | None = None,
+        avatar_border_width_px: int = 8,
     ) -> bytes:
         _ensure_ffmpeg_available()
         width, height = _resolution_size(resolution)
@@ -100,10 +174,23 @@ class ComposerService:
                 avatar_filter += (
                     f",format=rgba,chromakey={chromakey_color}:{chromakey_similarity}:{chromakey_blend}"
                 )
+            shape_suffix, border_chain, border_margin = build_avatar_shape_filters(
+                avatar_overlay["width"],
+                avatar_overlay["height"],
+                avatar_border_radius_pct,
+                avatar_border_color,
+                duration_seconds,
+                border_width_px=avatar_border_width_px,
+            )
+            avatar_filter += shape_suffix
+            overlay_label = "[avatarframed]" if border_chain else "[avatar]"
+            overlay_x = avatar_overlay["x"] - border_margin
+            overlay_y = avatar_overlay["y"] - border_margin
             base_overlay_filter = (
                 f"[0:v]scale={width}:{height},setsar=1[bg];"
                 f"[1:v]{avatar_filter}[avatar];"
-                f"[bg][avatar]overlay={avatar_overlay['x']}:{avatar_overlay['y']}:"
+                f"{border_chain}"
+                f"[bg]{overlay_label}overlay={overlay_x}:{overlay_y}:"
                 "shortest=0:eof_action=repeat[basev]"
             )
             command = [

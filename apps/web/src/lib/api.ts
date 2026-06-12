@@ -180,7 +180,16 @@ export interface SlideAvatarMeta {
   visible: boolean;
   borderRadius: number;  // 0–50 (0 = square, 50 = circle)
   fitMode: AvatarFitMode;
+  /** Vertical fine-tune offset in canvas units (negative = up). Used mainly in full_slide mode to center the face. */
+  offsetY: number;
+  /** Avatar frame border color (#rrggbb) or null for no border. */
+  borderColor: string | null;
+  /** Avatar frame border thickness in canvas units (scaled on export). */
+  borderWidth: number;
 }
+
+/** Default avatar border thickness (canvas units) when a border color is set. */
+export const DEFAULT_AVATAR_BORDER_WIDTH = 6;
 
 export const CANVAS_W = 960;
 export const CANVAS_H = 540;
@@ -193,6 +202,9 @@ export const DEFAULT_SLIDE_AVATAR: SlideAvatarMeta = {
   visible: true,
   borderRadius: 0,
   fitMode: "custom",
+  offsetY: 0,
+  borderColor: null,
+  borderWidth: DEFAULT_AVATAR_BORDER_WIDTH,
 };
 
 export function extractSlideAvatarMeta(slide: Slide): SlideAvatarMeta {
@@ -204,6 +216,17 @@ export function extractSlideAvatarMeta(slide: Slide): SlideAvatarMeta {
   const borderRadius =
     typeof meta.avatar_border_radius === "number" ? meta.avatar_border_radius : 0;
   const fitMode = (meta.avatar_fit_mode as AvatarFitMode) || "custom";
+  const offsetY = typeof meta.avatar_offset_y === "number" ? meta.avatar_offset_y : 0;
+  const borderColor =
+    typeof meta.avatar_border_color === "string" && /^#?[0-9a-fA-F]{6}$/.test(meta.avatar_border_color)
+      ? meta.avatar_border_color.startsWith("#")
+        ? meta.avatar_border_color
+        : `#${meta.avatar_border_color}`
+      : null;
+  const borderWidth =
+    typeof meta.avatar_border_width === "number" && meta.avatar_border_width > 0
+      ? meta.avatar_border_width
+      : DEFAULT_AVATAR_BORDER_WIDTH;
 
   return {
     x: typeof avatar.x === "number" ? avatar.x : DEFAULT_SLIDE_AVATAR.x,
@@ -213,6 +236,9 @@ export function extractSlideAvatarMeta(slide: Slide): SlideAvatarMeta {
     visible,
     borderRadius,
     fitMode,
+    offsetY,
+    borderColor,
+    borderWidth,
   };
 }
 
@@ -237,6 +263,9 @@ export function buildSlideAvatarPatch(
     avatar_visible: avatarMeta.visible,
     avatar_border_radius: avatarMeta.borderRadius,
     avatar_fit_mode: avatarMeta.fitMode,
+    avatar_offset_y: avatarMeta.offsetY,
+    avatar_border_color: avatarMeta.borderColor,
+    avatar_border_width: avatarMeta.borderWidth,
   };
 }
 
