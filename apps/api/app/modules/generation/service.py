@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from fastapi import HTTPException, status
 
 from app.config import settings as app_settings
+from app.modules.generation.media_settings import normalize_media_settings
 from app.modules.generation.models import GenerationJob, VideoGenerationSettings
 from app.modules.generation.repository import GenerationRepository
 from app.modules.generation.pipeline import (
@@ -26,9 +27,13 @@ from app.modules.generation.schemas import (
 )
 from app.modules.jobs.models import Job, JobStatus, JobType
 from app.modules.jobs.repository import JobRepository
-from app.modules.projects.models import PresentationStatus
+from app.modules.projects.models import Asset, PresentationStatus
 from app.modules.presentations.rendering import render_slide_previews
-from app.modules.projects.service import MOCK_ORG_ID
+from app.modules.projects.service import (
+    ALLOWED_MUSIC_MIME_TYPES,
+    MAX_MUSIC_BYTES,
+    MOCK_ORG_ID,
+)
 from app.providers.storage import get_storage
 from app.utils.crypto import decrypt_secret, encrypt_secret
 from app.workers.tasks import enqueue_generate_video
@@ -283,6 +288,25 @@ class GenerationService:
         if data.avatar_source_asset_id is not None:
             settings.avatar_source_asset_id = data.avatar_source_asset_id
 
+        if data.media_settings is not None:
+            # Deep-merge the incoming partial blob over the current normalized
+            # one, then re-normalize/clamp. The background music asset_id is
+            # managed via the dedicated upload/delete endpoints, so preserve it.
+            current = normalize_media_settings(settings.media_settings)
+            incoming = data.media_settings if isinstance(data.media_settings, dict) else {}
+            merged = {
+                "background_music": {
+                    **current["background_music"],
+                    **(incoming.get("background_music") or {}),
+                    "asset_id": current["background_music"]["asset_id"],
+                },
+                "subtitles": {
+                    **current["subtitles"],
+                    **(incoming.get("subtitles") or {}),
+                },
+            }
+            settings.media_settings = normalize_media_settings(merged)
+
         settings.validation_status = (
             "saved"
             if (
@@ -313,6 +337,111 @@ class GenerationService:
             bool(saved.wavespeed_api_key_encrypted),
         )
         return self._settings_read(saved)
+
+    async def upload_background_music(
+        self,
+        project_id: uuid.UUID,
+        file,
+    ) -> VideoSettingsRead:
+        project = self.repo.get_project(project_id, MOCK_ORG_ID)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        mime_type = file.content_type or "application/octet-stream"
+        if mime_type not in ALLOWED_MUSIC_MIME_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "INVALID_MUSIC_MIME_TYPE",
+                    "message": "El archivo debe ser MP3, WAV, OGG, AAC o M4A.",
+                },
+            )
+        data = await file.read()
+        if len(data) > MAX_MUSIC_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={
+                    "code": "MUSIC_FILE_TOO_LARGE",
+                    "message": "El archivo de música debe pesar 20 MB o menos.",
+                },
+            )
+        if not data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "MUSIC_UPLOAD_FAILED", "message": "El archivo está vacío."},
+            )
+
+        from pathlib import Path
+
+        extension = Path(file.filename or "music").suffix.lower() or ".mp3"
+        storage_key = f"projects/{project.id}/music/{uuid.uuid4()}{extension}"
+        try:
+            get_storage().upload_file(storage_key, data, mime_type)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "MUSIC_UPLOAD_FAILED", "message": "No se pudo subir la música."},
+            ) from exc
+
+        asset = Asset(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            slide_id=None,
+            asset_type="background_music",
+            storage_key=storage_key,
+            filename=file.filename or f"music{extension}",
+            mime_type=mime_type,
+            size_bytes=len(data),
+        )
+        self.repo.db.add(asset)
+        self.repo.db.flush()
+
+        settings = self._get_or_create_settings(project_id)
+        media = normalize_media_settings(settings.media_settings)
+        media["background_music"]["asset_id"] = str(asset.id)
+        media["background_music"]["enabled"] = True
+        settings.media_settings = media
+        saved = self.repo.save_video_settings(settings)
+        self.repo.db.commit()
+        self.repo.db.refresh(saved)
+        return self._settings_read(saved)
+
+    def delete_background_music(self, project_id: uuid.UUID) -> VideoSettingsRead:
+        project = self.repo.get_project(project_id, MOCK_ORG_ID)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
+        if settings is None:
+            return self._settings_read(None)
+        media = normalize_media_settings(settings.media_settings)
+        asset_id = media["background_music"].get("asset_id")
+        if asset_id:
+            asset = self.repo.db.get(Asset, uuid.UUID(str(asset_id)))
+            if asset is not None and asset.project_id == project.id:
+                try:
+                    get_storage().delete(asset.storage_key)
+                except Exception:  # pragma: no cover - best effort
+                    pass
+                self.repo.db.delete(asset)
+        media["background_music"]["asset_id"] = None
+        media["background_music"]["enabled"] = False
+        settings.media_settings = media
+        saved = self.repo.save_video_settings(settings)
+        self.repo.db.commit()
+        self.repo.db.refresh(saved)
+        return self._settings_read(saved)
+
+    def _get_or_create_settings(self, project_id: uuid.UUID) -> VideoGenerationSettings:
+        settings = self.repo.get_video_settings(project_id, MOCK_ORG_ID)
+        if settings is None:
+            settings = VideoGenerationSettings(
+                organization_id=MOCK_ORG_ID,
+                project_id=project_id,
+                validation_status="not_configured",
+            )
+            self.repo.db.add(settings)
+            self.repo.db.flush()
+        return settings
 
     def validate_video_settings(self, project_id: uuid.UUID) -> VideoSettingsValidationRead:
         project_config, settings, tts_resolution, wavespeed_key = self._resolve_validation_inputs(
@@ -576,6 +705,9 @@ class GenerationService:
                 validation_status="valid" if env_wavespeed_valid else "not_configured",
                 last_validated_at=None,
                 updated_at=None,
+                media_settings=normalize_media_settings(None),
+                background_music_url=None,
+                background_music_filename=None,
             )
         env_wavespeed_valid = _is_valid_key(app_settings.WAVESPEED_API_KEY)
         wavespeed_masked = _mask(settings.wavespeed_api_key_last_four)
@@ -589,6 +721,8 @@ class GenerationService:
         validation_status = settings.validation_status
         if not settings.wavespeed_api_key_encrypted and app_settings.WAVESPEED_API_KEY:
             validation_status = "valid" if env_wavespeed_valid else "invalid"
+        media = normalize_media_settings(settings.media_settings)
+        music_url, music_filename = self._background_music_reference(settings, media)
         return VideoSettingsRead(
             elevenlabs_api_key_masked=_mask(settings.elevenlabs_api_key_last_four),
             elevenlabs_voice_id=settings.elevenlabs_voice_id,
@@ -609,7 +743,28 @@ class GenerationService:
             validation_status=validation_status,  # type: ignore[arg-type]
             last_validated_at=settings.last_validated_at,
             updated_at=settings.updated_at,
+            media_settings=media,
+            background_music_url=music_url,
+            background_music_filename=music_filename,
         )
+
+    def _background_music_reference(
+        self,
+        settings: VideoGenerationSettings,
+        media: dict,
+    ) -> tuple[str | None, str | None]:
+        """Resolve a presigned URL + filename for the saved background music."""
+        asset_id = (media.get("background_music") or {}).get("asset_id")
+        if not asset_id:
+            return None, None
+        asset = self.repo.db.get(Asset, uuid.UUID(str(asset_id)))
+        if asset is None or asset.project_id != settings.project_id:
+            return None, None
+        try:
+            url = get_storage().generate_read_url(asset.storage_key)
+        except Exception:  # pragma: no cover - storage best effort
+            url = None
+        return url, asset.filename
 
     def _fail_stale_running_jobs(self, project_id: uuid.UUID) -> None:
         if app_settings.is_production:

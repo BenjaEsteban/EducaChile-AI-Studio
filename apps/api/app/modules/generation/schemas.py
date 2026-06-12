@@ -70,6 +70,11 @@ class VideoSettingsRead(BaseModel):
     validation_status: ValidationStatus
     last_validated_at: datetime | None
     updated_at: datetime | None
+    # Normalized background-music + subtitle settings (see media_settings.py).
+    media_settings: dict | None = None
+    # Presigned download URL for the uploaded background music, if any.
+    background_music_url: str | None = None
+    background_music_filename: str | None = None
 
 
 class VideoSettingsUpdate(BaseModel):
@@ -78,6 +83,8 @@ class VideoSettingsUpdate(BaseModel):
     wavespeed_api_key: str | None = None
     avatar_source_url: str | None = None
     avatar_source_asset_id: uuid.UUID | None = None
+    # Partial media settings; merged with existing + normalized server-side.
+    media_settings: dict | None = None
 
 
 class VideoSettingsValidationRead(VideoSettingsRead):

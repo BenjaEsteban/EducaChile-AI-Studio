@@ -14,6 +14,7 @@ import {
 
 import { AvatarSettingsPanel } from "@/components/editor/AvatarSettingsPanel";
 import { CollapsibleSection } from "@/components/editor/CollapsibleSection";
+import { VideoSettingsPanel } from "@/components/editor/VideoSettingsPanel";
 // Note: the editor intentionally does NOT use AppShell (no global sidebar);
 // it renders its own full-width top navbar + a 3-column workspace.
 import {
@@ -23,6 +24,7 @@ import {
   DEFAULT_AVATAR_BORDER_WIDTH,
   DEFAULT_SLIDE_AVATAR,
   GenerationStatus,
+  MediaSettings,
   ProjectAvatar,
   Slide,
   SlideAvatarMeta,
@@ -109,6 +111,13 @@ export default function ProjectEditorPage() {
   const [videoMessage, setVideoMessage] = useState<string | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [isStartingGeneration, setIsStartingGeneration] = useState(false);
+
+  // ── media settings (background music + subtitles) ──
+  const [isSavingMedia, setIsSavingMedia] = useState(false);
+  const [mediaSaveState, setMediaSaveState] = useState<"idle" | "saved" | "error">("idle");
+  const [mediaSaveError, setMediaSaveError] = useState<string | null>(null);
+  const [musicState, setMusicState] = useState<"idle" | "uploading" | "saved" | "error">("idle");
+  const [musicError, setMusicError] = useState<string | null>(null);
   const [generationStatus, setGenerationStatus] = useState<GenerationStatus>({
     status: "idle",
     progress: 0,
@@ -559,6 +568,62 @@ export default function ProjectEditorPage() {
     },
     [currentSlideAvatarMeta, selectedSlideId, slides],
   );
+
+  async function saveMediaSettings(media: MediaSettings) {
+    setIsSavingMedia(true);
+    setMediaSaveState("idle");
+    setMediaSaveError(null);
+    try {
+      const updated = await api.videoSettings.update(params.projectId, {
+        media_settings: {
+          background_music: {
+            loop: media.background_music.loop,
+            volume: media.background_music.volume,
+            fade_out_enabled: media.background_music.fade_out_enabled,
+            fade_out_seconds: media.background_music.fade_out_seconds,
+          },
+          subtitles: media.subtitles,
+        },
+      });
+      setVideoSettings(updated);
+      setMediaSaveState("saved");
+    } catch (err) {
+      setMediaSaveState("error");
+      setMediaSaveError(
+        err instanceof Error ? err.message : "No se pudo guardar la configuración del video.",
+      );
+    } finally {
+      setIsSavingMedia(false);
+    }
+  }
+
+  async function handleMusicFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setMusicState("uploading");
+    setMusicError(null);
+    try {
+      const updated = await api.videoSettings.uploadBackgroundMusic(params.projectId, file);
+      setVideoSettings(updated);
+      setMusicState("saved");
+    } catch (err) {
+      setMusicState("error");
+      setMusicError(err instanceof Error ? err.message : "No se pudo subir la música.");
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  async function deleteMusic() {
+    try {
+      const updated = await api.videoSettings.deleteBackgroundMusic(params.projectId);
+      setVideoSettings(updated);
+      setMusicState("idle");
+    } catch (err) {
+      setMusicState("error");
+      setMusicError(err instanceof Error ? err.message : "No se pudo quitar la música.");
+    }
+  }
 
   async function startVideoGeneration() {
     setIsStartingGeneration(true);
@@ -1022,6 +1087,38 @@ export default function ProjectEditorPage() {
                 isApplyingToAll={isApplyingToAll}
                 onResetToProjectDefault={resetToProjectDefault}
                 hasSlide={Boolean(selectedSlide)}
+              />
+            </CollapsibleSection>
+
+            <CollapsibleSection
+              title="Configuración del video"
+              icon={
+                <svg
+                  className="h-4 w-4 text-brand-600"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M9 18V5l12-2v13" />
+                  <circle cx="6" cy="18" r="3" />
+                  <circle cx="18" cy="16" r="3" />
+                </svg>
+              }
+            >
+              <VideoSettingsPanel
+                videoSettings={videoSettings}
+                onSaveMediaSettings={saveMediaSettings}
+                isSaving={isSavingMedia}
+                saveState={mediaSaveState}
+                saveError={mediaSaveError}
+                onUploadMusic={handleMusicFile}
+                onDeleteMusic={deleteMusic}
+                musicState={musicState}
+                musicError={musicError}
               />
             </CollapsibleSection>
 

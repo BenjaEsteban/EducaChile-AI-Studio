@@ -458,6 +458,35 @@ export interface FinalVideoResponse {
   size_bytes: number | null;
 }
 
+export type SubtitlePosition = "bottom" | "center" | "top";
+
+export interface BackgroundMusicSettings {
+  enabled: boolean;
+  asset_id: string | null;
+  loop: boolean;
+  volume: number; // 0..1
+  fade_out_enabled: boolean;
+  fade_out_seconds: number;
+}
+
+export interface SubtitleSettings {
+  enabled: boolean;
+  font_family: string;
+  font_size: number;
+  text_color: string; // #rrggbb
+  background_color: string; // #rrggbb
+  background_opacity: number; // 0..1
+  position: SubtitlePosition;
+}
+
+export interface MediaSettings {
+  background_music: BackgroundMusicSettings;
+  subtitles: SubtitleSettings;
+}
+
+export const SUBTITLE_MIN_FONT_SIZE = 10;
+export const SUBTITLE_MAX_FONT_SIZE = 72;
+
 export interface VideoSettings {
   elevenlabs_api_key_masked: string | null;
   elevenlabs_voice_id: string | null;
@@ -470,6 +499,9 @@ export interface VideoSettings {
   validation_status: "not_configured" | "saved" | "valid" | "invalid";
   last_validated_at: string | null;
   updated_at: string | null;
+  media_settings: MediaSettings | null;
+  background_music_url: string | null;
+  background_music_filename: string | null;
 }
 
 export interface UpdateVideoSettingsInput {
@@ -478,6 +510,10 @@ export interface UpdateVideoSettingsInput {
   wavespeed_api_key?: string | null;
   avatar_source_url?: string | null;
   avatar_source_asset_id?: string | null;
+  media_settings?: {
+    background_music?: Partial<BackgroundMusicSettings>;
+    subtitles?: Partial<SubtitleSettings>;
+  };
 }
 
 export interface VideoSettingsValidation extends VideoSettings {
@@ -661,6 +697,16 @@ export const api = {
       apiFetch<VideoSettingsValidation>(
         `/api/v1/projects/${projectId}/video-settings/validate`,
         { method: "POST" },
+      ),
+    uploadBackgroundMusic: (projectId: string, file: File) =>
+      apiUploadJson<VideoSettings>(
+        `/api/v1/projects/${projectId}/video-settings/background-music`,
+        file,
+      ),
+    deleteBackgroundMusic: (projectId: string) =>
+      apiFetch<VideoSettings>(
+        `/api/v1/projects/${projectId}/video-settings/background-music`,
+        { method: "DELETE" },
       ),
   },
   slides: {

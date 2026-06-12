@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -60,6 +60,29 @@ def validate_video_settings(
     service: GenerationService = Depends(get_service),
 ):
     return service.validate_video_settings(project_id)
+
+
+@router.post(
+    "/{project_id}/video-settings/background-music",
+    response_model=VideoSettingsRead,
+)
+async def upload_background_music(
+    project_id: uuid.UUID,
+    file: UploadFile = File(...),
+    service: GenerationService = Depends(get_service),
+):
+    return await service.upload_background_music(project_id, file)
+
+
+@router.delete(
+    "/{project_id}/video-settings/background-music",
+    response_model=VideoSettingsRead,
+)
+def delete_background_music(
+    project_id: uuid.UUID,
+    service: GenerationService = Depends(get_service),
+):
+    return service.delete_background_music(project_id)
 
 
 @router.post("/{project_id}/generate-video", response_model=StartGenerationResponse)
