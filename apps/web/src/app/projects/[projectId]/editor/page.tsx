@@ -23,15 +23,19 @@ import {
   DebugGenerationAsset,
   DEFAULT_AVATAR_BORDER_WIDTH,
   DEFAULT_SLIDE_AVATAR,
+  DEFAULT_SUBTITLE_BOX,
   GenerationStatus,
   MediaSettings,
   ProjectAvatar,
   Slide,
   SlideAvatarMeta,
+  SlideSubtitleBox,
   VideoSettings,
   api,
   buildSlideAvatarPatch,
+  buildSlideSubtitleBoxPatch,
   extractSlideAvatarMeta,
+  extractSlideSubtitleBox,
 } from "@/lib/api";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -98,6 +102,17 @@ export default function ProjectEditorPage() {
     "idle" | "saved" | "error"
   >("idle");
 
+  // ── subtitle safe-area box (per-slide) ──
+  const [slideSubtitleBox, setSlideSubtitleBox] = useState<Record<string, SlideSubtitleBox>>({});
+  const [subtitleBoxIsCustom, setSubtitleBoxIsCustom] = useState<Record<string, boolean>>({});
+  const [isSavingSubtitleBox, setIsSavingSubtitleBox] = useState(false);
+  const [subtitleBoxSaveState, setSubtitleBoxSaveState] = useState<"idle" | "saved" | "error">(
+    "idle",
+  );
+  const isDraggingSubtitleBoxRef = useRef(false);
+  const isResizingSubtitleBoxRef = useRef(false);
+  const [isDraggingSubtitleBox, setIsDraggingSubtitleBox] = useState(false);
+
   // ── project-level avatar ──
   const [videoSettings, setVideoSettings] = useState<VideoSettings | null>(null);
   const [projectAvatar, setProjectAvatar] = useState<ProjectAvatar | null>(null);
@@ -147,6 +162,12 @@ export default function ProjectEditorPage() {
   );
   const selectedDialogue = selectedSlide ? dialogueBySlideId[selectedSlide.id] || "" : "";
   const currentSlideAvatarMeta = selectedSlideId ? (slideAvatarMeta[selectedSlideId] ?? null) : null;
+  const currentSubtitleBox = selectedSlideId
+    ? (slideSubtitleBox[selectedSlideId] ?? DEFAULT_SUBTITLE_BOX)
+    : null;
+  const currentSubtitleBoxIsCustom = selectedSlideId
+    ? Boolean(subtitleBoxIsCustom[selectedSlideId])
+    : false;
   const allSlidesHaveDialogue = useMemo(
     () =>
       slides.length > 0 &&
@@ -224,6 +245,13 @@ export default function ProjectEditorPage() {
         );
         setSlideAvatarMeta(
           Object.fromEntries(data.map((slide) => [slide.id, extractSlideAvatarMeta(slide)])),
+        );
+        const subtitleBoxEntries = data.map((slide) => [slide.id, extractSlideSubtitleBox(slide)] as const);
+        setSlideSubtitleBox(
+          Object.fromEntries(subtitleBoxEntries.map(([id, entry]) => [id, entry.box])),
+        );
+        setSubtitleBoxIsCustom(
+          Object.fromEntries(subtitleBoxEntries.map(([id, entry]) => [id, entry.isCustom])),
         );
       } catch (err) {
         setError(err instanceof Error ? err.message : "No se pudieron cargar los slides.");
@@ -568,6 +596,164 @@ export default function ProjectEditorPage() {
     },
     [currentSlideAvatarMeta, selectedSlideId, slides],
   );
+
+  // ── subtitle box drag/resize on canvas (mirrors the avatar box handlers) ──
+  function persistSubtitleBox(slideId: string, box: SlideSubtitleBox) {
+    void (async () => {
+      const slide = slides.find((s) => s.id === slideId);
+      if (!slide) return;
+      try {
+        const patch = buildSlideSubtitleBoxPatch(slide, box);
+        const updated = await api.slides.update(slide.id, { metadata: patch });
+        setSlides((s) => s.map((sl) => (sl.id === updated.id ? updated : sl)));
+        setSubtitleBoxIsCustom((current) => ({ ...current, [slideId]: true }));
+      } catch {
+        // silent — user can retry via the explicit "Guardar" button
+      }
+    })();
+  }
+
+  const handleSubtitleBoxDragStart = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!canvasRef.current || !selectedSlideId || !currentSubtitleBox) return;
+      const slideId = selectedSlideId;
+
+      const rect = canvasRef.current.getBoundingClientRect();
+      const startCanvasX = currentSubtitleBox.x;
+      const startCanvasY = currentSubtitleBox.y;
+      const startMouseX = e.clientX;
+      const startMouseY = e.clientY;
+      isDraggingSubtitleBoxRef.current = true;
+      setIsDraggingSubtitleBox(true);
+
+      function onMouseMove(ev: MouseEvent) {
+        const dx = ev.clientX - startMouseX;
+        const dy = ev.clientY - startMouseY;
+        const newX = startCanvasX + (dx / rect.width) * CANVAS_W;
+        const newY = startCanvasY + (dy / rect.height) * CANVAS_H;
+        setSlideSubtitleBox((current) => {
+          const box = current[slideId];
+          if (!box) return current;
+          return {
+            ...current,
+            [slideId]: {
+              ...box,
+              x: clamp(newX, 0, CANVAS_W - box.width),
+              y: clamp(newY, 0, CANVAS_H - box.height),
+            },
+          };
+        });
+      }
+
+      function onMouseUp() {
+        window.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("mouseup", onMouseUp);
+        isDraggingSubtitleBoxRef.current = false;
+        setIsDraggingSubtitleBox(false);
+        setSlideSubtitleBox((current) => {
+          const box = current[slideId];
+          if (box) persistSubtitleBox(slideId, box);
+          return current;
+        });
+      }
+
+      window.addEventListener("mousemove", onMouseMove);
+      window.addEventListener("mouseup", onMouseUp);
+    },
+    [currentSubtitleBox, selectedSlideId, slides],
+  );
+
+  const handleSubtitleBoxResizeStart = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!canvasRef.current || !selectedSlideId || !currentSubtitleBox) return;
+      const slideId = selectedSlideId;
+
+      const rect = canvasRef.current.getBoundingClientRect();
+      const startWidth = currentSubtitleBox.width;
+      const startHeight = currentSubtitleBox.height;
+      const startMouseX = e.clientX;
+      const startMouseY = e.clientY;
+      isResizingSubtitleBoxRef.current = true;
+      setIsDraggingSubtitleBox(true);
+
+      function onMouseMove(ev: MouseEvent) {
+        const dw = ((ev.clientX - startMouseX) / rect.width) * CANVAS_W;
+        const dh = ((ev.clientY - startMouseY) / rect.height) * CANVAS_H;
+        setSlideSubtitleBox((current) => {
+          const box = current[slideId];
+          if (!box) return current;
+          return {
+            ...current,
+            [slideId]: {
+              ...box,
+              width: clamp(startWidth + dw, 60, CANVAS_W - box.x),
+              height: clamp(startHeight + dh, 30, CANVAS_H - box.y),
+            },
+          };
+        });
+      }
+
+      function onMouseUp() {
+        window.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("mouseup", onMouseUp);
+        isResizingSubtitleBoxRef.current = false;
+        setIsDraggingSubtitleBox(false);
+        setSlideSubtitleBox((current) => {
+          const box = current[slideId];
+          if (box) persistSubtitleBox(slideId, box);
+          return current;
+        });
+      }
+
+      window.addEventListener("mousemove", onMouseMove);
+      window.addEventListener("mouseup", onMouseUp);
+    },
+    [currentSubtitleBox, selectedSlideId, slides],
+  );
+
+  function updateCurrentSubtitleBox(box: SlideSubtitleBox) {
+    if (!selectedSlideId) return;
+    setSlideSubtitleBox((current) => ({ ...current, [selectedSlideId]: box }));
+  }
+
+  async function saveCurrentSubtitleBox() {
+    if (!selectedSlideId || !currentSubtitleBox) return;
+    setIsSavingSubtitleBox(true);
+    setSubtitleBoxSaveState("idle");
+    try {
+      const slide = slides.find((s) => s.id === selectedSlideId);
+      if (!slide) return;
+      const patch = buildSlideSubtitleBoxPatch(slide, currentSubtitleBox);
+      const updated = await api.slides.update(slide.id, { metadata: patch });
+      setSlides((s) => s.map((sl) => (sl.id === updated.id ? updated : sl)));
+      setSubtitleBoxIsCustom((current) => ({ ...current, [selectedSlideId]: true }));
+      setSubtitleBoxSaveState("saved");
+    } catch {
+      setSubtitleBoxSaveState("error");
+    } finally {
+      setIsSavingSubtitleBox(false);
+    }
+  }
+
+  async function resetCurrentSubtitleBox() {
+    if (!selectedSlideId) return;
+    const slide = slides.find((s) => s.id === selectedSlideId);
+    if (!slide) return;
+    try {
+      const patch = buildSlideSubtitleBoxPatch(slide, null);
+      const updated = await api.slides.update(slide.id, { metadata: patch });
+      setSlides((s) => s.map((sl) => (sl.id === updated.id ? updated : sl)));
+      setSlideSubtitleBox((current) => ({ ...current, [selectedSlideId]: { ...DEFAULT_SUBTITLE_BOX } }));
+      setSubtitleBoxIsCustom((current) => ({ ...current, [selectedSlideId]: false }));
+      setSubtitleBoxSaveState("idle");
+    } catch {
+      setSubtitleBoxSaveState("error");
+    }
+  }
 
   async function saveMediaSettings(media: MediaSettings) {
     setIsSavingMedia(true);
@@ -984,6 +1170,34 @@ export default function ProjectEditorPage() {
                         </div>
                       )}
 
+                    {/* Subtitle safe-area box — draggable/resizable, mirrors the avatar box.
+                        Only shown when subtitles are enabled for the project. */}
+                    {currentSubtitleBox &&
+                      videoSettings?.media_settings?.subtitles.enabled !== false && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            left: `${(currentSubtitleBox.x / CANVAS_W) * 100}%`,
+                            top: `${(currentSubtitleBox.y / CANVAS_H) * 100}%`,
+                            width: `${(currentSubtitleBox.width / CANVAS_W) * 100}%`,
+                            height: `${(currentSubtitleBox.height / CANVAS_H) * 100}%`,
+                            cursor: isDraggingSubtitleBox ? "grabbing" : "grab",
+                            userSelect: "none",
+                          }}
+                          onMouseDown={handleSubtitleBoxDragStart}
+                        >
+                          <div className="flex h-full w-full items-center justify-center rounded-sm border-2 border-dashed border-amber-500 bg-amber-500/10">
+                            <span className="pointer-events-none select-none rounded bg-amber-500/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                              Área de subtítulos
+                            </span>
+                          </div>
+                          <div
+                            className="absolute bottom-0 right-0 h-3.5 w-3.5 cursor-se-resize rounded-sm bg-amber-500 opacity-80 hover:opacity-100"
+                            onMouseDown={handleSubtitleBoxResizeStart}
+                          />
+                        </div>
+                      )}
+
                     {/* Hidden avatar badge */}
                     {currentSlideAvatarMeta && !currentSlideAvatarMeta.visible && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black/10">
@@ -1119,6 +1333,14 @@ export default function ProjectEditorPage() {
                 onDeleteMusic={deleteMusic}
                 musicState={musicState}
                 musicError={musicError}
+                hasSlide={Boolean(selectedSlide)}
+                subtitleBox={currentSubtitleBox}
+                isSubtitleBoxCustom={currentSubtitleBoxIsCustom}
+                onSubtitleBoxChange={updateCurrentSubtitleBox}
+                onSaveSubtitleBox={saveCurrentSubtitleBox}
+                onResetSubtitleBox={resetCurrentSubtitleBox}
+                isSavingSubtitleBox={isSavingSubtitleBox}
+                subtitleBoxSaveState={subtitleBoxSaveState}
               />
             </CollapsibleSection>
 

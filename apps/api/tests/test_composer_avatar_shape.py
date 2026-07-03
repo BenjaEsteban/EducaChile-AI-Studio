@@ -86,3 +86,22 @@ def test_slide_avatar_border_width_px_scales_to_output():
     assert _slide_avatar_border_width_px({"avatar_border_width": 6}, "720p") == 8
     # invalid falls back to default 6 → 12 px at 1080p
     assert _slide_avatar_border_width_px({"avatar_border_width": "x"}, "1080p") == 12
+
+
+def test_slide_subtitle_box_reads_canvas_metadata():
+    from app.modules.generation.pipeline import _slide_canvas_size, _slide_subtitle_box
+
+    metadata = {
+        "canvas": {
+            "width": 960,
+            "height": 540,
+            "subtitleBox": {"x": 20, "y": 400, "width": 900, "height": 90},
+        }
+    }
+    assert _slide_subtitle_box(metadata) == {"x": 20, "y": 400, "width": 900, "height": 90}
+    assert _slide_canvas_size(metadata) == (960.0, 540.0)
+
+    # Missing/invalid box or canvas -> None / defaults
+    assert _slide_subtitle_box({}) is None
+    assert _slide_subtitle_box({"canvas": {}}) is None
+    assert _slide_canvas_size({}) == (960.0, 540.0)

@@ -1455,10 +1455,11 @@ def generate_wavespeed_slide_video_for_slide(
         _stage_progress(db, job, "generating_avatar", slide_index, total_slides, 25, 60, slide_index)
         return existing
 
-    if not (app_settings.WAVESPEED_API_KEY or "").strip():
+    wavespeed_api_key = (context.wavespeed_api_key or app_settings.WAVESPEED_API_KEY or "").strip()
+    if not wavespeed_api_key:
         raise PipelineError(
             "avatar_generation_failed",
-            "WAVESPEED_API_KEY is missing in worker environment",
+            "No hay una WaveSpeed API Key configurada.",
             stage="generating_avatar",
             slide_index=slide_index,
         )
@@ -1485,7 +1486,9 @@ def generate_wavespeed_slide_video_for_slide(
     )
     _stage_progress(db, job, "generating_avatar", slide_index - 1, total_slides, 25, 60, slide_index)
 
-    client = WaveSpeedOfficialClient(api_key=app_settings.WAVESPEED_API_KEY)
+    # Use the resolved (global/user-configured) WaveSpeed key like every other
+    # avatar path, not just the environment key.
+    client = WaveSpeedOfficialClient(api_key=wavespeed_api_key)
     audio_bytes = storage.download_bytes(audio_asset.storage_key)
     audio_info = _probe_media_info(audio_bytes, ".mp3")
     audio_duration = float(audio_info.get("duration_seconds") or 0.0)
@@ -1997,7 +2000,15 @@ def compose_segment_for_slide(
             if subtitles_cfg["enabled"]
             else None
         )
-        subtitle_style = build_subtitle_force_style(subtitles_cfg) if subtitle_text else None
+        subtitle_style = None
+        if subtitle_text:
+            canvas_width, canvas_height = _slide_canvas_size(metadata)
+            subtitle_style = build_subtitle_force_style(
+                subtitles_cfg,
+                box=_slide_subtitle_box(metadata),
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
 
         segment = composer.compose_slide_video(
             slide_image_bytes=slide_image,
@@ -4169,6 +4180,29 @@ def _slide_avatar_border_width_px(metadata: dict, resolution: str) -> int:
     _, output_height = _resolution_size_for_generation(resolution)
     scale = output_height / max(canvas_height, 1.0)
     return max(2, round(width_canvas * scale))
+
+
+def _slide_subtitle_box(metadata: dict) -> dict | None:
+    """Per-slide subtitle safe-area box (canvas units), if set in the editor.
+
+    Stored at ``canvas.subtitleBox`` (mirrors ``canvas.avatar``). Returns None
+    when not configured, so ``build_subtitle_force_style`` falls back to its
+    pre-existing single-margin behavior.
+    """
+    canvas = metadata.get("canvas") if isinstance(metadata, dict) else None
+    if not isinstance(canvas, dict):
+        return None
+    box = canvas.get("subtitleBox")
+    return box if isinstance(box, dict) else None
+
+
+def _slide_canvas_size(metadata: dict) -> tuple[float, float]:
+    canvas = metadata.get("canvas") if isinstance(metadata, dict) else None
+    width, height = 960.0, 540.0
+    if isinstance(canvas, dict):
+        width = float(canvas.get("width") or width)
+        height = float(canvas.get("height") or height)
+    return width, height
 
 
 def _avatar_overlay_type(metadata: dict | None, *, fallback_reason: str | None = None) -> str:
