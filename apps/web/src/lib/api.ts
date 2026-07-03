@@ -191,6 +191,27 @@ export interface SlideAvatarMeta {
 /** Default avatar border thickness (canvas units) when a border color is set. */
 export const DEFAULT_AVATAR_BORDER_WIDTH = 6;
 
+/**
+ * Per-slide subtitle "safe area" rectangle, in the same 960×540 canvas
+ * coordinate space as the avatar box. Constrains where burned-in subtitles
+ * render on export (via FFmpeg ASS MarginL/MarginR/MarginV) so they don't
+ * cover the avatar or important slide content. Optional — a slide without a
+ * saved box uses the global (project-level) subtitle position.
+ */
+export interface SlideSubtitleBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export const DEFAULT_SUBTITLE_BOX: SlideSubtitleBox = {
+  x: 40,
+  y: 430,
+  width: 880,
+  height: 90,
+};
+
 export const CANVAS_W = 960;
 export const CANVAS_H = 540;
 
@@ -239,6 +260,51 @@ export function extractSlideAvatarMeta(slide: Slide): SlideAvatarMeta {
     offsetY,
     borderColor,
     borderWidth,
+  };
+}
+
+/** Reads the per-slide subtitle box, if the slide has customized one. */
+export function extractSlideSubtitleBox(slide: Slide): {
+  box: SlideSubtitleBox;
+  isCustom: boolean;
+} {
+  const canvas = (slide.metadata.canvas as Record<string, unknown>) || {};
+  const raw = canvas.subtitleBox as Record<string, unknown> | undefined;
+  if (
+    raw &&
+    typeof raw.x === "number" &&
+    typeof raw.y === "number" &&
+    typeof raw.width === "number" &&
+    typeof raw.height === "number"
+  ) {
+    return {
+      box: { x: raw.x, y: raw.y, width: raw.width, height: raw.height },
+      isCustom: true,
+    };
+  }
+  return { box: { ...DEFAULT_SUBTITLE_BOX }, isCustom: false };
+}
+
+/**
+ * Build the metadata patch for a slide's subtitle box. Pass `null` to remove
+ * the custom box (the slide reverts to the global/project subtitle position).
+ */
+export function buildSlideSubtitleBoxPatch(
+  slide: Slide,
+  box: SlideSubtitleBox | null,
+): Record<string, unknown> {
+  const existingCanvas = { ...((slide.metadata.canvas as Record<string, unknown>) || {}) };
+  if (box) {
+    existingCanvas.subtitleBox = { x: box.x, y: box.y, width: box.width, height: box.height };
+  } else {
+    delete existingCanvas.subtitleBox;
+  }
+  return {
+    canvas: {
+      ...existingCanvas,
+      width: CANVAS_W,
+      height: CANVAS_H,
+    },
   };
 }
 

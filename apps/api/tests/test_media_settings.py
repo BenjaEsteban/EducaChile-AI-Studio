@@ -75,3 +75,61 @@ def test_build_subtitle_force_style_opacity_alpha():
     )
     # fully transparent background → alpha FF
     assert "BackColour=&HFF000000" in style
+
+
+def test_build_subtitle_force_style_without_box_is_unchanged():
+    # Backward-compat guard: no box → identical to legacy single-margin output.
+    style = build_subtitle_force_style({"position": "bottom"})
+    assert "MarginV=40" in style
+    assert "MarginL" not in style
+    assert "MarginR" not in style
+
+
+def test_build_subtitle_force_style_with_box_bottom():
+    style = build_subtitle_force_style(
+        {"position": "bottom"},
+        box={"x": 40, "y": 400, "width": 880, "height": 100},
+        canvas_width=960,
+        canvas_height=540,
+        output_width=1920,
+        output_height=1080,
+    )
+    # scale_x = 1920/960 = 2, scale_y = 1080/540 = 2
+    # MarginL = 40*2 = 80; MarginR = (960-40-880)*2 = 80
+    assert "MarginL=80" in style
+    assert "MarginR=80" in style
+    # bottom edge of box = 400+100=500; distance to canvas bottom (540)=40 -> *2 = 80
+    assert "MarginV=80" in style
+
+
+def test_build_subtitle_force_style_with_box_top():
+    style = build_subtitle_force_style(
+        {"position": "top"},
+        box={"x": 0, "y": 20, "width": 960, "height": 80},
+        canvas_width=960,
+        canvas_height=540,
+    )
+    # MarginV = box_y * scale_y = 20*2 = 40
+    assert "MarginV=40" in style
+    assert "MarginL=0" in style
+    assert "MarginR=0" in style
+
+
+def test_build_subtitle_force_style_with_box_center_ignores_margin_v():
+    style = build_subtitle_force_style(
+        {"position": "center"},
+        box={"x": 100, "y": 200, "width": 760, "height": 100},
+        canvas_width=960,
+        canvas_height=540,
+    )
+    assert "MarginV=0" in style
+    assert "MarginL" in style  # horizontal box still applied
+
+
+def test_build_subtitle_force_style_invalid_box_falls_back():
+    style = build_subtitle_force_style(
+        {"position": "bottom"},
+        box={"x": "bad", "width": 0},
+    )
+    assert "MarginV=40" in style
+    assert "MarginL" not in style

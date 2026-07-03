@@ -126,18 +126,70 @@ def _hex_to_ass(color: str, alpha: int = 0) -> str:
     return f"&H{aa}{bb}{gg}{rr}"
 
 
-def build_subtitle_force_style(subtitles: dict) -> str:
-    """Build an FFmpeg ``subtitles=...:force_style='...'`` style string."""
+def _normalize_subtitle_box(box: dict | None) -> tuple[float, float, float, float] | None:
+    """Validate a per-slide subtitle safe-area box (canvas units)."""
+    if not isinstance(box, dict):
+        return None
+    try:
+        x = float(box.get("x"))
+        y = float(box.get("y"))
+        width = float(box.get("width"))
+        height = float(box.get("height"))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return x, y, width, height
+
+
+def build_subtitle_force_style(
+    subtitles: dict,
+    *,
+    box: dict | None = None,
+    canvas_width: float = 960.0,
+    canvas_height: float = 540.0,
+    output_width: int = 1920,
+    output_height: int = 1080,
+) -> str:
+    """Build an FFmpeg ``subtitles=...:force_style='...'`` style string.
+
+    ``box`` is an optional per-slide safe-area rectangle (``{x, y, width,
+    height}`` in canvas units, same coordinate space as the avatar overlay).
+    When provided, it is translated into libass ``MarginL``/``MarginR`` (so
+    subtitle text wraps within that horizontal region) and ``MarginV`` (derived
+    from whichever edge matches the configured vertical ``position``) — this
+    reuses the exact same ``subtitles`` FFmpeg filter already in place, adding
+    only extra numeric style parameters (no new filter, no extra FFmpeg pass).
+    Without a box, output is byte-identical to the pre-existing behavior.
+    """
     subs = normalize_media_settings({"subtitles": subtitles})["subtitles"]
     alignment = {"bottom": 2, "center": 5, "top": 8}[subs["position"]]
     # ASS alpha: 00 = opaque, FF = transparent.
     bg_alpha = int(round((1.0 - subs["background_opacity"]) * 255))
     primary = _hex_to_ass(subs["text_color"], alpha=0)
     back = _hex_to_ass(subs["background_color"], alpha=bg_alpha)
-    margin_v = 40 if subs["position"] != "center" else 0
+
+    normalized_box = _normalize_subtitle_box(box)
+    margin_lr = ""
+    if normalized_box is not None:
+        box_x, box_y, box_width, box_height = normalized_box
+        scale_x = output_width / max(float(canvas_width), 1.0)
+        scale_y = output_height / max(float(canvas_height), 1.0)
+        margin_l = max(0, round(box_x * scale_x))
+        margin_r = max(0, round((canvas_width - box_x - box_width) * scale_x))
+        margin_lr = f",MarginL={margin_l},MarginR={margin_r}"
+        if subs["position"] == "top":
+            margin_v = max(0, round(box_y * scale_y))
+        elif subs["position"] == "center":
+            margin_v = 0
+        else:  # bottom
+            margin_v = max(0, round((canvas_height - box_y - box_height) * scale_y))
+    else:
+        margin_v = 40 if subs["position"] != "center" else 0
+
     # BorderStyle=3 → opaque box behind text using BackColour.
     return (
         f"FontName={subs['font_family']},FontSize={subs['font_size']},"
         f"PrimaryColour={primary},BorderStyle=3,Outline=1,Shadow=0,"
-        f"BackColour={back},Alignment={alignment},MarginV={margin_v}"
+        f"BackColour={back}{margin_lr},Alignment={alignment},MarginV={margin_v}"
     )

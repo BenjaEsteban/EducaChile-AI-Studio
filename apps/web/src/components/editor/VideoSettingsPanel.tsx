@@ -4,7 +4,10 @@ import { ChangeEvent, useEffect, useState } from "react";
 
 import {
   BackgroundMusicSettings,
+  CANVAS_H,
+  CANVAS_W,
   MediaSettings,
+  SlideSubtitleBox,
   SubtitlePosition,
   SubtitleSettings,
   SUBTITLE_MAX_FONT_SIZE,
@@ -48,6 +51,15 @@ interface VideoSettingsPanelProps {
   onDeleteMusic: () => Promise<void>;
   musicState: "idle" | "uploading" | "saved" | "error";
   musicError: string | null;
+  /* per-slide subtitle safe-area box */
+  hasSlide: boolean;
+  subtitleBox: SlideSubtitleBox | null;
+  isSubtitleBoxCustom: boolean;
+  onSubtitleBoxChange: (box: SlideSubtitleBox) => void;
+  onSaveSubtitleBox: () => Promise<void>;
+  onResetSubtitleBox: () => Promise<void>;
+  isSavingSubtitleBox: boolean;
+  subtitleBoxSaveState: "idle" | "saved" | "error";
 }
 
 export function VideoSettingsPanel({
@@ -60,6 +72,14 @@ export function VideoSettingsPanel({
   onDeleteMusic,
   musicState,
   musicError,
+  hasSlide,
+  subtitleBox,
+  isSubtitleBoxCustom,
+  onSubtitleBoxChange,
+  onSaveSubtitleBox,
+  onResetSubtitleBox,
+  isSavingSubtitleBox,
+  subtitleBoxSaveState,
 }: VideoSettingsPanelProps) {
   const [music, setMusic] = useState<BackgroundMusicSettings>(DEFAULT_MUSIC);
   const [subs, setSubs] = useState<SubtitleSettings>(DEFAULT_SUBS);
@@ -315,6 +335,114 @@ export function VideoSettingsPanel({
                 ))}
               </select>
             </label>
+
+            {/* Per-slide subtitle area (dimensions), like the avatar box */}
+            {hasSlide && subtitleBox ? (
+              <div className="space-y-2 rounded-md border border-amber-200 bg-amber-50/50 p-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-gray-700">
+                    Área de subtítulos en esta lámina
+                  </span>
+                  {isSubtitleBoxCustom ? (
+                    <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+                      Personalizada
+                    </span>
+                  ) : (
+                    <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-semibold text-gray-600">
+                      Por defecto
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-500">
+                  Arrastra el rectángulo ámbar sobre la lámina para ajustar dónde caben los
+                  subtítulos (evita tapar el avatar o la presentación).
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="block">
+                    <span className="text-xs text-gray-600">Posición X</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={CANVAS_W}
+                      value={Math.round(subtitleBox.x)}
+                      onChange={(e) =>
+                        onSubtitleBoxChange({ ...subtitleBox, x: Number(e.target.value) })
+                      }
+                      className={inputCls}
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-600">Posición Y</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={CANVAS_H}
+                      value={Math.round(subtitleBox.y)}
+                      onChange={(e) =>
+                        onSubtitleBoxChange({ ...subtitleBox, y: Number(e.target.value) })
+                      }
+                      className={inputCls}
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-600">Ancho</span>
+                    <input
+                      type="number"
+                      min={60}
+                      max={CANVAS_W}
+                      value={Math.round(subtitleBox.width)}
+                      onChange={(e) =>
+                        onSubtitleBoxChange({ ...subtitleBox, width: Number(e.target.value) })
+                      }
+                      className={inputCls}
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-600">Alto</span>
+                    <input
+                      type="number"
+                      min={30}
+                      max={CANVAS_H}
+                      value={Math.round(subtitleBox.height)}
+                      onChange={(e) =>
+                        onSubtitleBoxChange({ ...subtitleBox, height: Number(e.target.value) })
+                      }
+                      className={inputCls}
+                    />
+                  </label>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void onSaveSubtitleBox()}
+                    disabled={isSavingSubtitleBox}
+                    className="rounded-md bg-gray-900 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
+                  >
+                    {isSavingSubtitleBox ? "Guardando…" : "Guardar área"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onResetSubtitleBox()}
+                    disabled={!isSubtitleBoxCustom}
+                    className="rounded-md border border-gray-300 px-3 py-1.5 text-xs font-semibold text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
+                  >
+                    Restablecer
+                  </button>
+                </div>
+                {subtitleBoxSaveState === "saved" && (
+                  <p className="text-xs font-medium text-green-700">Área guardada.</p>
+                )}
+                {subtitleBoxSaveState === "error" && (
+                  <p className="text-xs font-medium text-red-700">No se pudo guardar el área.</p>
+                )}
+              </div>
+            ) : (
+              !hasSlide && (
+                <p className="text-xs text-gray-400">
+                  Selecciona una lámina para ajustar el área de subtítulos.
+                </p>
+              )
+            )}
           </>
         )}
       </section>

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -34,7 +33,7 @@ class WaveSpeedOfficialClient:
             raise WaveSpeedOfficialError("WAVESPEED_API_KEY is missing in worker environment")
 
     def run_infinitetalk_fast(self, *, image_url: str, audio_url: str) -> str:
-        wavespeed = self._sdk()
+        client = self._sdk_client()
         payload = {
             "audio": audio_url,
             "image": image_url,
@@ -47,7 +46,7 @@ class WaveSpeedOfficialClient:
             _safe_payload_shape(payload),
         )
         try:
-            output = wavespeed.run(INFINITETALK_FAST_MODEL, payload)
+            output = client.run(INFINITETALK_FAST_MODEL, payload)
         except Exception as exc:
             raise WaveSpeedOfficialError(
                 f"WaveSpeed InfiniteTalk Fast request failed: {exc}",
@@ -70,13 +69,13 @@ class WaveSpeedOfficialClient:
     def upload_bytes(self, file_bytes: bytes, *, filename: str, content_type: str) -> str:
         if not file_bytes:
             raise WaveSpeedOfficialError("Cannot upload empty media to WaveSpeed")
-        wavespeed = self._sdk()
+        client = self._sdk_client()
         suffix = Path(filename or "media.bin").suffix or ".bin"
         with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
             tmp.write(file_bytes)
             tmp.flush()
             try:
-                uploaded = wavespeed.upload(tmp.name)
+                uploaded = client.upload(tmp.name)
             except Exception as exc:
                 raise WaveSpeedOfficialError(
                     f"WaveSpeed media upload failed for {filename}: {exc}",
@@ -97,19 +96,27 @@ class WaveSpeedOfficialClient:
         )
         return url
 
-    def _sdk(self):
+    def _sdk_client(self):
+        """Build a fresh SDK ``Client`` bound to this instance's api_key.
+
+        IMPORTANT: do not use the module-level ``wavespeed.run()``/``wavespeed.upload()``
+        helpers here. They call ``wavespeed.api._get_default_client()``, which lazily
+        creates a single ``Client()`` the *first* time it's invoked in the process and
+        then caches it forever — later mutating ``os.environ["WAVESPEED_API_KEY"]`` or
+        ``wavespeed.api_key`` has no effect on that already-constructed instance. In a
+        long-lived Celery worker this meant every generation after the first one in the
+        process kept reusing whatever key happened to be configured at that first call,
+        silently ignoring credential updates made afterwards (surfacing as persistent
+        401 Unauthorized errors). Constructing our own ``Client(api_key=...)` per call
+        guarantees the current key is always used.
+        """
         try:
-            import wavespeed  # type: ignore
+            from wavespeed.api.client import Client  # type: ignore
         except ImportError as exc:
             raise WaveSpeedOfficialError(
                 "WaveSpeed Python SDK is not installed. Add the wavespeed package to the worker image."
             ) from exc
-        os.environ["WAVESPEED_API_KEY"] = self.api_key
-        try:
-            wavespeed.api_key = self.api_key
-        except Exception:
-            pass
-        return wavespeed
+        return Client(api_key=self.api_key)
 
 
 def download_video(url: str) -> bytes:
